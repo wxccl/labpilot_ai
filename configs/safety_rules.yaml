@@ -1,0 +1,6 @@
+mutual_exclusion:
+  - name: absorption_vs_fluorescence_placeholder
+    cannot_both_true: []
+
+high_risk:
+  require_confirmation_for_risk: [high]

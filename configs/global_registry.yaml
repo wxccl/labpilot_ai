@@ -1,0 +1,69 @@
+# runmanager globals whitelist.
+# Human operators should add variables here before AI can control them.
+
+duration_tof_ms:
+  backend: runmanager
+  type: float
+  allow_array: true
+  min: 0.0
+  max: 20.0
+  max_points: 100
+  unit: ms
+  risk: low
+  aliases: [TOF, tof, 飞行时间, duration tof]
+  description: Time of flight before imaging. User phrases like TOF or 飞行时间 should map here.
+
+duration_probe_us:
+  backend: runmanager
+  type: float
+  allow_array: true
+  min: 1.0
+  max: 10000.0
+  max_points: 100
+  unit: us
+  risk: low
+  aliases: [probe time, 探测光时间, 成像光时间]
+  description: Probe pulse duration.
+
+lyse_do_SG_F1_masked:
+  backend: runmanager
+  type: int
+  min: 0
+  max: 1
+  unit: ''
+  risk: low
+  aliases: [SG mask, sg mask, masked SG, SG遮罩]
+  description: Whether lyse uses masked SG F=1 analysis.
+
+lyse_update_centers_json:
+  backend: runmanager
+  type: bool
+  risk: low
+  aliases: [更新中心, update centers, centers json]
+  description: Whether lyse updates centers_json.
+
+do_Rabi:
+  backend: runmanager
+  type: bool
+  risk: low
+  aliases: [Rabi, 拉比, Rabi时序]
+  description: Enable Rabi sequence branch in labscript.
+
+do_pure:
+  backend: runmanager
+  type: bool
+  risk: medium
+  aliases: [pure, pure 0, 清除0态]
+  description: Enable pure/cleaning sequence branch in labscript.
+
+MW_power_W:
+  backend: runmanager
+  type: float
+  allow_array: false
+  min: 0.0
+  max: 0.20
+  unit: W
+  risk: high
+  require_confirm: true
+  aliases: [微波功率, microwave power, MW power]
+  description: Microwave power. Conservative limit for AI control.

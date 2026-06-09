@@ -1,0 +1,114 @@
+Metadata-Version: 2.4
+Name: labpilot-ai
+Version: 0.1.1
+Summary: Local AI copilot for labscript suite: runmanager globals, lyse data, BLACS manual stubs, optimizer skeleton.
+Author: LabPilot AI Developers
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: PyQt5>=5.15
+Requires-Dist: openai>=1.0
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: numpy>=1.23
+Requires-Dist: pandas>=1.5
+Requires-Dist: h5py>=3.8
+Requires-Dist: matplotlib>=3.6
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Provides-Extra: fit
+Requires-Dist: scipy>=1.9; extra == "fit"
+Provides-Extra: voice
+Requires-Dist: sounddevice; extra == "voice"
+Requires-Dist: faster-whisper; extra == "voice"
+Provides-Extra: opt
+Requires-Dist: scikit-optimize; extra == "opt"
+Requires-Dist: optuna; extra == "opt"
+
+# LabPilot AI Starter
+
+这是一个本地开发用的 **AI 实验控制软件骨架**。第一版重点是：
+
+- 统一项目结构；
+- PyQt5 主界面；
+- DeepSeek/OpenAI 兼容 API 自然语言解析；
+- runmanager globals 读写与 engage；
+- 安全白名单、类型检查、范围检查、数组扫描；
+- lyse/HDF5 数据加载基础框架；
+- BLACS manual、optimizer、voice、protocol designer 预留模块。
+
+默认支持 **mock 模式**：没有 labscript/runmanager 也能打开 UI 和测试指令解析。
+
+## 本地开发安装
+
+进入项目根目录：
+
+```bash
+cd labpilot_ai_starter
+pip install -e .
+```
+
+在你的 labscript conda 环境里推荐：
+
+```bash
+conda activate labscript
+cd D:\timing sequence\GPT\labpilot_ai_starter
+pip install -e .
+```
+
+## 设置 API key
+
+PowerShell 临时设置：
+
+```powershell
+$env:DEEPSEEK_API_KEY="你的 key"
+$env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
+$env:DEEPSEEK_MODEL="deepseek-v4-pro"
+```
+
+没有 key 时可勾选 UI 中的 `Mock LLM`，用内置规则解析做本地测试。
+
+## 启动
+
+```bash
+labpilot-ai
+```
+
+或者：
+
+```bash
+python -m labpilot_ai
+```
+
+## 第一轮测试流程
+
+1. 打开软件。
+2. 先勾选 `Mock runmanager` 和 `Dry run`。
+3. 在 Command 页面输入：
+
+```text
+把 TOF 改成 17 ms，不运行
+```
+
+4. 点击 `Parse`，检查动作表。
+5. 取消 `Dry run` 但保留 `Mock runmanager`，点击 `Execute`，测试 mock 写入。
+6. 进入真实实验电脑后，取消 `Mock runmanager`，确保 runmanager GUI/server 已打开，再测试 `Test connection`。
+
+## 重要安全原则
+
+- AI 只输出 JSON 动作；
+- 真正执行前必须通过本地 safety validator；
+- 所有可控变量必须在 `configs/global_registry.yaml` 中登记；
+- 高风险参数应设置 `risk: high` 和 `require_confirm: true`；
+- 自动运行 shot 默认关闭。
+
+## Labscript h5_lock note
+
+This build imports `labscript_utils.h5_lock` at process startup through
+`labpilot_ai.bootstrap_labscript.install_h5_lock()` and also uses lazy `h5py`
+imports in the HDF5 loader. This avoids the common labscript error:
+
+`h5py has already been imported. h5_lock must be imported before h5py.`
+
+If you still see that error, close all Python/IPython/Jupyter processes that
+already imported `h5py`, then start LabPilot AI from a fresh terminal.

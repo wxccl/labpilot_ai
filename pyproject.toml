@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "labpilot-ai"
+version = "0.1.1"
+description = "Local AI copilot for labscript suite: runmanager globals, lyse data, BLACS manual stubs, optimizer skeleton."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "LabPilot AI Developers"}]
+dependencies = [
+    "PyQt5>=5.15",
+    "openai>=1.0",
+    "PyYAML>=6.0",
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "h5py>=3.8",
+    "matplotlib>=3.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff"]
+fit = ["scipy>=1.9"]
+voice = ["sounddevice", "faster-whisper"]
+opt = ["scikit-optimize", "optuna"]
+
+[project.scripts]
+labpilot-ai = "labpilot_ai.main:main"
+
+# Important: this project uses a flat-layout and also has top-level
+# directories named configs/ and plugins/. Tell setuptools explicitly that
+# only labpilot_ai is a Python package. Otherwise pip install -e . fails with:
+# "Multiple top-level packages discovered in a flat-layout".
+[tool.setuptools.packages.find]
+include = ["labpilot_ai*"]
+exclude = ["configs*", "plugins*", "tests*", "examples*"]

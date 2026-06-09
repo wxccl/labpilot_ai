@@ -1,0 +1,25 @@
+# BLACS manual whitelist placeholder.
+# Add real device/channel names after you inspect your BLACS tabs.
+
+Example_Bias_voltage:
+  backend: blacs_manual
+  kind: AO
+  device: NI_DAQ
+  channel: ao0
+  type: float
+  min: -1.0
+  max: 1.0
+  unit: V
+  risk: medium
+  aliases: [bias, 偏置电压]
+  description: Example manual AO voltage. Replace with your real device/channel.
+
+Example_RF_switch:
+  backend: blacs_manual
+  kind: DO
+  device: PulseBlaster
+  channel: flag 0
+  type: bool
+  risk: medium
+  aliases: [RF switch, 射频开关]
+  description: Example manual digital output. Replace with your real device/channel.
