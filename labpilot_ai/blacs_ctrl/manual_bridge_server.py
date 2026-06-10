@@ -5,9 +5,21 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class ManualBridgeState:
     def __init__(self):
         self.values = {}
+        self.channels = []
 
     def set_manual(self, name, value, program=False):
         self.values[name] = {"value": value, "program": bool(program)}
+        if name and not any(item.get("name") == name for item in self.channels):
+            self.channels.append(
+                {
+                    "name": name,
+                    "kind": "manual",
+                    "device": "placeholder",
+                    "channel": name,
+                    "type": "float" if not isinstance(value, bool) else "bool",
+                    "risk": "low",
+                }
+            )
         return {"ok": True, "name": name, "value": value, "program": bool(program)}
 
 
@@ -16,6 +28,10 @@ def make_handler(state: ManualBridgeState):
         def do_GET(self):
             if self.path == "/status":
                 self._send({"ok": True, "service": "labpilot-blacs-manual-bridge", "values": state.values})
+            elif self.path == "/channels":
+                self._send({"ok": True, "channels": state.channels})
+            elif self.path == "/values":
+                self._send({"ok": True, "values": state.values})
             else:
                 self.send_error(404)
 

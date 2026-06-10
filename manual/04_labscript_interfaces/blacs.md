@@ -1,26 +1,35 @@
-# BLACS Manual 接口
+# BLACS Manual interface
 
-BLACS manual 控制集中在 `blacs_ctrl/`。设计目标是只通过 localhost bridge 暴露人工登记过的 manual 通道。
+LabPilot AI talks to BLACS through a localhost bridge boundary. It does not patch BLACS internals and it does not bypass the LabPilot safety layer.
 
-## 功能
+## v0.1.3 bridge scope
 
-- Mock manual 写入。
-- localhost HTTP bridge client。
-- AO/DO/DDS 等通道可以通过 registry 暴露。
-- 类型、单位、范围、风险等级由安全层校验。
+The first real BLACS bridge target is readonly discovery and readback:
 
-## 相关代码
+- `GET /status`
+- `GET /channels`
+- `GET /values`
 
-- `blacs_ctrl/manual_client.py`
-- `blacs_ctrl/manual_bridge_server.py`
-- `configs/blacs_manual_registry.yaml`
+The UI exposes:
 
-## Registry 示例
+- `Test BLACS bridge`
+- `Refresh bridge status`
+- `Discover channels`
+- `Read current values`
+- `Import selected channels`
+- `Set selected manual value`
+- `Apply checked channels`
+- `Load connection table context`
+
+`Discover channels` and `Read current values` are safe observation tools. `Import selected channels` writes only to the local LabPilot registry draft, marks imported channels as requiring confirmation, and keeps `ai_control: false` until a human reviews the entry.
+
+## Registry example
 
 ```yaml
 mot_coil_current:
   device: "coil_driver"
   channel: "ao0"
+  kind: "manual"
   type: float
   unit: A
   min: 0
@@ -31,20 +40,24 @@ mot_coil_current:
   description: MOT coil current manual control.
 ```
 
-## 安全建议
-
-- 默认不要把危险 manual 通道开放给 AI。
-- 高功率激光、线圈、电源、快门等必须设置 high risk。
-- 第一次真实测试使用虚拟通道或低风险输出。
-- bridge server 只监听 localhost。
-
-## 工作流
+## Safety workflow
 
 ```text
-AI/用户命令
-  -> set_blacs_manual action
-  -> SafetyValidator
+Natural-language command or UI edit
+  -> JSON action with type="set_blacs_manual"
+  -> SafetyValidator whitelist/type/range/risk check
+  -> dry-run preview and high-risk confirmation
   -> manual_client
-  -> localhost bridge
-  -> BLACS manual 通道
+  -> localhost BLACS bridge
 ```
+
+## Important first-release limit
+
+Readonly bridge discovery is the recommended first lab validation step. Real manual writes should only be enabled after the lab-side BLACS bridge/plugin has been reviewed, tested in mock mode, and staged on one low-risk channel. High-power lasers, magnetic coils, power supplies, shutters, and DDS outputs should remain high-risk and confirmation-gated.
+
+## Related code
+
+- `labpilot_ai/blacs_ctrl/manual_client.py`
+- `labpilot_ai/blacs_ctrl/manual_bridge_server.py`
+- `configs/blacs_manual_registry.yaml`
+- `labpilot_ai/safety/validator.py`

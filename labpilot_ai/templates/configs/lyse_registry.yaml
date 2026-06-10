@@ -1,6 +1,7 @@
 single_modules:
   example_single:
     path: plugins/single_modules/example_single.py
+    mode: labpilot_module
     enabled_by_default: true
     order: 10
     description: Minimal single-shot analysis example.
@@ -9,6 +10,7 @@ single_modules:
 multi_modules:
   example_multi:
     path: plugins/multi_modules/example_multi.py
+    mode: labpilot_module
     enabled_by_default: false
     order: 10
     description: Minimal multi-shot analysis example.

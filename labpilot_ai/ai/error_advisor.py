@@ -3,7 +3,7 @@ def advise_error(error_text: str) -> str:
     low = text.lower()
     hints = []
 
-    if any(token in low for token in ["unicode", "utf-8", "codec", "mojibake", "encoding", "decode error", "�"]):
+    if any(token in low for token in ["unicode", "utf-8", "codec", "mojibake", "encoding", "decode error", chr(0xFFFD)]):
         hints.append("Check source/document encoding. Save Python and Markdown files as UTF-8, then rerun compileall before release.")
     if any(token in text for token in ["乱码", "鏄", "涓", "鎵", "寮"]):
         hints.append("This looks like mojibake. Reopen the affected file as UTF-8, replace corrupted strings, and avoid mixed terminal encodings.")

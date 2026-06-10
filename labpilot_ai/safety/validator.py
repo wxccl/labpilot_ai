@@ -67,6 +67,14 @@ class SafetyValidator:
         self.blacs_registry = blacs_registry or {}
         self.lyse_registry = lyse_registry or {}
 
+    def reload(self, global_registry: dict | None = None, blacs_registry: dict | None = None, lyse_registry: dict | None = None):
+        if global_registry is not None:
+            self.global_registry = global_registry or {}
+        if blacs_registry is not None:
+            self.blacs_registry = blacs_registry or {}
+        if lyse_registry is not None:
+            self.lyse_registry = lyse_registry or {}
+
     def validate_command(self, command: dict) -> dict:
         actions = command.get("actions", [])
         if not isinstance(actions, list):

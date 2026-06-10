@@ -16,6 +16,35 @@ class BlacsManualClient:
         with request.urlopen(f"http://{self.host}:{self.port}/status", timeout=5) as resp:
             return resp.read().decode("utf-8")
 
+    def discover_channels(self):
+        if self.mock:
+            return [
+                {
+                    "name": name,
+                    "kind": "manual",
+                    "device": "mock",
+                    "channel": name,
+                    "type": "float" if not isinstance(value, bool) else "bool",
+                    "current_value": value,
+                    "risk": "low",
+                }
+                for name, value in sorted(self.values.items())
+            ]
+        with request.urlopen(f"http://{self.host}:{self.port}/channels", timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            raise RuntimeError(payload.get("error") or "BLACS bridge channel discovery failed")
+        return payload.get("channels", payload if isinstance(payload, list) else [])
+
+    def get_values(self):
+        if self.mock:
+            return dict(self.values)
+        with request.urlopen(f"http://{self.host}:{self.port}/values", timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            raise RuntimeError(payload.get("error") or "BLACS bridge value readback failed")
+        return payload.get("values", payload if isinstance(payload, dict) else {})
+
     def set_manual(self, name, value, program=False):
         if self.mock:
             self.values[name] = value
@@ -28,4 +57,7 @@ class BlacsManualClient:
             method="POST",
         )
         with request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            payload = json.loads(resp.read().decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            raise RuntimeError(payload.get("error") or "BLACS bridge manual write failed")
+        return payload

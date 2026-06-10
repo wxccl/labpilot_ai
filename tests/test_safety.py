@@ -68,3 +68,10 @@ def test_optimization_feedback_manual_values_action():
         {"actions": [{"type": "tell_optimization_result", "values": {"N_total": 2.0}}]}
     )
     assert safe["optimization_feedback"][0]["values"]["N_total"] == 2.0
+
+
+def test_validator_reload_updates_blacs_whitelist():
+    validator = SafetyValidator({}, {})
+    validator.reload(blacs_registry={"ao0": {"type": "float", "min": 0, "max": 5}})
+    safe = validator.validate_command({"actions": [{"type": "set_blacs_manual", "name": "ao0", "value": 1.25}]})
+    assert safe["blacs_manual"]["ao0"] == 1.25

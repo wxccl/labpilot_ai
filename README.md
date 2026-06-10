@@ -11,8 +11,8 @@ The first release is designed to be safe by default: Mock LLM, Mock runmanager/B
 - AI command schema: strict JSON actions using `type`, including `set_global`, `set_blacs_manual`, `engage`, `load_h5`, `run_single_lyse`, `run_multi_lyse`, `plot`, `fit`, `start_optimization`, and `generate_report`.
 - Safety layer: whitelist validation, type/range/array checks, high-risk confirmations, dry-run previews, diffs, rollback hooks, SQLite audit records, and Error Center reporting.
 - runmanager control: globals read/write, float/int/bool/array scan handling, shot preview, and engage through adapters.
-- BLACS manual control: mock/localhost bridge client, limited to registered manual channels.
-- lyse/HDF5 workflow: H5 folder loading, single/multi module selection, result table merging, JSONL/SQLite cache, plots, fits, and reports.
+- BLACS manual workflow: mock/localhost bridge client, readonly discovery/readback (`/status`, `/channels`, `/values`), and registered manual actions gated by the SafetyValidator.
+- lyse/HDF5 workflow: H5 folder/file loading, table row/column management, original lyse `.py` script compatibility (`lyse.path`, `Run(path)`, `lyse.data()`), LabPilot module selection, result table merging, JSONL/SQLite cache, plots, fits, and reports.
 - Optimizer: grid and Bayesian ask/tell, plus supervised auto loop: set parameters, engage, wait for new H5, run checked lyse modules, evaluate objective, and continue safely.
 - Knowledge base: local SQLite FTS index over sequence code, connection table, lyse modules, labscript source, manuals, papers, and registries. Remote LLMs only receive short retrieved snippets.
 - Protocol Designer: import text/Markdown/PDF text and image paths to generate experiment-design suggestions without executing them.
@@ -29,6 +29,7 @@ The first release is designed to be safe by default: Mock LLM, Mock runmanager/B
 - lyse fitting and plotting parameters are stored in LabPilot analysis records, JSONL, SQLite, and reports. The first release does not write fitting results back into original H5 files.
 - Knowledge snippets are short context references only; LabPilot AI does not execute arbitrary source code from the Knowledge database.
 - Real runmanager/BLACS/lyse hardware workflows must be validated in the lab in stages: low-risk globals, one shot, small grid scan, then BLACS single-channel tests.
+- v0.1.3 BLACS integration is intentionally conservative: readonly discovery/readback is the first real-bridge target. Real manual writes should only be enabled after a lab-side BLACS plugin/bridge has been reviewed and staged on low-risk channels.
 
 ## Install
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.1.2"
+version = "0.1.3"
 description = "Industrial AI copilot for labscript-suite experiments: voice commands, runmanager/BLACS/lyse control, optimization, Knowledge, Co-Sequence, and supervised logs."
 readme = "README.md"
 requires-python = ">=3.9"
