@@ -42,6 +42,7 @@ from labpilot_ai.lyse_ctrl.h5_loader import load_h5_folder
 from labpilot_ai.lyse_ctrl.multi_runner import run_multi_module
 from labpilot_ai.lyse_ctrl.result_store import JsonlResultStore, default_result_store_path, merge_result_columns
 from labpilot_ai.lyse_ctrl.single_runner import run_single_module
+from labpilot_ai.lyse_ctrl.registry_autoscan import merge_autoscanned_lyse_modules
 from labpilot_ai.optimizer.auto_loop import AutoLoopConfig, SupervisedOptimizerAutoLoop
 from labpilot_ai.optimizer.experiment_loop import OptimizerLoop
 from labpilot_ai.optimizer.history import save_optimization_history
@@ -439,6 +440,10 @@ class RegistryEditorWidget(QtWidgets.QWidget):
             combo = QtWidgets.QComboBox()
             combo.addItems(["single", "multi"])
             return combo
+        if field == "mode":
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["labpilot_module", "lyse_script"])
+            return combo
         if field in {"allow_array", "require_confirm", "ai_control", "enabled_by_default"}:
             return QtWidgets.QCheckBox()
         if field in {"description", "params"}:
@@ -474,7 +479,15 @@ class RegistryEditorWidget(QtWidgets.QWidget):
         if "backend" in row:
             row["backend"] = "blacs_manual" if self.kind == "blacs" else "runmanager"
         if self.kind == "lyse":
-            row.update({"group": "single", "enabled_by_default": False, "order": 100, "params": {}})
+            row.update(
+                {
+                    "group": "single",
+                    "mode": "lyse_script",
+                    "enabled_by_default": False,
+                    "order": 100,
+                    "params": {},
+                }
+            )
         return row
 
     def add_row(self):
@@ -1088,9 +1101,23 @@ class MainWindow(QtWidgets.QMainWindow):
         load_single_dir.clicked.connect(lambda: self.load_lyse_modules_folder("single_modules_dir"))
         load_multi_dir = QtWidgets.QPushButton("Load multi modules folder")
         load_multi_dir.clicked.connect(lambda: self.load_lyse_modules_folder("multi_modules_dir"))
+        scan_lyse_modules = QtWidgets.QPushButton("Scan .py modules")
+        scan_lyse_modules.clicked.connect(self.auto_scan_lyse_modules_ui)
         index_analysis = QtWidgets.QPushButton("Index analysis code")
         index_analysis.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
-        for widget in [self.h5_folder, self.h5_recursive, browse, load, save_merged, export_h5, open_output, load_single_dir, load_multi_dir, index_analysis]:
+        for widget in [
+            self.h5_folder,
+            self.h5_recursive,
+            browse,
+            load,
+            save_merged,
+            export_h5,
+            open_output,
+            load_single_dir,
+            load_multi_dir,
+            scan_lyse_modules,
+            index_analysis,
+        ]:
             row.addWidget(widget, 1 if widget is self.h5_folder else 0)
         layout.addLayout(row)
 
@@ -1538,8 +1565,13 @@ class MainWindow(QtWidgets.QMainWindow):
         reload_row = QtWidgets.QHBoxLayout()
         reload_runtime = QtWidgets.QPushButton("Reload runtime")
         reload_runtime.clicked.connect(self.reload_runtime_config)
+
+        scan_lyse_modules = QtWidgets.QPushButton("Auto scan lyse .py")
+        scan_lyse_modules.clicked.connect(self.auto_scan_lyse_modules_ui)
+
         reload_row.addWidget(QtWidgets.QLabel("Registry editor writes local ./configs/*.yaml and keeps .bak backups."))
         reload_row.addStretch()
+        reload_row.addWidget(scan_lyse_modules)
         reload_row.addWidget(reload_runtime)
         layout.addLayout(reload_row)
 
@@ -1681,7 +1713,54 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reload_runtime_config()
         except Exception as exc:
             self._show_error("Initialize project templates failed", exc)
+    def auto_scan_lyse_modules_ui(self):
+        try:
+            # 先读取最新 project_settings，避免 UI 中刚保存的路径没同步
+            self.project_settings = self.settings.load_project_settings()
 
+            single_dir = self.project_settings.get("single_modules_dir", "")
+            multi_dir = self.project_settings.get("multi_modules_dir", "")
+
+            if not str(single_dir).strip() and not str(multi_dir).strip():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Auto scan lyse modules",
+                    "Please set single_modules_dir and/or multi_modules_dir in Settings -> Project Paths first.",
+                )
+                return
+
+            registry, report = merge_autoscanned_lyse_modules(
+                self.lyse_registry,
+                single_dir=single_dir,
+                multi_dir=multi_dir,
+                project_root=self.settings.project_dir,
+                prune_missing=False,
+            )
+
+            path = self.settings.save_lyse_registry(registry)
+            self.log(
+                "Auto scanned lyse modules:\n"
+                f"  single scanned: {report['single_scanned']}\n"
+                f"  multi scanned: {report['multi_scanned']}\n"
+                f"  added: {len(report['added'])}\n"
+                f"  updated: {len(report['updated'])}\n"
+                f"  saved: {path}"
+            )
+
+            self.reload_runtime_config()
+
+            QtWidgets.QMessageBox.information(
+                self,
+                "Auto scan lyse modules",
+                "Lyse module registry updated.\n\n"
+                f"Single scanned: {report['single_scanned']}\n"
+                f"Multi scanned: {report['multi_scanned']}\n"
+                f"Added: {len(report['added'])}\n"
+                f"Updated: {len(report['updated'])}",
+            )
+
+        except Exception as exc:
+            self._show_error("Auto scan lyse modules failed", exc)
     def reload_runtime_config(self):
         self.global_registry = self.settings.load_global_registry()
         self.blacs_registry = self.settings.load_blacs_registry()

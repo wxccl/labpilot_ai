@@ -41,6 +41,7 @@ LYSE_FIELDS = [
     "group",
     "name",
     "path",
+    "mode",
     "enabled_by_default",
     "order",
     "description",
