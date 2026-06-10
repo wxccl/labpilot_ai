@@ -1,247 +1,3885 @@
-from PyQt5 import QtWidgets, QtCore, QtGui
-from labpilot_ai.app.theme import APP_STYLE
-from labpilot_ai.config.settings_manager import SettingsManager
+import json
+import queue
+import time
+from datetime import date
+from pathlib import Path
+
+import yaml
+from PyQt5 import QtCore, QtGui, QtWidgets
+from matplotlib import pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
 from labpilot_ai.ai.llm_client import LLMClient
-from labpilot_ai.safety.validator import SafetyValidator, SafetyError
-from labpilot_ai.runmanager_ctrl.backend import RunmanagerBackend
+from labpilot_ai.ai.protocol_importer import build_protocol_prompt, describe_image_attachment, import_protocol_file
+from labpilot_ai.ai.protocol_designer import draft_protocol_suggestion
+from labpilot_ai.analysis import plotting
+from labpilot_ai.analysis.fit_models import fit_histogram, fit_xy, fit_xyz
+from labpilot_ai.analysis.report_generator import generate_markdown_report
+from labpilot_ai.app.error_center import ErrorCenter
+from labpilot_ai.app.theme import APP_STYLE
+from labpilot_ai.blacs_ctrl.manual_client import BlacsManualClient
+from labpilot_ai.co_sequence import CodeChangeLogStore, apply_patch_plan, validate_patch_plan
+from labpilot_ai.config.registry_editor import (
+    BLACS_FIELDS,
+    GLOBAL_FIELDS,
+    LYSE_FIELDS,
+    PROJECT_PATH_FIELDS,
+    build_blacs_registry,
+    build_global_registry,
+    build_lyse_registry,
+    flatten_lyse_registry,
+    validate_blacs_registry,
+    validate_global_registry,
+    validate_lyse_registry,
+)
+from labpilot_ai.config.settings_manager import SettingsManager
+from labpilot_ai.directory import DIRECTORY_FIELDS, default_directory_settings, validate_directory_settings
+from labpilot_ai.experiment_log import generate_experiment_log, save_experiment_log
+from labpilot_ai.knowledge.context_builder import build_project_context
+from labpilot_ai.knowledge.indexer import KnowledgeIndexer, discover_source_files, project_db_path, source_counts
+from labpilot_ai.knowledge.search import KnowledgeSearch
 from labpilot_ai.lyse_ctrl.h5_loader import load_h5_folder
-from labpilot_ai.utils.json_utils import dumps, to_jsonable
+from labpilot_ai.lyse_ctrl.multi_runner import run_multi_module
+from labpilot_ai.lyse_ctrl.result_store import JsonlResultStore, default_result_store_path, merge_result_columns
+from labpilot_ai.lyse_ctrl.single_runner import run_single_module
+from labpilot_ai.optimizer.auto_loop import AutoLoopConfig, SupervisedOptimizerAutoLoop
+from labpilot_ai.optimizer.experiment_loop import OptimizerLoop
+from labpilot_ai.optimizer.history import save_optimization_history
+from labpilot_ai.optimizer.lyse_feedback import latest_row_position, objective_values_from_row, tell_optimizer_from_dataframe
+from labpilot_ai.runmanager_ctrl.backend import RunmanagerBackend
+from labpilot_ai.safety.validator import SafetyValidator
+from labpilot_ai.storage.database import LabPilotDatabase
+from labpilot_ai.utils.json_utils import dumps
+from labpilot_ai.utils.paths import app_icon_path, default_config_dir
+from labpilot_ai.voice.recorder import AudioRecorder, write_wav
+from labpilot_ai.voice.diagnostics import run_voice_diagnostics
+from labpilot_ai.voice.stt_backend import SpeechToTextBackend
+from labpilot_ai.voice.vad import SilenceDetector, rms
+from labpilot_ai.voice.wake_agent import WakeAgentConfig, contains_wake_name, strip_wake_name
+from labpilot_ai.voice.lexicon import VoiceLexicon
+
+
+class TranscriptionWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(str, str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, stt, audio_path, language=None, strip_wake=None):
+        super().__init__()
+        self.stt = stt
+        self.audio_path = str(audio_path)
+        self.language = language
+        self.strip_wake = strip_wake
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            text = self.stt.transcribe(self.audio_path, language=self.language)
+            if self.strip_wake:
+                text = strip_wake_name(text, self.strip_wake)
+            self.finished.emit(text, self.audio_path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class WakeStandbyWorker(QtCore.QObject):
+    status = QtCore.pyqtSignal(str)
+    level = QtCore.pyqtSignal(float)
+    command_audio_ready = QtCore.pyqtSignal(str, str)
+    failed = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, stt, config: WakeAgentConfig):
+        super().__init__()
+        self.stt = stt
+        self.config = config
+        self._running = False
+
+    def stop(self):
+        self._running = False
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            import numpy as np
+            import sounddevice as sd
+        except Exception:
+            self.failed.emit("sounddevice is not installed. Install labpilot-ai[voice] to use standby voice mode.")
+            self.stopped.emit()
+            return
+
+        q = queue.Queue()
+
+        def callback(indata, frames, time_info, status):
+            q.put(np.array(indata, dtype=np.float32, copy=True))
+
+        self._running = True
+        mode = "wake"
+        command_frames = []
+        detector = SilenceDetector(
+            threshold=self.config.silence_threshold,
+            silence_seconds=self.config.silence_seconds,
+            samplerate=self.config.samplerate,
+        )
+        seen_voice = False
+        self.status.emit(f"Standby listening for '{self.config.wake_name}'")
+        try:
+            with sd.InputStream(
+                samplerate=self.config.samplerate,
+                channels=self.config.channels,
+                dtype="float32",
+                callback=callback,
+            ):
+                buffer = []
+                buffered = 0
+                while self._running:
+                    try:
+                        frame = q.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    self.level.emit(rms(frame))
+                    if mode == "command":
+                        command_frames.append(frame)
+                        if rms(frame) >= self.config.silence_threshold:
+                            seen_voice = True
+                        if seen_voice and detector.update(frame):
+                            audio = np.concatenate(command_frames, axis=0)
+                            path = write_wav(audio, self.config.samplerate)
+                            self.command_audio_ready.emit(str(path), self.config.wake_name)
+                            self.status.emit(f"Command audio captured after '{self.config.wake_name}'.")
+                            mode = "wake"
+                            command_frames = []
+                            detector.reset()
+                            seen_voice = False
+                            buffer = []
+                            buffered = 0
+                            self.status.emit(f"Standby listening for '{self.config.wake_name}'")
+                        continue
+
+                    is_voice = rms(frame) >= self.config.silence_threshold
+                    if is_voice:
+                        buffer.append(frame)
+                        buffered += len(frame)
+                        seen_voice = True
+                        detector.reset()
+                        continue
+                    if not seen_voice:
+                        continue
+                    buffer.append(frame)
+                    buffered += len(frame)
+                    if not detector.update(frame):
+                        continue
+                    audio = np.concatenate(buffer, axis=0)
+                    buffer = []
+                    buffered = 0
+                    seen_voice = False
+                    path = write_wav(audio, self.config.samplerate)
+                    heard = self.stt.transcribe(path, language=None)
+                    if contains_wake_name(heard, self.config.wake_name):
+                        self.status.emit(f"Wake word heard: {heard}")
+                        stripped = strip_wake_name(heard, self.config.wake_name)
+                        if stripped:
+                            self.command_audio_ready.emit(str(path), self.config.wake_name)
+                        else:
+                            mode = "command"
+                            command_frames = []
+                            detector.reset()
+                            seen_voice = False
+                            self.status.emit("Wake word accepted. Recording command...")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self._running = False
+            self.stopped.emit()
+
+
+class OptimizerAutoLoopWorker(QtCore.QObject):
+    status = QtCore.pyqtSignal(str)
+    step_result = QtCore.pyqtSignal(dict)
+    dataframe_ready = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(dict)
+
+    def __init__(
+        self,
+        spec,
+        validator,
+        runmanager,
+        lyse_registry,
+        h5_folder,
+        *,
+        h5_recursive=False,
+        checked_singles=None,
+        checked_multis=None,
+        dry_run=False,
+        high_risk_approved=False,
+    ):
+        super().__init__()
+        self.spec = dict(spec)
+        self.validator = validator
+        self.runmanager = runmanager
+        self.lyse_registry = lyse_registry
+        self.h5_folder = str(h5_folder or "")
+        self.h5_recursive = bool(h5_recursive)
+        self.checked_singles = list(checked_singles or [])
+        self.checked_multis = list(checked_multis or [])
+        self.dry_run = bool(dry_run)
+        self.high_risk_approved = bool(high_risk_approved)
+        self.runner = None
+        self._pause_requested = False
+        self._stop_requested = False
+
+    def request_pause(self):
+        self._pause_requested = True
+        if self.runner:
+            self.runner.request_pause()
+
+    def resume(self):
+        self._pause_requested = False
+        if self.runner:
+            self.runner.resume()
+
+    def request_stop(self):
+        self._stop_requested = True
+        if self.runner:
+            self.runner.request_stop()
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        db = None
+        try:
+            output_dir = Path.cwd() / "labpilot_outputs"
+            history_path = output_dir / "optimizer" / f"{self.spec.get('name', 'optimization')}_history.json"
+            config = AutoLoopConfig.from_spec(
+                self.spec,
+                dry_run=self.dry_run,
+                h5_recursive=self.h5_recursive,
+                high_risk_approved=self.high_risk_approved,
+                history_path=str(history_path),
+            )
+            db = LabPilotDatabase(output_dir / "labpilot.sqlite")
+
+            def apply_params(params):
+                safe = self.validator.validate_command(
+                    {"actions": [{"type": "set_global", "name": name, "value": value} for name, value in params.items()]}
+                )
+                if safe.get("confirmations") and not config.high_risk_approved:
+                    raise RuntimeError("High risk optimizer parameters were not approved before starting auto loop.")
+                diff = self.runmanager.preview_diff(safe["globals"])
+                self.runmanager.set_globals(safe["globals"])
+                return {"safe": safe, "diff": diff}
+
+            def engage():
+                self.runmanager.set_run_shots(True)
+                return self.runmanager.engage()
+
+            def load_dataframe(_h5_path):
+                return load_h5_folder(self.h5_folder, recursive=self.h5_recursive)
+
+            def evaluate_feedback(loop, dataframe, h5_path, iteration):
+                row = latest_row_position(dataframe)
+                row_h5 = dataframe.iloc[row]["filepath"] if "filepath" in dataframe.columns else h5_path
+                extra_values = {}
+                for name in self.checked_singles if config.run_checked_modules else []:
+                    result = run_single_module(self.lyse_registry, name, row_h5, params={})
+                    merge_result_columns(dataframe, row, result)
+                    self._append_jsonl("single", name, result, {"h5_path": str(row_h5), "row_index": row, "iteration": iteration})
+                for name in self.checked_multis if config.run_checked_modules else []:
+                    result = run_multi_module(self.lyse_registry, name, dataframe, params={})
+                    extra_values.update(self._prefix_objective_values(name, result))
+                    self._append_jsonl("multi", name, result, {"iteration": iteration, "rows": len(dataframe)})
+                feedback = tell_optimizer_from_dataframe(
+                    loop,
+                    dataframe,
+                    row_position=row,
+                    extra_values=extra_values,
+                    metadata={
+                        "source": "auto_loop_latest_h5",
+                        "checked_singles": self.checked_singles if config.run_checked_modules else [],
+                        "checked_multis": self.checked_multis if config.run_checked_modules else [],
+                        "iteration": iteration,
+                    },
+                )
+                self._append_jsonl("optimizer_tell", loop.session.objective, feedback, feedback.get("metadata"))
+                self.dataframe_ready.emit(dataframe)
+                return feedback
+
+            def record_point(result):
+                db.log_optimization_point(
+                    config.session_id,
+                    result.get("iteration", 0),
+                    result.get("status", ""),
+                    result.get("params", {}),
+                    result.get("objective_value"),
+                    result,
+                )
+
+            def save_history_callback(session_dict):
+                save_optimization_history(history_path, session_dict)
+                db.upsert_optimization_session(config.session_id, session_dict.get("auto_loop_status", "running"), session_dict)
+
+            self.runner = SupervisedOptimizerAutoLoop(
+                self.spec,
+                apply_params,
+                engage,
+                load_dataframe,
+                evaluate_feedback,
+                h5_folder=None if self.dry_run else self.h5_folder,
+                config=config,
+                record_point=record_point,
+                save_history=save_history_callback,
+                status_callback=self.status.emit,
+            )
+            if self._pause_requested:
+                self.runner.request_pause()
+            if self._stop_requested:
+                self.runner.request_stop()
+
+            last = {}
+            while True:
+                result = self.runner.step()
+                last = result
+                self.step_result.emit(result)
+                if result["status"] in {"complete", "stopped", "error", "dry_run_preview"}:
+                    break
+                while self.runner.should_pause() and not self.runner.should_stop():
+                    self.status.emit("Auto loop paused. Press Resume loop to continue.")
+                    time.sleep(0.2)
+                if self.runner.should_stop():
+                    continue
+            if last.get("status") == "error":
+                self.failed.emit(last.get("message") or last.get("error", "Auto loop failed"))
+            self.finished.emit(last)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            self.finished.emit({"status": "error", "error": repr(exc)})
+        finally:
+            if db is not None:
+                db.close()
+
+    def _append_jsonl(self, kind, name, result, metadata=None):
+        store = JsonlResultStore(default_result_store_path())
+        store.append(kind, name, result, metadata=metadata)
+
+    def _prefix_objective_values(self, prefix, result):
+        values = objective_values_from_row(result or {})
+        out = {}
+        for key, value in values.items():
+            out[key] = value
+            out[f"{prefix}.{key}"] = value
+        return out
+
+
+class RegistryEditorWidget(QtWidgets.QWidget):
+    save_requested = QtCore.pyqtSignal(object)
+    validate_requested = QtCore.pyqtSignal(object)
+
+    def __init__(self, title, fields, rows=None, kind="global", parent=None):
+        super().__init__(parent)
+        self.fields = list(fields)
+        self.kind = kind
+        self.form_widgets = {}
+        self._loading_form = False
+
+        layout = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel(title))
+        header.addStretch()
+        for label, slot in [
+            ("Add", self.add_row),
+            ("Duplicate", self.duplicate_row),
+            ("Delete", self.delete_row),
+            ("Apply form", self.apply_form_to_table),
+            ("Validate", self.emit_validate),
+            ("Save registry", self.emit_save),
+        ]:
+            button = QtWidgets.QPushButton(label)
+            button.clicked.connect(slot)
+            header.addWidget(button)
+        layout.addLayout(header)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.table = QtWidgets.QTableWidget(0, len(self.fields))
+        self.table.setHorizontalHeaderLabels(self.fields)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.table.itemSelectionChanged.connect(self.load_selected_row_to_form)
+        split.addWidget(self.table)
+
+        form_host = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(form_host)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        for field in self.fields:
+            widget = self._make_form_widget(field)
+            self.form_widgets[field] = widget
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(widget, 1)
+            if field == "path":
+                browse = QtWidgets.QPushButton("Browse")
+                browse.clicked.connect(self.browse_path)
+                row.addWidget(browse)
+            form.addRow(field, row)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(form_host)
+        split.addWidget(scroll)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        layout.addWidget(split, 1)
+        self.set_rows(rows or [])
+
+    def _make_form_widget(self, field):
+        if field == "type":
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["float", "int", "bool", "str", "float_array"] if self.kind == "global" else ["float", "int", "bool", "str"])
+            return combo
+        if field == "risk":
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["low", "medium", "high"])
+            return combo
+        if field == "group":
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["single", "multi"])
+            return combo
+        if field in {"allow_array", "require_confirm", "ai_control", "enabled_by_default"}:
+            return QtWidgets.QCheckBox()
+        if field in {"description", "params"}:
+            edit = QtWidgets.QPlainTextEdit()
+            edit.setMaximumHeight(90)
+            return edit
+        return QtWidgets.QLineEdit()
+
+    def set_rows(self, rows):
+        self.table.setRowCount(0)
+        for row_values in rows:
+            self._append_row(row_values)
+        if self.table.rowCount():
+            self.table.selectRow(0)
+
+    def _append_row(self, values):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        for col, field in enumerate(self.fields):
+            value = values.get(field, "")
+            if isinstance(value, list):
+                value = ", ".join(str(v) for v in value)
+            elif isinstance(value, dict):
+                value = yaml.safe_dump(value, allow_unicode=True, sort_keys=False).strip()
+            self.table.setItem(row, col, QtWidgets.QTableWidgetItem(str(value)))
+
+    def default_row(self):
+        row = {field: "" for field in self.fields}
+        if "type" in row:
+            row["type"] = "float"
+        if "risk" in row:
+            row["risk"] = "low"
+        if "backend" in row:
+            row["backend"] = "blacs_manual" if self.kind == "blacs" else "runmanager"
+        if self.kind == "lyse":
+            row.update({"group": "single", "enabled_by_default": False, "order": 100, "params": {}})
+        return row
+
+    def add_row(self):
+        self.apply_form_to_table()
+        self._append_row(self.default_row())
+        self.table.selectRow(self.table.rowCount() - 1)
+
+    def duplicate_row(self):
+        self.apply_form_to_table()
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self._append_row(self.row_dict(row))
+        self.table.selectRow(self.table.rowCount() - 1)
+
+    def delete_row(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        reply = QtWidgets.QMessageBox.question(self, "Delete registry item", "Delete the selected registry item?")
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.table.removeRow(row)
+
+    def row_dict(self, row):
+        out = {}
+        for col, field in enumerate(self.fields):
+            item = self.table.item(row, col)
+            out[field] = item.text() if item else ""
+        return out
+
+    def rows(self):
+        self.apply_form_to_table()
+        return [self.row_dict(row) for row in range(self.table.rowCount())]
+
+    def load_selected_row_to_form(self):
+        if self._loading_form:
+            return
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self._loading_form = True
+        try:
+            values = self.row_dict(row)
+            for field, widget in self.form_widgets.items():
+                self._set_widget_value(widget, values.get(field, ""))
+        finally:
+            self._loading_form = False
+
+    def apply_form_to_table(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        for col, field in enumerate(self.fields):
+            value = self._widget_value(self.form_widgets[field])
+            item = self.table.item(row, col)
+            if item is None:
+                item = QtWidgets.QTableWidgetItem()
+                self.table.setItem(row, col, item)
+            item.setText(value)
+
+    def _set_widget_value(self, widget, value):
+        if isinstance(widget, QtWidgets.QComboBox):
+            text = str(value)
+            index = widget.findText(text)
+            if index < 0:
+                widget.addItem(text)
+                index = widget.findText(text)
+            widget.setCurrentIndex(index)
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            widget.setChecked(str(value).strip().lower() in {"true", "1", "yes", "on", "enabled"})
+        elif isinstance(widget, QtWidgets.QPlainTextEdit):
+            widget.setPlainText(str(value))
+        elif isinstance(widget, QtWidgets.QLineEdit):
+            widget.setText(str(value))
+
+    def _widget_value(self, widget):
+        if isinstance(widget, QtWidgets.QComboBox):
+            return widget.currentText()
+        if isinstance(widget, QtWidgets.QCheckBox):
+            return "true" if widget.isChecked() else "false"
+        if isinstance(widget, QtWidgets.QPlainTextEdit):
+            return widget.toPlainText()
+        if isinstance(widget, QtWidgets.QLineEdit):
+            return widget.text()
+        return ""
+
+    def browse_path(self):
+        current = self.form_widgets.get("path")
+        if current is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose module file", "", "Python files (*.py);;All files (*.*)")
+        if path:
+            current.setText(path)
+
+    def emit_validate(self):
+        self.validate_requested.emit(self.rows())
+
+    def emit_save(self):
+        self.save_requested.emit(self.rows())
+
+
+class ProjectPathsWidget(QtWidgets.QWidget):
+    save_requested = QtCore.pyqtSignal(dict)
+    init_templates_requested = QtCore.pyqtSignal()
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = dict(settings or {})
+        self.edits = {}
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        for field in PROJECT_PATH_FIELDS:
+            if field == "knowledge_context_enabled":
+                edit = QtWidgets.QCheckBox("Use local knowledge snippets in AI prompts")
+                edit.setChecked(bool(self.settings.get(field, True)))
+            else:
+                edit = QtWidgets.QLineEdit(str(self.settings.get(field, "")))
+            self.edits[field] = edit
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(edit, 1)
+            if field not in {"shot_naming_rule", "knowledge_context_enabled"}:
+                button = QtWidgets.QPushButton("Browse")
+                button.clicked.connect(lambda checked=False, f=field: self.browse(f))
+                row.addWidget(button)
+            form.addRow(field, row)
+        layout.addLayout(form)
+        buttons = QtWidgets.QHBoxLayout()
+        save = QtWidgets.QPushButton("Save project settings")
+        save.clicked.connect(lambda: self.save_requested.emit(self.values()))
+        init = QtWidgets.QPushButton("Init/repair project templates")
+        init.clicked.connect(self.init_templates_requested.emit)
+        buttons.addWidget(save)
+        buttons.addWidget(init)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        layout.addStretch(1)
+
+    def browse(self, field):
+        if field in {"connection_table", "active_connection_table", "active_sequence_file", "runmanager_globals_path", "blacs_connection_context_path"}:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field}", "", "Python files (*.py);;YAML files (*.yaml *.yml);;All files (*.*)")
+        elif field == "knowledge_db_path":
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Choose knowledge database", "", "SQLite database (*.sqlite *.db);;All files (*.*)")
+        else:
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Choose {field}")
+        if path:
+            self.edits[field].setText(path)
+
+    def values(self):
+        out = dict(self.settings)
+        for field, edit in self.edits.items():
+            if isinstance(edit, QtWidgets.QCheckBox):
+                out[field] = edit.isChecked()
+            else:
+                out[field] = edit.text()
+        return out
+
+    def set_settings(self, settings):
+        self.settings = dict(settings or {})
+        for field, edit in self.edits.items():
+            if isinstance(edit, QtWidgets.QCheckBox):
+                edit.setChecked(bool(self.settings.get(field, True)))
+            else:
+                edit.setText(str(self.settings.get(field, "")))
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, error_center=None, database=None):
         super().__init__()
-        self.setWindowTitle("LabPilot AI - Starter")
-        self.resize(1350, 850)
+        self.setWindowTitle("LabPilot AI")
+        self.resize(1450, 900)
         self.setStyleSheet(APP_STYLE)
+        icon = app_icon_path()
+        if icon.exists():
+            self.setWindowIcon(QtGui.QIcon(str(icon)))
 
         self.settings = SettingsManager()
         self.global_registry = self.settings.load_global_registry()
         self.blacs_registry = self.settings.load_blacs_registry()
         self.lyse_registry = self.settings.load_lyse_registry()
-        self.validator = SafetyValidator(self.global_registry, self.blacs_registry)
+        self.project_settings = self.settings.load_project_settings()
+        self.error_records = []
+        self.database = database or LabPilotDatabase(Path.cwd() / "labpilot_outputs" / "labpilot_state.sqlite")
+        self.error_center = error_center or ErrorCenter(database=self.database, parent=self)
+        if self.error_center.parent() is None:
+            self.error_center.setParent(self)
+        self.error_center.record_added.connect(self.on_error_record_added)
+        self.error_center.install_global_hooks(qt_message_handler=True)
+
+        self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
         self.rm = RunmanagerBackend(mock=True)
+        self.blacs = BlacsManualClient(mock=True)
+        voice_cfg = self.project_settings.get("voice", {})
+        self.voice_lexicon = VoiceLexicon.from_registries(
+            self.global_registry,
+            self.blacs_registry,
+            self.lyse_registry,
+            extra_path=self.settings.path("voice_lexicon.yaml"),
+        )
+        self.stt = SpeechToTextBackend(
+            model_size=voice_cfg.get("model_size", "small"),
+            device=voice_cfg.get("device", "cpu"),
+            language=voice_cfg.get("language", "zh,en"),
+            isolated=self._voice_isolated_from_config(voice_cfg),
+            compute_type=voice_cfg.get("compute_type", "int8"),
+            initial_prompt=self.voice_lexicon.prompt(),
+            model_lifetime=voice_cfg.get("model_lifetime", "isolated_release"),
+        )
+        self.voice_recorder = AudioRecorder(
+            samplerate=voice_cfg.get("samplerate", 16000),
+            channels=1,
+        )
+        self.voice_recording = False
+        self.transcription_thread = None
+        self.transcription_worker = None
+        self.wake_thread = None
+        self.wake_worker = None
+        self.mic_level_timer = QtCore.QTimer(self)
+        self.mic_level_timer.setInterval(100)
+        self.mic_level_timer.timeout.connect(self.update_manual_mic_level)
+
         self.last_command = None
         self.last_safe = None
+        self.h5_df = None
+        self.fit_results = []
+        self.figure_paths = []
+        self.analysis_records = []
+        self.result_store = JsonlResultStore(default_result_store_path())
+        self.optimizer_loop = None
+        self.optimizer_pending_params = None
+        self.optimizer_last_session = None
+        self.auto_loop_thread = None
+        self.auto_loop_worker = None
+        self.voice_diagnostic_report = None
+        self.protocol_attachments = []
+        self.knowledge_results = []
+        self.last_project_context = ""
+        self.optimizer_status_state = "idle"
+        self.co_sequence_plan = None
+        self.co_sequence_validation = None
+        self.experiment_log_text = ""
 
         self._build_ui()
-        self.log("LabPilot AI starter loaded. 默认 Mock runmanager + Dry run。")
+        self.log("LabPilot AI loaded. Default mode: Mock LLM, Mock runmanager, Mock BLACS, Dry run.")
 
     def _build_ui(self):
+        central = QtWidgets.QWidget()
+        central_layout = QtWidgets.QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._ribbon())
         self.tabs = QtWidgets.QTabWidget()
-        self.setCentralWidget(self.tabs)
-        self.tabs.addTab(self._command_page(), "Command Center")
+        central_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+        self.tabs.addTab(self._command_page(), "Command")
         self.tabs.addTab(self._runmanager_page(), "Runmanager")
         self.tabs.addTab(self._blacs_page(), "BLACS Manual")
         self.tabs.addTab(self._lyse_page(), "Lyse")
         self.tabs.addTab(self._optimizer_page(), "Optimizer")
-        self.tabs.addTab(self._protocol_page(), "Protocol Designer")
+        self.tabs.addTab(self._co_sequence_page(), "Co-Sequence")
+        self.tabs.addTab(self._experiment_log_page(), "Experiment Log")
+        self.tabs.addTab(self._protocol_page(), "Protocol")
+        self.tabs.addTab(self._knowledge_page(), "Knowledge")
+        self.tabs.addTab(self._directory_page(), "Directory")
+        self.tabs.addTab(self._diagnostics_page(), "Diagnostics")
+        self.tabs.addTab(self._error_center_page(), "Error Center")
         self.tabs.addTab(self._settings_page(), "Settings")
-        self.tabs.addTab(self._logs_page(), "Logs")
+        self.tabs.currentChanged.connect(self._update_inspector)
+
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self._project_dock())
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._inspector_dock())
+
+        log_dock = QtWidgets.QDockWidget("Logs", self)
+        log_dock.setObjectName("LabPilotLogsDock")
+        log_dock.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+        self.log_text = QtWidgets.QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        log_dock.setWidget(self.log_text)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, log_dock)
         self.statusBar().showMessage("Ready")
+        self._update_inspector()
+
+    def _ribbon(self):
+        ribbon = QtWidgets.QWidget()
+        ribbon.setObjectName("Ribbon")
+        layout = QtWidgets.QHBoxLayout(ribbon)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+        for label, slot, tip in [
+            ("Parse", lambda: self.parse_command(), "Parse natural language into safe actions"),
+            ("Execute", self.execute_last, "Execute the last safe action"),
+            ("Record", self.toggle_voice_recording, "Start or stop voice recording"),
+            ("Voice Diag", self.run_voice_diagnostics_ui, "Check CPU voice runtime"),
+            ("Refresh RM", self.refresh_globals, "Refresh runmanager globals"),
+            ("Load H5", lambda: self.load_h5_table(), "Load lyse H5 table"),
+        ]:
+            layout.addWidget(self._ribbon_button(label, slot, tip))
+        layout.addStretch(1)
+        self.cpu_voice_light = QtWidgets.QLabel("STT CPU")
+        self.cpu_voice_light.setObjectName("StatusLightOk")
+        layout.addWidget(self.cpu_voice_light)
+        return ribbon
+
+    def _ribbon_button(self, label, slot, tooltip):
+        button = QtWidgets.QToolButton()
+        button.setText(label)
+        button.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+        button.setToolTip(tooltip)
+        button.clicked.connect(lambda checked=False, s=slot: s())
+        return button
+
+    def _project_dock(self):
+        dock = QtWidgets.QDockWidget("Project", self)
+        dock.setObjectName("LabPilotProjectDock")
+        self.project_tree = QtWidgets.QTreeWidget()
+        self.project_tree.setHeaderLabels(["Item", "Count"])
+        self._fill_project_tree()
+        dock.setWidget(self.project_tree)
+        return dock
+
+    def _fill_project_tree(self):
+        self.project_tree.clear()
+        root = QtWidgets.QTreeWidgetItem(["LabPilot AI", ""])
+        registries = QtWidgets.QTreeWidgetItem(["Registries", ""])
+        registries.addChild(QtWidgets.QTreeWidgetItem(["Globals", str(len(self.global_registry))]))
+        registries.addChild(QtWidgets.QTreeWidgetItem(["BLACS manual", str(len(self.blacs_registry))]))
+        single_count = len((self.lyse_registry.get("single_modules", {}) or {}))
+        multi_count = len((self.lyse_registry.get("multi_modules", {}) or {}))
+        registries.addChild(QtWidgets.QTreeWidgetItem(["Lyse single", str(single_count)]))
+        registries.addChild(QtWidgets.QTreeWidgetItem(["Lyse multi", str(multi_count)]))
+        voice = QtWidgets.QTreeWidgetItem(["Voice", str(self.stt.device).upper()])
+        voice.addChild(QtWidgets.QTreeWidgetItem(["Wake name", self.project_settings.get("voice", {}).get("wake_name", "labscript")]))
+        voice.addChild(QtWidgets.QTreeWidgetItem(["Lexicon terms", str(len(self.voice_lexicon.terms))]))
+        knowledge = QtWidgets.QTreeWidgetItem(["Knowledge sources", ""])
+        try:
+            counts = source_counts(self.project_settings, project_dir=self.settings.project_dir)
+        except Exception:
+            counts = {}
+        for category in ["sequence", "connection_table", "single_lyse", "multi_lyse", "labscript_source", "manual", "paper", "registry"]:
+            knowledge.addChild(QtWidgets.QTreeWidgetItem([category, str(counts.get(category, 0))]))
+        root.addChild(registries)
+        root.addChild(voice)
+        root.addChild(knowledge)
+        self.project_tree.addTopLevelItem(root)
+        self.project_tree.expandAll()
+
+    def _inspector_dock(self):
+        dock = QtWidgets.QDockWidget("Inspector", self)
+        dock.setObjectName("LabPilotInspectorDock")
+        self.inspector_text = QtWidgets.QPlainTextEdit()
+        self.inspector_text.setReadOnly(True)
+        dock.setWidget(self.inspector_text)
+        return dock
+
+    def _update_inspector(self):
+        if not hasattr(self, "inspector_text"):
+            return
+        tab = self.tabs.tabText(self.tabs.currentIndex()) if hasattr(self, "tabs") else "LabPilot"
+        payload = {
+            "workspace": tab,
+            "dry_run": self.dry_run.isChecked() if hasattr(self, "dry_run") else True,
+            "voice": {
+                "device": self.stt.device if hasattr(self, "stt") else "cpu",
+                "compute_type": self.stt.compute_type if hasattr(self, "stt") else "int8",
+                "model_size": self.stt.model_size if hasattr(self, "stt") else "small",
+                "wake_name": self.voice_wake_name.text() if hasattr(self, "voice_wake_name") else "labscript",
+                "lexicon_terms": len(self.voice_lexicon.terms) if hasattr(self, "voice_lexicon") else 0,
+            },
+            "last_safe": bool(self.last_safe),
+        }
+        self.inspector_text.setPlainText(dumps(payload, indent=2))
 
     def _command_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        top = QtWidgets.QGroupBox("AI / Safety Settings"); grid = QtWidgets.QGridLayout(top)
-        self.api_key = QtWidgets.QLineEdit(); self.api_key.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.api_key.setText("")
-        self.base_url = QtWidgets.QLineEdit("https://api.deepseek.com")
-        self.model = QtWidgets.QLineEdit("deepseek-v4-flash")
-        self.mock_llm = QtWidgets.QCheckBox("Mock LLM"); self.mock_llm.setChecked(True)
-        self.mock_rm = QtWidgets.QCheckBox("Mock runmanager"); self.mock_rm.setChecked(True); self.mock_rm.stateChanged.connect(self._update_rm_mode)
-        self.dry_run = QtWidgets.QCheckBox("Dry run"); self.dry_run.setChecked(True)
-        self.auto_write = QtWidgets.QCheckBox("自动写入")
-        self.auto_run = QtWidgets.QCheckBox("自动写入并运行")
-        grid.addWidget(QtWidgets.QLabel("API Key"),0,0); grid.addWidget(self.api_key,0,1)
-        grid.addWidget(QtWidgets.QLabel("Base URL"),1,0); grid.addWidget(self.base_url,1,1)
-        grid.addWidget(QtWidgets.QLabel("Model"),2,0); grid.addWidget(self.model,2,1)
-        grid.addWidget(self.mock_llm,3,0); grid.addWidget(self.mock_rm,3,1)
-        grid.addWidget(self.dry_run,4,0); grid.addWidget(self.auto_write,4,1); grid.addWidget(self.auto_run,4,2)
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+
+        top = QtWidgets.QGroupBox("AI and safety")
+        grid = QtWidgets.QGridLayout(top)
+        ai_cfg = self.project_settings.get("ai", {})
+        self.api_key = QtWidgets.QLineEdit()
+        self.api_key.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.base_url = QtWidgets.QLineEdit(ai_cfg.get("base_url", "https://api.deepseek.com"))
+        self.model = QtWidgets.QLineEdit(ai_cfg.get("model", "deepseek-v4-flash"))
+        self.mock_llm = QtWidgets.QCheckBox("Mock LLM")
+        self.mock_llm.setChecked(True)
+        self.mock_rm = QtWidgets.QCheckBox("Mock runmanager")
+        self.mock_rm.setChecked(True)
+        self.mock_rm.stateChanged.connect(self._update_rm_mode)
+        self.mock_blacs = QtWidgets.QCheckBox("Mock BLACS")
+        self.mock_blacs.setChecked(True)
+        self.mock_blacs.stateChanged.connect(self._update_blacs_mode)
+        self.dry_run = QtWidgets.QCheckBox("Dry run")
+        self.dry_run.setChecked(True)
+        self.auto_write = QtWidgets.QCheckBox("Auto write")
+        self.auto_run = QtWidgets.QCheckBox("Auto write and run")
+        self.clear_after_parse = QtWidgets.QCheckBox("Clear command after Parse")
+        grid.addWidget(QtWidgets.QLabel("API key"), 0, 0)
+        grid.addWidget(self.api_key, 0, 1, 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Base URL"), 1, 0)
+        grid.addWidget(self.base_url, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Model"), 1, 2)
+        grid.addWidget(self.model, 1, 3)
+        for col, widget in enumerate([self.mock_llm, self.mock_rm, self.mock_blacs, self.dry_run, self.auto_write, self.auto_run, self.clear_after_parse]):
+            grid.addWidget(widget, 2 + col // 3, col % 3)
         layout.addWidget(top)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal); layout.addWidget(split, 1)
-        left = QtWidgets.QWidget(); l = QtWidgets.QVBoxLayout(left)
-        self.command_text = QtWidgets.QPlainTextEdit(); self.command_text.setPlaceholderText("例如：把 TOF 改成 17 ms，不运行\n把 TOF 从 5 到 20 ms 扫描 4 个点并运行一次")
-        l.addWidget(QtWidgets.QLabel("Natural language command")); l.addWidget(self.command_text, 1)
-        btns = QtWidgets.QHBoxLayout()
-        b_parse = QtWidgets.QPushButton("Parse"); b_parse.clicked.connect(self.parse_command)
-        b_exec = QtWidgets.QPushButton("Execute last safe action"); b_exec.clicked.connect(self.execute_last)
-        b_clear = QtWidgets.QPushButton("Clear"); b_clear.clicked.connect(lambda: self.command_text.setPlainText(""))
-        btns.addWidget(b_parse); btns.addWidget(b_exec); btns.addWidget(b_clear); l.addLayout(btns)
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        layout.addWidget(split, 1)
+
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        self.command_text = QtWidgets.QPlainTextEdit()
+        self.command_text.setPlaceholderText(
+            "Examples:\n"
+            "Set TOF to 17 ms, do not run.\n"
+            "Scan TOF from 5 to 20 ms with 4 points and run once.\n"
+            "Start grid optimization maximizing N_total over duration_tof_ms from 5 to 20 with 6 points."
+        )
+        left_layout.addWidget(QtWidgets.QLabel("Natural language command"))
+        left_layout.addWidget(self.command_text, 1)
+        command_buttons = QtWidgets.QHBoxLayout()
+        b_voice = QtWidgets.QPushButton("Transcribe audio file")
+        b_voice.clicked.connect(self.transcribe_audio_file)
+        voice_box = QtWidgets.QGroupBox("Voice input")
+        voice_layout = QtWidgets.QGridLayout(voice_box)
+        self.voice_toggle_button = QtWidgets.QPushButton("Start voice recording")
+        self.voice_toggle_button.setCheckable(True)
+        self.voice_toggle_button.clicked.connect(self.toggle_voice_recording)
+        self.voice_after_transcribe = QtWidgets.QComboBox()
+        self.voice_after_transcribe.addItem("Fill command box only", "fill")
+        self.voice_after_transcribe.addItem("Parse after transcription", "parse")
+        self.voice_after_transcribe.addItem("Parse and execute after transcription", "execute")
+        self.voice_backend = QtWidgets.QComboBox()
+        self.voice_backend.addItem("CPU stable", "cpu")
+        self.voice_backend.addItem("GPU RTX/CUDA", "cuda")
+        backend_index = max(0, self.voice_backend.findData(self.stt.device))
+        self.voice_backend.setCurrentIndex(backend_index)
+        self.voice_backend.currentIndexChanged.connect(self.apply_voice_profile)
+        self.voice_profile = QtWidgets.QComboBox()
+        self.voice_profile.addItem("Fast CPU (tiny)", "fast")
+        self.voice_profile.addItem("Balanced CPU (small)", "balanced")
+        self.voice_profile.addItem("Accurate CPU (medium)", "accurate")
+        self.voice_profile.addItem("Fast GPU (small/float16)", "gpu_fast")
+        self.voice_profile.addItem("Accurate GPU (large-v3/float16)", "gpu_accurate")
+        profile = self.project_settings.get("voice", {}).get("profile", "balanced")
+        idx = max(0, self.voice_profile.findData(profile))
+        self.voice_profile.setCurrentIndex(idx)
+        self.voice_profile.currentIndexChanged.connect(self.apply_voice_profile)
+        self.voice_lifetime = QtWidgets.QComboBox()
+        self.voice_lifetime.addItem("Release after transcription", "isolated_release")
+        self.voice_lifetime.addItem("Persistent GPU model", "persistent_gpu")
+        self.voice_lifetime.addItem("Persistent CPU model", "persistent_cpu")
+        lifetime = self.project_settings.get("voice", {}).get("model_lifetime", "isolated_release")
+        self.voice_lifetime.setCurrentIndex(max(0, self.voice_lifetime.findData(lifetime)))
+        self.voice_lifetime.currentIndexChanged.connect(self.apply_voice_profile)
+        release_model = QtWidgets.QPushButton("Release STT model")
+        release_model.clicked.connect(self.release_stt_model)
+        self.voice_language = QtWidgets.QComboBox()
+        self.voice_language.addItem("Chinese + English auto", "zh,en")
+        self.voice_language.addItem("Auto detect", "auto")
+        self.voice_language.addItem("Chinese", "zh")
+        self.voice_language.addItem("English", "en")
+        self.voice_wake_name = QtWidgets.QLineEdit(self.project_settings.get("voice", {}).get("wake_name", "labscript"))
+        self.voice_standby = QtWidgets.QCheckBox("Standby wake mode")
+        self.voice_standby.stateChanged.connect(self.toggle_wake_standby)
+        self.voice_status = QtWidgets.QLabel("Voice idle")
+        self.voice_runtime_label = QtWidgets.QLabel(self._voice_runtime_text())
+        self.voice_runtime_label.setObjectName("StatusLightOk")
+        self.mic_level = QtWidgets.QProgressBar()
+        self.mic_level.setRange(0, 100)
+        self.mic_level.setValue(0)
+        self.mic_level.setTextVisible(True)
+        self.mic_level.setFormat("Mic level %p%")
+        self.mic_signal_label = QtWidgets.QLabel("Silent")
+        self.mic_signal_label.setObjectName("StatusLightWarn")
+        b_voice_diag = QtWidgets.QPushButton("Diagnostics")
+        b_voice_diag.clicked.connect(self.run_voice_diagnostics_ui)
+        voice_layout.addWidget(self.voice_toggle_button, 0, 0)
+        voice_layout.addWidget(QtWidgets.QLabel("After transcription"), 0, 1)
+        voice_layout.addWidget(self.voice_after_transcribe, 0, 2)
+        voice_layout.addWidget(QtWidgets.QLabel("Backend"), 1, 0)
+        voice_layout.addWidget(self.voice_backend, 1, 1)
+        voice_layout.addWidget(QtWidgets.QLabel("Profile"), 1, 2)
+        voice_layout.addWidget(self.voice_profile, 1, 3)
+        voice_layout.addWidget(QtWidgets.QLabel("Language"), 2, 0)
+        voice_layout.addWidget(self.voice_language, 2, 1)
+        voice_layout.addWidget(QtWidgets.QLabel("Wake name"), 2, 2)
+        voice_layout.addWidget(self.voice_wake_name, 2, 3)
+        voice_layout.addWidget(self.voice_standby, 3, 0)
+        voice_layout.addWidget(b_voice_diag, 3, 1)
+        voice_layout.addWidget(self.voice_runtime_label, 3, 2, 1, 2)
+        voice_layout.addWidget(QtWidgets.QLabel("Input signal"), 4, 0)
+        voice_layout.addWidget(self.mic_level, 4, 1, 1, 2)
+        voice_layout.addWidget(self.mic_signal_label, 4, 3)
+        voice_layout.addWidget(QtWidgets.QLabel("Model lifetime"), 5, 0)
+        voice_layout.addWidget(self.voice_lifetime, 5, 1, 1, 2)
+        voice_layout.addWidget(release_model, 5, 3)
+        voice_layout.addWidget(self.voice_status, 6, 0, 1, 4)
+        left_layout.addWidget(voice_box)
+
+        b_parse = QtWidgets.QPushButton("Parse only")
+        b_parse.clicked.connect(lambda: self.parse_command(allow_auto=False))
+        b_preview = QtWidgets.QPushButton("Dry-run preview")
+        b_preview.clicked.connect(self.dry_run_preview)
+        b_exec = QtWidgets.QPushButton("Execute last safe action")
+        b_exec.clicked.connect(self.execute_last)
+        b_context = QtWidgets.QPushButton("Show retrieved context")
+        b_context.clicked.connect(self.show_retrieved_context)
+        b_clear = QtWidgets.QPushButton("Clear")
+        b_clear.clicked.connect(lambda: self.command_text.setPlainText(""))
+        for button in [b_voice, b_parse, b_preview, b_exec, b_context, b_clear]:
+            command_buttons.addWidget(button)
+        left_layout.addLayout(command_buttons)
         split.addWidget(left)
 
-        right = QtWidgets.QWidget(); r = QtWidgets.QVBoxLayout(right)
-        self.actions_table = QtWidgets.QTableWidget(0,4); self.actions_table.setHorizontalHeaderLabels(["action", "name", "value", "status"])
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        self.actions_table = QtWidgets.QTableWidget(0, 4)
+        self.actions_table.setHorizontalHeaderLabels(["action", "name/path", "value", "status"])
         self.actions_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.json_view = QtWidgets.QPlainTextEdit(); self.json_view.setReadOnly(True)
-        r.addWidget(QtWidgets.QLabel("Validated actions")); r.addWidget(self.actions_table, 1)
-        r.addWidget(QtWidgets.QLabel("Raw JSON / safe JSON")); r.addWidget(self.json_view, 1)
-        split.addWidget(right); split.setSizes([480, 780])
+        self.json_view = QtWidgets.QPlainTextEdit()
+        self.json_view.setReadOnly(True)
+        right_layout.addWidget(QtWidgets.QLabel("Validated actions"))
+        right_layout.addWidget(self.actions_table, 1)
+        right_layout.addWidget(QtWidgets.QLabel("Raw JSON / safe JSON"))
+        right_layout.addWidget(self.json_view, 1)
+        split.addWidget(right)
+        split.setSizes([560, 850])
         return w
 
     def _runmanager_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        btns = QtWidgets.QHBoxLayout()
-        test = QtWidgets.QPushButton("Test connection"); test.clicked.connect(self.test_rm)
-        refresh = QtWidgets.QPushButton("Refresh globals"); refresh.clicked.connect(self.refresh_globals)
-        engage = QtWidgets.QPushButton("Engage manually"); engage.clicked.connect(lambda: self.execute_last(force_run=True))
-        btns.addWidget(test); btns.addWidget(refresh); btns.addWidget(engage); btns.addStretch(); layout.addLayout(btns)
-        self.globals_table = QtWidgets.QTableWidget(0,4); self.globals_table.setHorizontalHeaderLabels(["name", "value", "whitelisted", "description"])
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        buttons = QtWidgets.QHBoxLayout()
+        test = QtWidgets.QPushButton("Test connection")
+        test.clicked.connect(self.test_rm)
+        refresh = QtWidgets.QPushButton("Refresh globals")
+        refresh.clicked.connect(self.refresh_globals)
+        rollback = QtWidgets.QPushButton("Rollback last write")
+        rollback.clicked.connect(self.rollback_globals)
+        engage = QtWidgets.QPushButton("Engage from last action")
+        engage.clicked.connect(lambda: self.execute_last(force_run=True))
+        apply_selected = QtWidgets.QPushButton("Apply selected globals")
+        apply_selected.clicked.connect(self.apply_selected_globals)
+        build_array = QtWidgets.QPushButton("Build array scan")
+        build_array.clicked.connect(self.build_array_scan_from_selected)
+        preview_shots = QtWidgets.QPushButton("Preview shots")
+        preview_shots.clicked.connect(self.preview_runmanager_shots)
+        engage_bools = QtWidgets.QPushButton("Engage checked sequence bools")
+        engage_bools.clicked.connect(self.engage_checked_sequence_bools)
+        load_sequence = QtWidgets.QPushButton("Load sequence folder")
+        load_sequence.clicked.connect(self.load_sequence_folder)
+        load_connection = QtWidgets.QPushButton("Load connection table")
+        load_connection.clicked.connect(self.load_connection_table)
+        detect_bools = QtWidgets.QPushButton("Detect sequence bools")
+        detect_bools.clicked.connect(self.detect_sequence_bools)
+        index_sequence = QtWidgets.QPushButton("Index sequence code")
+        index_sequence.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
+        for button in [test, refresh, rollback, engage, apply_selected, build_array, preview_shots, engage_bools, load_sequence, load_connection, detect_bools, index_sequence]:
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.globals_table = QtWidgets.QTableWidget(0, 6)
+        self.globals_table.setHorizontalHeaderLabels(["name", "value", "type", "unit", "risk", "description"])
         self.globals_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         layout.addWidget(self.globals_table, 1)
         return w
 
     def _blacs_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        layout.addWidget(QtWidgets.QLabel("BLACS manual bridge placeholder. 下一阶段接 localhost bridge 后在这里控制 AO/DO/DDS manual 参数。"))
-        self.blacs_table = QtWidgets.QTableWidget(0,5); self.blacs_table.setHorizontalHeaderLabels(["name", "kind", "device", "channel", "range"])
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        buttons = QtWidgets.QHBoxLayout()
+        test = QtWidgets.QPushButton("Test BLACS bridge")
+        test.clicked.connect(self.test_blacs)
+        set_selected = QtWidgets.QPushButton("Set selected manual value")
+        set_selected.clicked.connect(self.set_selected_blacs)
+        refresh_bridge = QtWidgets.QPushButton("Refresh bridge status")
+        refresh_bridge.clicked.connect(self.test_blacs)
+        apply_checked = QtWidgets.QPushButton("Apply checked channels")
+        apply_checked.clicked.connect(self.apply_checked_blacs)
+        load_connection = QtWidgets.QPushButton("Load connection table context")
+        load_connection.clicked.connect(self.load_connection_table)
+        self.blacs_program = QtWidgets.QCheckBox("Program hardware")
+        for widget in [test, refresh_bridge, set_selected, apply_checked, load_connection, self.blacs_program]:
+            buttons.addWidget(widget)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.blacs_table = QtWidgets.QTableWidget(0, 7)
+        self.blacs_table.setHorizontalHeaderLabels(["name", "kind", "device", "channel", "range", "target value", "risk"])
         self.blacs_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         layout.addWidget(self.blacs_table, 1)
         self._fill_blacs_registry()
         return w
 
     def _lyse_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
         row = QtWidgets.QHBoxLayout()
-        self.h5_folder = QtWidgets.QLineEdit()
-        browse = QtWidgets.QPushButton("Choose h5 folder"); browse.clicked.connect(self.choose_h5_folder)
-        load = QtWidgets.QPushButton("Load h5 table"); load.clicked.connect(self.load_h5_table)
-        row.addWidget(self.h5_folder,1); row.addWidget(browse); row.addWidget(load); layout.addLayout(row)
-        self.h5_table = QtWidgets.QTableWidget(0,0)
-        layout.addWidget(self.h5_table, 1)
+        self.h5_folder = QtWidgets.QLineEdit(self.project_settings.get("h5_output_dir", ""))
+        self.h5_recursive = QtWidgets.QCheckBox("Recursive")
+        browse = QtWidgets.QPushButton("Choose h5 folder")
+        browse.clicked.connect(self.choose_h5_folder)
+        load = QtWidgets.QPushButton("Load h5 table")
+        load.clicked.connect(lambda: self.load_h5_table())
+        save_merged = QtWidgets.QPushButton("Save merged results")
+        save_merged.clicked.connect(self.save_merged_results)
+        export_h5 = QtWidgets.QPushButton("Export selected H5 table")
+        export_h5.clicked.connect(self.export_h5_table)
+        open_output = QtWidgets.QPushButton("Open analysis output folder")
+        open_output.clicked.connect(self.open_analysis_output_folder)
+        load_single_dir = QtWidgets.QPushButton("Load single modules folder")
+        load_single_dir.clicked.connect(lambda: self.load_lyse_modules_folder("single_modules_dir"))
+        load_multi_dir = QtWidgets.QPushButton("Load multi modules folder")
+        load_multi_dir.clicked.connect(lambda: self.load_lyse_modules_folder("multi_modules_dir"))
+        index_analysis = QtWidgets.QPushButton("Index analysis code")
+        index_analysis.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
+        for widget in [self.h5_folder, self.h5_recursive, browse, load, save_merged, export_h5, open_output, load_single_dir, load_multi_dir, index_analysis]:
+            row.addWidget(widget, 1 if widget is self.h5_folder else 0)
+        layout.addLayout(row)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        layout.addWidget(split, 1)
+        self.h5_table = QtWidgets.QTableWidget(0, 0)
+        split.addWidget(self.h5_table)
+
+        lower = QtWidgets.QWidget()
+        lower_layout = QtWidgets.QHBoxLayout(lower)
+
+        module_box = QtWidgets.QGroupBox("Lyse modules")
+        module_layout = QtWidgets.QVBoxLayout(module_box)
+        self.single_modules = QtWidgets.QListWidget()
+        self.multi_modules = QtWidgets.QListWidget()
+        self._fill_module_lists()
+        run_single = QtWidgets.QPushButton("Run selected single on selected shot")
+        run_single.clicked.connect(self.run_selected_single)
+        run_checked_single = QtWidgets.QPushButton("Run checked singles on selected shot")
+        run_checked_single.clicked.connect(self.run_checked_single_selected)
+        run_checked_single_table = QtWidgets.QPushButton("Run checked singles on table")
+        run_checked_single_table.clicked.connect(self.run_checked_single_table)
+        run_multi = QtWidgets.QPushButton("Run selected multi on table")
+        run_multi.clicked.connect(self.run_selected_multi)
+        run_checked_multi = QtWidgets.QPushButton("Run checked multis on table")
+        run_checked_multi.clicked.connect(self.run_checked_multi_table)
+        module_layout.addWidget(QtWidgets.QLabel("Single"))
+        module_layout.addWidget(self.single_modules)
+        module_layout.addWidget(run_single)
+        module_layout.addWidget(run_checked_single)
+        module_layout.addWidget(run_checked_single_table)
+        module_layout.addWidget(QtWidgets.QLabel("Multi"))
+        module_layout.addWidget(self.multi_modules)
+        module_layout.addWidget(run_multi)
+        module_layout.addWidget(run_checked_multi)
+        lower_layout.addWidget(module_box, 1)
+
+        plot_box = QtWidgets.QGroupBox("Plot, fit, report")
+        plot_layout = QtWidgets.QGridLayout(plot_box)
+        self.plot_type = QtWidgets.QComboBox()
+        self.plot_type.addItems(["scatter_line", "mean_errorbar", "histogram", "scatter2d", "heatmap2d", "surface3d"])
+        self.fit_model = QtWidgets.QComboBox()
+        self.fit_model.addItems(["linear", "gaussian", "logarithmic", "exponential", "lorentzian", "gaussian2d", "double_gaussian2d"])
+        self.x_col = QtWidgets.QComboBox()
+        self.y_col = QtWidgets.QComboBox()
+        self.z_col = QtWidgets.QComboBox()
+        draw = QtWidgets.QPushButton("Draw plot")
+        draw.clicked.connect(self.draw_plot_from_ui)
+        fit = QtWidgets.QPushButton("Fit")
+        fit.clicked.connect(self.fit_from_ui)
+        report = QtWidgets.QPushButton("Generate report")
+        report.clicked.connect(lambda: self.generate_report_from_ui())
+        multi_report = QtWidgets.QPushButton("Generate multi report")
+        multi_report.clicked.connect(lambda: self.generate_report_from_ui("LabPilot multi analysis report"))
+        plot_layout.addWidget(QtWidgets.QLabel("Plot"), 0, 0)
+        plot_layout.addWidget(self.plot_type, 0, 1)
+        plot_layout.addWidget(QtWidgets.QLabel("Fit"), 0, 2)
+        plot_layout.addWidget(self.fit_model, 0, 3)
+        plot_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
+        plot_layout.addWidget(self.x_col, 1, 1)
+        plot_layout.addWidget(QtWidgets.QLabel("y/value"), 1, 2)
+        plot_layout.addWidget(self.y_col, 1, 3)
+        plot_layout.addWidget(QtWidgets.QLabel("z/color"), 2, 0)
+        plot_layout.addWidget(self.z_col, 2, 1)
+        plot_layout.addWidget(draw, 3, 0)
+        plot_layout.addWidget(fit, 3, 1)
+        plot_layout.addWidget(report, 3, 2)
+        plot_layout.addWidget(multi_report, 3, 3)
+        self.figure_area = QtWidgets.QWidget()
+        self.figure_layout = QtWidgets.QVBoxLayout(self.figure_area)
+        plot_layout.addWidget(self.figure_area, 4, 0, 1, 4)
+        self.analysis_results_table = QtWidgets.QTableWidget(0, 4)
+        self.analysis_results_table.setHorizontalHeaderLabels(["kind", "name", "status", "summary"])
+        self.analysis_results_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.analysis_results_table.setMaximumHeight(150)
+        plot_layout.addWidget(QtWidgets.QLabel("Analysis records"), 5, 0)
+        plot_layout.addWidget(self.analysis_results_table, 6, 0, 1, 4)
+        lower_layout.addWidget(plot_box, 2)
+        split.addWidget(lower)
+        split.setSizes([520, 320])
         return w
 
     def _optimizer_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        layout.addWidget(QtWidgets.QLabel("Optimizer placeholder. 当前先完成项目骨架；下一步实现 grid search 和 Bayesian optimization loop。"))
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        form = QtWidgets.QGridLayout()
+        self.opt_method = QtWidgets.QComboBox()
+        self.opt_method.addItems(["grid", "bayesian"])
+        self.opt_mode = QtWidgets.QComboBox()
+        self.opt_mode.addItems(["maximize", "minimize"])
+        self.opt_objective = QtWidgets.QLineEdit("N_total")
+        self.opt_iterations = QtWidgets.QSpinBox()
+        self.opt_iterations.setRange(1, 10000)
+        self.opt_iterations.setValue(10)
+        self.opt_poll_interval = QtWidgets.QDoubleSpinBox()
+        self.opt_poll_interval.setRange(0.05, 60.0)
+        self.opt_poll_interval.setValue(1.0)
+        self.opt_poll_interval.setSuffix(" s")
+        self.opt_h5_timeout = QtWidgets.QDoubleSpinBox()
+        self.opt_h5_timeout.setRange(0.1, 36000.0)
+        self.opt_h5_timeout.setValue(120.0)
+        self.opt_h5_timeout.setSuffix(" s")
+        self.opt_run_checked_modules = QtWidgets.QCheckBox("Run checked lyse modules")
+        self.opt_run_checked_modules.setChecked(True)
+        self.opt_report_on_complete = QtWidgets.QCheckBox("Report on complete")
+        self.opt_result_json = QtWidgets.QLineEdit('{"N_total": 1.0}')
+        form.addWidget(QtWidgets.QLabel("Method"), 0, 0)
+        form.addWidget(self.opt_method, 0, 1)
+        form.addWidget(QtWidgets.QLabel("Mode"), 0, 2)
+        form.addWidget(self.opt_mode, 0, 3)
+        form.addWidget(QtWidgets.QLabel("Objective"), 1, 0)
+        form.addWidget(self.opt_objective, 1, 1)
+        form.addWidget(QtWidgets.QLabel("Max iterations"), 1, 2)
+        form.addWidget(self.opt_iterations, 1, 3)
+        form.addWidget(QtWidgets.QLabel("Poll interval"), 2, 0)
+        form.addWidget(self.opt_poll_interval, 2, 1)
+        form.addWidget(QtWidgets.QLabel("H5 timeout"), 2, 2)
+        form.addWidget(self.opt_h5_timeout, 2, 3)
+        form.addWidget(self.opt_run_checked_modules, 3, 0, 1, 2)
+        form.addWidget(self.opt_report_on_complete, 3, 2, 1, 2)
+        form.addWidget(QtWidgets.QLabel("Result JSON for tell()"), 4, 0)
+        form.addWidget(self.opt_result_json, 4, 1, 1, 3)
+        layout.addLayout(form)
+
+        self.opt_params_table = QtWidgets.QTableWidget(0, 5)
+        self.opt_params_table.setHorizontalHeaderLabels(["use", "name", "min", "max", "points"])
+        self.opt_params_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.opt_params_table, 1)
+        self._fill_optimizer_params()
+
+        buttons = QtWidgets.QHBoxLayout()
+        start = QtWidgets.QPushButton("Start optimizer")
+        start.clicked.connect(self.start_optimizer_from_ui)
+        apply_next = QtWidgets.QPushButton("Apply next params")
+        apply_next.clicked.connect(self.apply_optimizer_params)
+        apply_run = QtWidgets.QPushButton("Apply next and engage")
+        apply_run.clicked.connect(self.apply_optimizer_params_and_engage)
+        tell = QtWidgets.QPushButton("Tell result and ask next")
+        tell.clicked.connect(self.tell_optimizer_result)
+        tell_latest = QtWidgets.QPushButton("Tell latest lyse result")
+        tell_latest.clicked.connect(self.tell_optimizer_latest_h5)
+        start_loop = QtWidgets.QPushButton("Start supervised loop")
+        start_loop.clicked.connect(self.start_supervised_loop_from_ui)
+        pause_loop = QtWidgets.QPushButton("Pause after current")
+        pause_loop.clicked.connect(self.pause_supervised_loop)
+        resume_loop = QtWidgets.QPushButton("Resume loop")
+        resume_loop.clicked.connect(self.resume_supervised_loop)
+        stop_loop = QtWidgets.QPushButton("Stop loop")
+        stop_loop.clicked.connect(self.stop_supervised_loop)
+        save_history = QtWidgets.QPushButton("Save history")
+        save_history.clicked.connect(self.save_optimizer_history_ui)
+        for button in [start, apply_next, apply_run, tell, tell_latest, start_loop, pause_loop, resume_loop, stop_loop, save_history]:
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.optimizer_state_label = QtWidgets.QLabel("optimizer: idle")
+        self.optimizer_state_label.setObjectName("StatusLightOk")
+        layout.addWidget(self.optimizer_state_label)
+        self.optimizer_status = QtWidgets.QPlainTextEdit()
+        self.optimizer_status.setReadOnly(True)
+        layout.addWidget(self.optimizer_status, 1)
+        return w
+
+    def _co_sequence_page(self):
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        header = QtWidgets.QGridLayout()
+        self.co_sequence_instruction = QtWidgets.QPlainTextEdit()
+        self.co_sequence_instruction.setPlaceholderText("Describe a sequence or connection table code change. Only the selected two files can be edited.")
+        self.co_sequence_instruction.setMaximumHeight(120)
+        self.co_sequence_sequence_path = QtWidgets.QLineEdit(self._active_sequence_path_text())
+        self.co_sequence_connection_path = QtWidgets.QLineEdit(self._active_connection_table_text())
+        browse_sequence = QtWidgets.QPushButton("Browse sequence")
+        browse_sequence.clicked.connect(self.browse_co_sequence_sequence)
+        browse_connection = QtWidgets.QPushButton("Browse connection table")
+        browse_connection.clicked.connect(self.browse_co_sequence_connection)
+        use_directory = QtWidgets.QPushButton("Use Directory paths")
+        use_directory.clicked.connect(self.refresh_co_sequence_paths)
+        self.co_sequence_review_required = QtWidgets.QCheckBox("Review required before apply")
+        self.co_sequence_review_required.setChecked(bool(self.project_settings.get("co_sequence", {}).get("review_required_default", True)))
+        self.co_sequence_color_tags = QtWidgets.QLineEdit()
+        self.co_sequence_color_tags.setPlaceholderText("Optional color tags, e.g. yellow: timing, red: hardware risk")
+        self.co_sequence_status = QtWidgets.QLabel("Status: No patch")
+        self.co_sequence_status.setObjectName("StatusLightOk")
+        header.addWidget(QtWidgets.QLabel("Instruction"), 0, 0)
+        header.addWidget(self.co_sequence_instruction, 0, 1, 1, 5)
+        header.addWidget(QtWidgets.QLabel("Sequence"), 1, 0)
+        header.addWidget(self.co_sequence_sequence_path, 1, 1, 1, 3)
+        header.addWidget(browse_sequence, 1, 4)
+        header.addWidget(use_directory, 1, 5)
+        header.addWidget(QtWidgets.QLabel("Connection table"), 2, 0)
+        header.addWidget(self.co_sequence_connection_path, 2, 1, 1, 3)
+        header.addWidget(browse_connection, 2, 4)
+        header.addWidget(self.co_sequence_review_required, 2, 5)
+        header.addWidget(QtWidgets.QLabel("Color tags"), 3, 0)
+        header.addWidget(self.co_sequence_color_tags, 3, 1, 1, 4)
+        header.addWidget(self.co_sequence_status, 3, 5)
+        layout.addLayout(header)
+
+        buttons = QtWidgets.QHBoxLayout()
+        generate = QtWidgets.QPushButton("Generate patch")
+        generate.clicked.connect(self.generate_co_sequence_patch)
+        validate = QtWidgets.QPushButton("Validate patch")
+        validate.clicked.connect(self.validate_co_sequence_patch_ui)
+        apply_button = QtWidgets.QPushButton("Approve & apply")
+        apply_button.clicked.connect(self.apply_co_sequence_patch_ui)
+        reject = QtWidgets.QPushButton("Reject")
+        reject.clicked.connect(self.reject_co_sequence_patch)
+        manual = QtWidgets.QPushButton("Add manual log")
+        manual.clicked.connect(self.add_manual_code_log)
+        for button in [generate, validate, apply_button, reject, manual]:
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.co_sequence_context = QtWidgets.QPlainTextEdit()
+        self.co_sequence_context.setReadOnly(True)
+        self.co_sequence_context.setPlaceholderText("Knowledge snippets used for this code change will appear here.")
+        self.co_sequence_diff = QtWidgets.QPlainTextEdit()
+        self.co_sequence_diff.setPlaceholderText("Generated JSON patch plan and validated unified diffs appear here.")
+        self.co_sequence_summary = QtWidgets.QPlainTextEdit()
+        self.co_sequence_summary.setReadOnly(True)
+        self.co_sequence_summary.setPlaceholderText("Validation summary, warnings, and log output.")
+        split.addWidget(self.co_sequence_context)
+        split.addWidget(self.co_sequence_diff)
+        split.addWidget(self.co_sequence_summary)
+        split.setSizes([360, 700, 360])
+        layout.addWidget(split, 1)
+        return w
+
+    def _experiment_log_page(self):
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        controls = QtWidgets.QGridLayout()
+        self.exp_log_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.exp_log_date.setCalendarPopup(True)
+        self.exp_log_format = QtWidgets.QComboBox()
+        self.exp_log_format.addItems(["markdown", "latex", "dokuwiki"])
+        default_format = self.project_settings.get("experiment_log", {}).get("default_format", "markdown")
+        self.exp_log_format.setCurrentIndex(max(0, self.exp_log_format.findText(default_format)))
+        self.exp_log_length = QtWidgets.QComboBox()
+        self.exp_log_length.addItem("N paragraphs", "paragraphs")
+        self.exp_log_length.addItem("One A4 page", "one_a4")
+        self.exp_log_length.addItem("Full report", "full")
+        default_length = self.project_settings.get("experiment_log", {}).get("default_length", "one_a4")
+        self.exp_log_length.setCurrentIndex(max(0, self.exp_log_length.findData(default_length)))
+        self.exp_log_paragraphs = QtWidgets.QSpinBox()
+        self.exp_log_paragraphs.setRange(1, 200)
+        self.exp_log_paragraphs.setValue(8)
+        self.exp_log_include_knowledge = QtWidgets.QCheckBox("Include Knowledge context")
+        self.exp_log_include_knowledge.setChecked(True)
+        self.exp_log_notes = QtWidgets.QPlainTextEdit()
+        self.exp_log_notes.setMaximumHeight(90)
+        self.exp_log_notes.setPlaceholderText("Optional operator notes for today's experiment log.")
+        generate = QtWidgets.QPushButton("Generate daily log")
+        generate.clicked.connect(self.generate_daily_experiment_log)
+        save = QtWidgets.QPushButton("Save")
+        save.clicked.connect(self.save_daily_experiment_log)
+        copy = QtWidgets.QPushButton("Copy")
+        copy.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.experiment_log_text))
+        open_folder = QtWidgets.QPushButton("Open folder")
+        open_folder.clicked.connect(self.open_experiment_log_folder)
+        controls.addWidget(QtWidgets.QLabel("Date"), 0, 0)
+        controls.addWidget(self.exp_log_date, 0, 1)
+        controls.addWidget(QtWidgets.QLabel("Format"), 0, 2)
+        controls.addWidget(self.exp_log_format, 0, 3)
+        controls.addWidget(QtWidgets.QLabel("Length"), 0, 4)
+        controls.addWidget(self.exp_log_length, 0, 5)
+        controls.addWidget(QtWidgets.QLabel("Paragraphs"), 0, 6)
+        controls.addWidget(self.exp_log_paragraphs, 0, 7)
+        controls.addWidget(self.exp_log_include_knowledge, 1, 0, 1, 2)
+        controls.addWidget(generate, 1, 2)
+        controls.addWidget(save, 1, 3)
+        controls.addWidget(copy, 1, 4)
+        controls.addWidget(open_folder, 1, 5)
+        controls.addWidget(self.exp_log_notes, 2, 0, 1, 8)
+        layout.addLayout(controls)
+        self.exp_log_preview = QtWidgets.QPlainTextEdit()
+        self.exp_log_preview.setPlaceholderText("Daily experiment log preview.")
+        layout.addWidget(self.exp_log_preview, 1)
+        return w
+
+    def _directory_page(self):
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        buttons = QtWidgets.QHBoxLayout()
+        save = QtWidgets.QPushButton("Save paths")
+        save.clicked.connect(self.save_directory_paths)
+        validate = QtWidgets.QPushButton("Validate paths")
+        validate.clicked.connect(self.validate_directory_paths_ui)
+        detect = QtWidgets.QPushButton("Detect active files")
+        detect.clicked.connect(self.detect_directory_active_files)
+        index = QtWidgets.QPushButton("Index to Knowledge")
+        index.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
+        open_folder = QtWidgets.QPushButton("Open selected folder")
+        open_folder.clicked.connect(self.open_selected_directory_path)
+        for button in [save, validate, detect, index, open_folder]:
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.directory_table = QtWidgets.QTableWidget(0, 7)
+        self.directory_table.setHorizontalHeaderLabels(["purpose", "path", "type", "exists", "source", "last modified", "action"])
+        self.directory_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.directory_table, 1)
+        self.directory_detail = QtWidgets.QPlainTextEdit()
+        self.directory_detail.setReadOnly(True)
+        self.directory_detail.setMaximumHeight(160)
+        self.directory_detail.setPlaceholderText("Path meaning and validation output.")
+        layout.addWidget(self.directory_detail)
+        self._fill_directory_table()
         return w
 
     def _protocol_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        self.protocol_text = QtWidgets.QPlainTextEdit(); self.protocol_text.setPlaceholderText("粘贴论文文字/PDF摘要/图片描述。下一阶段调用 AI 生成实验设计建议，不直接执行。")
-        layout.addWidget(self.protocol_text)
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        buttons = QtWidgets.QHBoxLayout()
+        import_text = QtWidgets.QPushButton("Import text/Markdown")
+        import_text.clicked.connect(self.import_protocol_text)
+        import_pdf = QtWidgets.QPushButton("Import PDF")
+        import_pdf.clicked.connect(self.import_protocol_pdf)
+        attach_image = QtWidgets.QPushButton("Attach image path")
+        attach_image.clicked.connect(self.attach_protocol_image)
+        clear = QtWidgets.QPushButton("Clear attachments")
+        clear.clicked.connect(self.clear_protocol_attachments)
+        generate = QtWidgets.QPushButton("Generate protocol suggestion")
+        generate.clicked.connect(self.generate_protocol_suggestion)
+        send = QtWidgets.QPushButton("Send to Command box")
+        send.clicked.connect(self.send_protocol_to_command)
+        for button in [import_text, import_pdf, attach_image, clear, generate, send]:
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        self.protocol_text = QtWidgets.QPlainTextEdit()
+        self.protocol_text.setPlaceholderText("Paste paper text, PDF summary, image notes, or an experimental idea. This page generates suggestions only.")
+        self.protocol_attachment_list = QtWidgets.QPlainTextEdit()
+        self.protocol_attachment_list.setReadOnly(True)
+        self.protocol_attachment_list.setMaximumHeight(110)
+        self.protocol_attachment_list.setPlaceholderText("Attached image paths and operator notes. Suggestions only; no direct execution.")
+        self.protocol_output = QtWidgets.QPlainTextEdit()
+        self.protocol_output.setReadOnly(True)
+        layout.addWidget(self.protocol_text, 1)
+        layout.addWidget(self.protocol_attachment_list)
+        layout.addWidget(self.protocol_output, 1)
+        return w
+
+    def _knowledge_page(self):
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        controls = QtWidgets.QHBoxLayout()
+        scan = QtWidgets.QPushButton("Scan sources")
+        scan.clicked.connect(self.scan_knowledge_sources)
+        build = QtWidgets.QPushButton("Build/Rebuild index")
+        build.clicked.connect(lambda: self.build_knowledge_index(rebuild=True))
+        self.knowledge_query = QtWidgets.QLineEdit()
+        self.knowledge_query.setPlaceholderText("Search sequences, connection table, lyse code, manuals, papers...")
+        search = QtWidgets.QPushButton("Search")
+        search.clicked.connect(self.search_knowledge_ui)
+        preview = QtWidgets.QPushButton("Preview selected snippet")
+        preview.clicked.connect(self.preview_selected_knowledge)
+        send = QtWidgets.QPushButton("Send snippet to Protocol")
+        send.clicked.connect(self.send_knowledge_to_protocol)
+        self.knowledge_command_enabled = QtWidgets.QCheckBox("Enable for Command AI")
+        self.knowledge_command_enabled.setChecked(bool(self.project_settings.get("knowledge_context_enabled", True)))
+        self.knowledge_protocol_enabled = QtWidgets.QCheckBox("Enable for Protocol AI")
+        self.knowledge_protocol_enabled.setChecked(bool(self.project_settings.get("knowledge_context_enabled", True)))
+        for widget in [scan, build, self.knowledge_query, search, preview, send, self.knowledge_command_enabled, self.knowledge_protocol_enabled]:
+            controls.addWidget(widget, 1 if widget is self.knowledge_query else 0)
+        layout.addLayout(controls)
+        self.knowledge_table = QtWidgets.QTableWidget(0, 6)
+        self.knowledge_table.setHorizontalHeaderLabels(["category", "file", "lines", "summary", "snippet", "status"])
+        self.knowledge_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.knowledge_table, 2)
+        self.knowledge_preview = QtWidgets.QPlainTextEdit()
+        self.knowledge_preview.setReadOnly(True)
+        self.knowledge_preview.setPlaceholderText("Selected knowledge snippets and AI context preview.")
+        layout.addWidget(self.knowledge_preview, 1)
+        return w
+
+    def _diagnostics_page(self):
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QGroupBox("CPU voice runtime")
+        grid = QtWidgets.QGridLayout(top)
+        self.diag_cpu_mode = QtWidgets.QLabel("CPU or GPU / isolated subprocess")
+        self.diag_cpu_mode.setObjectName("StatusLightOk")
+        self.diag_gpu = QtWidgets.QLabel("not checked")
+        self.diag_sounddevice = QtWidgets.QLabel("not checked")
+        self.diag_faster_whisper = QtWidgets.QLabel("not checked")
+        self.diag_microphones = QtWidgets.QLabel("not checked")
+        self.diag_lexicon = QtWidgets.QLabel(f"{len(self.voice_lexicon.terms)} terms")
+        run_diag = QtWidgets.QPushButton("Run voice diagnostics")
+        run_diag.clicked.connect(self.run_voice_diagnostics_ui)
+        grid.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
+        grid.addWidget(self.diag_cpu_mode, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("NVIDIA GPU"), 1, 0)
+        grid.addWidget(self.diag_gpu, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("sounddevice"), 2, 0)
+        grid.addWidget(self.diag_sounddevice, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("faster-whisper"), 3, 0)
+        grid.addWidget(self.diag_faster_whisper, 3, 1)
+        grid.addWidget(QtWidgets.QLabel("Microphones"), 4, 0)
+        grid.addWidget(self.diag_microphones, 4, 1)
+        grid.addWidget(QtWidgets.QLabel("Lexicon"), 5, 0)
+        grid.addWidget(self.diag_lexicon, 5, 1)
+        grid.addWidget(run_diag, 6, 0, 1, 2)
+        layout.addWidget(top)
+        self.diag_report = QtWidgets.QPlainTextEdit()
+        self.diag_report.setReadOnly(True)
+        self.diag_report.setPlaceholderText("Run diagnostics to inspect CPU-only speech runtime.")
+        layout.addWidget(self.diag_report, 1)
+        return w
+
+    def _error_center_page(self):
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        buttons = QtWidgets.QHBoxLayout()
+        copy = QtWidgets.QPushButton("Copy traceback")
+        copy.clicked.connect(self.copy_selected_error_traceback)
+        save = QtWidgets.QPushButton("Save report")
+        save.clicked.connect(self.save_error_report)
+        clear = QtWidgets.QPushButton("Clear resolved")
+        clear.clicked.connect(self.clear_error_records)
+        dry = QtWidgets.QPushButton("Switch to Mock/Dry run")
+        dry.clicked.connect(self.switch_to_mock_dry_run)
+        for button in [copy, save, clear, dry]:
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.error_table = QtWidgets.QTableWidget(0, 6)
+        self.error_table.setHorizontalHeaderLabels(["time", "severity", "kind", "title", "message", "advice"])
+        self.error_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.error_table.itemSelectionChanged.connect(self.preview_selected_error)
+        layout.addWidget(self.error_table, 2)
+        self.error_detail = QtWidgets.QPlainTextEdit()
+        self.error_detail.setReadOnly(True)
+        self.error_detail.setPlaceholderText("Select an error to view traceback, advice, and related project context.")
+        layout.addWidget(self.error_detail, 1)
         return w
 
     def _settings_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        layout.addWidget(QtWidgets.QLabel("Loaded global registry:"))
-        text = QtWidgets.QPlainTextEdit(dumps(self.global_registry, indent=2)); text.setReadOnly(True)
-        layout.addWidget(text,1)
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        reload_row = QtWidgets.QHBoxLayout()
+        reload_runtime = QtWidgets.QPushButton("Reload runtime")
+        reload_runtime.clicked.connect(self.reload_runtime_config)
+        reload_row.addWidget(QtWidgets.QLabel("Registry editor writes local ./configs/*.yaml and keeps .bak backups."))
+        reload_row.addStretch()
+        reload_row.addWidget(reload_runtime)
+        layout.addLayout(reload_row)
+
+        tabs = QtWidgets.QTabWidget()
+        self.global_editor = RegistryEditorWidget(
+            "Runmanager globals",
+            GLOBAL_FIELDS,
+            self._global_registry_rows(),
+            kind="global",
+        )
+        self.blacs_editor = RegistryEditorWidget(
+            "BLACS manual whitelist",
+            BLACS_FIELDS,
+            self._blacs_registry_rows(),
+            kind="blacs",
+        )
+        self.lyse_editor = RegistryEditorWidget(
+            "Lyse single/multi modules",
+            LYSE_FIELDS,
+            flatten_lyse_registry(self.lyse_registry),
+            kind="lyse",
+        )
+        self.project_paths_editor = ProjectPathsWidget(self.project_settings)
+        self.global_editor.validate_requested.connect(self.validate_global_editor)
+        self.global_editor.save_requested.connect(self.save_global_editor)
+        self.blacs_editor.validate_requested.connect(self.validate_blacs_editor)
+        self.blacs_editor.save_requested.connect(self.save_blacs_editor)
+        self.lyse_editor.validate_requested.connect(self.validate_lyse_editor)
+        self.lyse_editor.save_requested.connect(self.save_lyse_editor)
+        self.project_paths_editor.save_requested.connect(self.save_project_paths_editor)
+        self.project_paths_editor.init_templates_requested.connect(self.init_project_templates_ui)
+        tabs.addTab(self.global_editor, "Globals")
+        tabs.addTab(self.blacs_editor, "BLACS Manual")
+        tabs.addTab(self.lyse_editor, "Lyse Modules")
+        tabs.addTab(self.project_paths_editor, "Project Paths")
+        layout.addWidget(tabs, 1)
         return w
 
-    def _logs_page(self):
-        w = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(w)
-        self.log_text = QtWidgets.QPlainTextEdit(); self.log_text.setReadOnly(True)
-        layout.addWidget(self.log_text, 1)
-        return w
+    def _global_registry_rows(self):
+        rows = []
+        for name, rule in (self.global_registry or {}).items():
+            row = {"name": name}
+            row.update(rule or {})
+            rows.append(row)
+        return rows
+
+    def _blacs_registry_rows(self):
+        rows = []
+        for name, rule in (self.blacs_registry or {}).items():
+            row = {"name": name}
+            row.update(rule or {})
+            rows.append(row)
+        return rows
+
+    def _show_registry_validation(self, title, errors):
+        if errors:
+            QtWidgets.QMessageBox.warning(self, title, "\n".join(errors[:30]))
+            self.log(f"{title}: validation failed\n" + "\n".join(errors))
+            return False
+        QtWidgets.QMessageBox.information(self, title, "Validation passed.")
+        self.log(f"{title}: validation passed.")
+        return True
+
+    def validate_global_editor(self, rows):
+        try:
+            registry = build_global_registry(rows)
+            return self._show_registry_validation("Globals registry", validate_global_registry(registry))
+        except Exception as exc:
+            self._show_error("Globals registry validation failed", exc)
+            return False
+
+    def validate_blacs_editor(self, rows):
+        try:
+            registry = build_blacs_registry(rows)
+            return self._show_registry_validation("BLACS registry", validate_blacs_registry(registry))
+        except Exception as exc:
+            self._show_error("BLACS registry validation failed", exc)
+            return False
+
+    def validate_lyse_editor(self, rows):
+        try:
+            registry = build_lyse_registry(rows)
+            return self._show_registry_validation("Lyse registry", validate_lyse_registry(registry, base_dir=self.settings.project_dir))
+        except Exception as exc:
+            self._show_error("Lyse registry validation failed", exc)
+            return False
+
+    def save_global_editor(self, rows):
+        try:
+            registry = build_global_registry(rows)
+            errors = validate_global_registry(registry)
+            if errors:
+                self._show_registry_validation("Globals registry", errors)
+                return
+            path = self.settings.save_global_registry(registry)
+            self.log(f"Saved globals registry: {path}")
+            self.reload_runtime_config()
+        except Exception as exc:
+            self._show_error("Save globals registry failed", exc)
+
+    def save_blacs_editor(self, rows):
+        try:
+            registry = build_blacs_registry(rows)
+            errors = validate_blacs_registry(registry)
+            if errors:
+                self._show_registry_validation("BLACS registry", errors)
+                return
+            path = self.settings.save_blacs_registry(registry)
+            self.log(f"Saved BLACS registry: {path}")
+            self.reload_runtime_config()
+        except Exception as exc:
+            self._show_error("Save BLACS registry failed", exc)
+
+    def save_lyse_editor(self, rows):
+        try:
+            registry = build_lyse_registry(rows)
+            errors = validate_lyse_registry(registry, base_dir=self.settings.project_dir)
+            if errors:
+                self._show_registry_validation("Lyse registry", errors)
+                return
+            path = self.settings.save_lyse_registry(registry)
+            self.log(f"Saved lyse registry: {path}")
+            self.reload_runtime_config()
+        except Exception as exc:
+            self._show_error("Save lyse registry failed", exc)
+
+    def save_project_paths_editor(self, values):
+        try:
+            path = self.settings.save_project_settings(values)
+            self.log(f"Saved project settings: {path}")
+            self.reload_runtime_config()
+        except Exception as exc:
+            self._show_error("Save project settings failed", exc)
+
+    def init_project_templates_ui(self):
+        try:
+            copied = self.settings.ensure_project_templates(include_manual=True)
+            self.log("Initialized project templates: " + (", ".join(str(p) for p in copied) if copied else "already complete"))
+            self.reload_runtime_config()
+        except Exception as exc:
+            self._show_error("Initialize project templates failed", exc)
+
+    def reload_runtime_config(self):
+        self.global_registry = self.settings.load_global_registry()
+        self.blacs_registry = self.settings.load_blacs_registry()
+        self.lyse_registry = self.settings.load_lyse_registry()
+        self.project_settings = self.settings.load_project_settings()
+        self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
+        self.voice_lexicon = VoiceLexicon.from_registries(
+            self.global_registry,
+            self.blacs_registry,
+            self.lyse_registry,
+            extra_path=self.settings.path("voice_lexicon.yaml"),
+        )
+        self.stt.initial_prompt = self.voice_lexicon.prompt()
+        voice_cfg = self.project_settings.get("voice", {})
+        self.stt.model_lifetime = voice_cfg.get("model_lifetime", getattr(self.stt, "model_lifetime", "isolated_release"))
+        self.stt.isolated = self._voice_isolated_from_config(voice_cfg)
+        if hasattr(self, "global_editor"):
+            self.global_editor.set_rows(self._global_registry_rows())
+        if hasattr(self, "blacs_editor"):
+            self.blacs_editor.set_rows(self._blacs_registry_rows())
+        if hasattr(self, "lyse_editor"):
+            self.lyse_editor.set_rows(flatten_lyse_registry(self.lyse_registry))
+        if hasattr(self, "project_paths_editor"):
+            self.project_paths_editor.set_settings(self.project_settings)
+        if hasattr(self, "directory_table"):
+            self._fill_directory_table()
+        if hasattr(self, "co_sequence_sequence_path"):
+            if not self.co_sequence_sequence_path.text().strip():
+                self.co_sequence_sequence_path.setText(self._active_sequence_path_text())
+            if not self.co_sequence_connection_path.text().strip():
+                self.co_sequence_connection_path.setText(self._active_connection_table_text())
+        if hasattr(self, "project_tree"):
+            self._fill_project_tree()
+        if hasattr(self, "blacs_table"):
+            self._fill_blacs_registry()
+        if hasattr(self, "single_modules"):
+            self._fill_module_lists()
+        if hasattr(self, "opt_params_table"):
+            self._fill_optimizer_params()
+        if hasattr(self, "diag_lexicon"):
+            self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+        if hasattr(self, "h5_folder"):
+            self.h5_folder.setText(self.project_settings.get("h5_output_dir", ""))
+        if hasattr(self, "knowledge_command_enabled"):
+            enabled = bool(self.project_settings.get("knowledge_context_enabled", True))
+            self.knowledge_command_enabled.setChecked(enabled)
+            self.knowledge_protocol_enabled.setChecked(enabled)
+        if hasattr(self, "voice_lifetime"):
+            self.voice_lifetime.setCurrentIndex(max(0, self.voice_lifetime.findData(self.stt.model_lifetime)))
+        self.log("Runtime configuration reloaded.")
+        self._update_inspector()
+
+    def _voice_isolated_from_config(self, voice_cfg):
+        lifetime = str((voice_cfg or {}).get("model_lifetime", "isolated_release"))
+        if lifetime == "isolated_release":
+            return True
+        return bool((voice_cfg or {}).get("isolated_stt", False))
+
+    def on_error_record_added(self, payload):
+        if payload.get("cleared"):
+            self.error_records = []
+        else:
+            self.error_records.append(payload)
+            if payload.get("severity") == "hardware_pause":
+                self.set_optimizer_state("error")
+        self._fill_error_table()
+
+    def _fill_error_table(self):
+        if not hasattr(self, "error_table"):
+            return
+        rows = list(self.error_records[-200:])
+        self.error_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row.get("created_at", ""),
+                row.get("severity", ""),
+                row.get("kind", ""),
+                row.get("title", ""),
+                row.get("message", ""),
+                row.get("advice", ""),
+            ]
+            for col, value in enumerate(values):
+                self.error_table.setItem(row_index, col, QtWidgets.QTableWidgetItem(str(value)))
+
+    def selected_error_record(self):
+        if not self.error_records:
+            return None
+        row = self.error_table.currentRow() if hasattr(self, "error_table") else -1
+        if row < 0:
+            row = len(self.error_records) - 1
+        start = max(0, len(self.error_records) - 200)
+        index = start + row
+        return self.error_records[index] if 0 <= index < len(self.error_records) else None
+
+    def preview_selected_error(self):
+        record = self.selected_error_record()
+        if not record or not hasattr(self, "error_detail"):
+            return
+        text = (
+            f"{record.get('created_at', '')} [{record.get('severity', '')}/{record.get('kind', '')}]\n"
+            f"{record.get('title', '')}: {record.get('message', '')}\n\n"
+            f"Advice:\n{record.get('advice', '')}\n\n"
+            f"Context:\n{record.get('context', '')}\n\n"
+            f"Traceback:\n{record.get('traceback', '')}"
+        )
+        self.error_detail.setPlainText(text)
+
+    def copy_selected_error_traceback(self):
+        record = self.selected_error_record()
+        if record:
+            QtWidgets.QApplication.clipboard().setText(record.get("traceback", ""))
+            self.log("Error traceback copied to clipboard.")
+
+    def save_error_report(self):
+        out_path = Path.cwd() / "labpilot_outputs" / "errors" / "error_report.md"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# LabPilot Error Report", ""]
+        for record in self.error_records[-100:]:
+            lines.extend(
+                [
+                    f"## {record.get('title', 'Error')}",
+                    f"- Time: {record.get('created_at', '')}",
+                    f"- Severity: {record.get('severity', '')}",
+                    f"- Kind: {record.get('kind', '')}",
+                    f"- Message: {record.get('message', '')}",
+                    "",
+                    "Advice:",
+                    record.get("advice", ""),
+                    "",
+                    "Traceback:",
+                    "```text",
+                    record.get("traceback", ""),
+                    "```",
+                    "",
+                ]
+            )
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        self.log(f"Error report saved: {out_path}")
+
+    def clear_error_records(self):
+        self.error_center.clear()
+        if hasattr(self, "error_detail"):
+            self.error_detail.clear()
+        self.log("Error Center cleared.")
+
+    def switch_to_mock_dry_run(self):
+        if hasattr(self, "mock_llm"):
+            self.mock_llm.setChecked(True)
+        if hasattr(self, "mock_rm"):
+            self.mock_rm.setChecked(True)
+        if hasattr(self, "mock_blacs"):
+            self.mock_blacs.setChecked(True)
+        if hasattr(self, "dry_run"):
+            self.dry_run.setChecked(True)
+        self._update_rm_mode()
+        self._update_blacs_mode()
+        self.log("Switched to Mock LLM, Mock runmanager, Mock BLACS, and Dry run.")
+
+    def set_optimizer_state(self, state):
+        self.optimizer_status_state = str(state or "idle")
+        if hasattr(self, "optimizer_state_label"):
+            self.optimizer_state_label.setText(f"optimizer: {self.optimizer_status_state}")
+            warn = self.optimizer_status_state in {"paused", "error", "waiting_h5"}
+            self.optimizer_state_label.setObjectName("StatusLightWarn" if warn else "StatusLightOk")
+            self.optimizer_state_label.style().unpolish(self.optimizer_state_label)
+            self.optimizer_state_label.style().polish(self.optimizer_state_label)
 
     def log(self, msg):
         if hasattr(self, "log_text"):
             self.log_text.appendPlainText(str(msg))
         print(msg)
 
+    def apply_voice_profile(self, *args):
+        profile = self.voice_profile.currentData() if hasattr(self, "voice_profile") else "balanced"
+        backend = self.voice_backend.currentData() if hasattr(self, "voice_backend") else "cpu"
+        lifetime = self.voice_lifetime.currentData() if hasattr(self, "voice_lifetime") else self.project_settings.get("voice", {}).get("model_lifetime", "isolated_release")
+        specs = {
+            "fast": ("tiny", "cpu", "int8"),
+            "balanced": ("small", "cpu", "int8"),
+            "accurate": ("medium", "cpu", "int8"),
+            "gpu_fast": ("small", "cuda", self.project_settings.get("voice", {}).get("gpu_compute_type", "float16")),
+            "gpu_accurate": ("large-v3", "cuda", self.project_settings.get("voice", {}).get("gpu_compute_type", "float16")),
+        }
+        model_size, suggested_device, compute_type = specs.get(profile, specs["balanced"])
+        device = "cuda" if backend == "cuda" else "cpu"
+        if device == "cpu" and profile.startswith("gpu_"):
+            model_size, compute_type = "small", "int8"
+        if device == "cuda" and not profile.startswith("gpu_"):
+            compute_type = self.project_settings.get("voice", {}).get("gpu_compute_type", "float16")
+        changed = (
+            self.stt.model_size != model_size
+            or self.stt.device != device
+            or self.stt.compute_type != compute_type
+            or getattr(self.stt, "model_lifetime", "isolated_release") != lifetime
+        )
+        if changed:
+            self.stt.release_model()
+        self.stt.model_size = model_size
+        self.stt.device = device
+        self.stt.compute_type = compute_type
+        self.stt.model_lifetime = lifetime
+        self.stt.isolated = lifetime == "isolated_release"
+        if hasattr(self, "voice_runtime_label"):
+            self.voice_runtime_label.setText(self._voice_runtime_text())
+            self.voice_runtime_label.setObjectName("StatusLightOk")
+            self.voice_runtime_label.style().unpolish(self.voice_runtime_label)
+            self.voice_runtime_label.style().polish(self.voice_runtime_label)
+        self.log(f"voice profile: {profile}, model={self.stt.model_size}, device={self.stt.device}, compute_type={self.stt.compute_type}, lifetime={lifetime}")
+        self._update_inspector()
+
+    def _voice_runtime_text(self):
+        device = self.stt.device if hasattr(self, "stt") else "cpu"
+        compute = self.stt.compute_type if hasattr(self, "stt") else "int8"
+        model = self.stt.model_size if hasattr(self, "stt") else "small"
+        lifetime = getattr(self.stt, "model_lifetime", "isolated_release") if hasattr(self, "stt") else "isolated_release"
+        return f"{device.upper()}/{compute} {model} {lifetime}"
+
+    def release_stt_model(self):
+        self.stt.release_model()
+        self.log("STT model released from the GUI process.")
+        if hasattr(self, "voice_status"):
+            self.voice_status.setText("STT model released.")
+
+    def run_voice_diagnostics_ui(self):
+        voice_cfg = dict(self.project_settings.get("voice", {}))
+        voice_cfg["model_size"] = self.stt.model_size
+        voice_cfg["device"] = self.stt.device
+        voice_cfg["compute_type"] = self.stt.compute_type
+        report = run_voice_diagnostics(voice_cfg)
+        self.voice_diagnostic_report = report
+        payload = report.to_dict()
+        if hasattr(self, "diag_report"):
+            self.diag_report.setPlainText(dumps(payload, indent=2))
+            self.diag_sounddevice.setText("OK" if report.sounddevice else "missing")
+            self.diag_sounddevice.setObjectName("StatusLightOk" if report.sounddevice else "StatusLightWarn")
+            self.diag_faster_whisper.setText("OK" if report.faster_whisper else "missing")
+            self.diag_faster_whisper.setObjectName("StatusLightOk" if report.faster_whisper else "StatusLightWarn")
+            self.diag_microphones.setText(str(report.microphone_count))
+            self.diag_gpu.setText(report.gpu_name if report.gpu_available else "not detected")
+            self.diag_gpu.setObjectName("StatusLightOk" if report.gpu_available else "StatusLightWarn")
+            for label in [self.diag_sounddevice, self.diag_faster_whisper, self.diag_gpu]:
+                label.style().unpolish(label)
+                label.style().polish(label)
+        if hasattr(self, "voice_status"):
+            self.voice_status.setText(f"Voice diagnostics: {report.status}")
+        self.log("voice diagnostics: " + dumps(payload))
+        self._update_inspector()
+        return report
+
     def _update_rm_mode(self):
         self.rm = RunmanagerBackend(mock=self.mock_rm.isChecked())
         self.log(f"runmanager mode: {'mock' if self.mock_rm.isChecked() else 'real'}")
 
-    def parse_command(self):
+    def _update_blacs_mode(self):
+        self.blacs = BlacsManualClient(mock=self.mock_blacs.isChecked())
+        self.log(f"BLACS mode: {'mock' if self.mock_blacs.isChecked() else 'localhost bridge'}")
+
+    def transcribe_audio_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose audio file", "", "Audio files (*.wav *.mp3 *.m4a *.flac);;All files (*.*)")
+        if not path:
+            return
+        self.start_transcription(path)
+
+    def toggle_voice_recording(self, checked=False):
+        if self.voice_recording:
+            self.stop_voice_recording()
+        else:
+            self.start_voice_recording()
+
+    def start_voice_recording(self):
         try:
-            client = LLMClient(api_key=self.api_key.text().strip(), base_url=self.base_url.text().strip(), model=self.model.text().strip(), mock=self.mock_llm.isChecked())
-            command = client.parse_command(self.command_text.toPlainText(), self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_recorder.start()
+            self.voice_recording = True
+            self.voice_toggle_button.setChecked(True)
+            self.voice_toggle_button.setText("Stop voice recording")
+            self.voice_status.setText("Recording... press again to stop.")
+            self.mic_level_timer.start()
+            self.log("Voice recording started.")
+        except Exception as exc:
+            self.voice_toggle_button.setChecked(False)
+            self._show_error("Voice recording failed", exc)
+
+    def stop_voice_recording(self):
+        try:
+            path = self.voice_recorder.stop_to_wav()
+            stats = self.voice_recorder.audio_stats()
+            self.voice_recording = False
+            self.mic_level_timer.stop()
+            self.set_mic_level(0.0)
+            self.voice_toggle_button.setChecked(False)
+            self.voice_toggle_button.setText("Start voice recording")
+            if stats["rms"] < 0.003:
+                self.voice_status.setText("Recorded audio is very quiet; check microphone input.")
+                self.log(f"Voice recording saved but level is very low: {path}, stats={stats}")
+            else:
+                self.voice_status.setText(f"Recorded audio: {path}")
+                self.log(f"Voice recording saved: {path}, stats={stats}")
+            self.start_transcription(path)
+        except Exception as exc:
+            self.voice_recording = False
+            self.mic_level_timer.stop()
+            self.set_mic_level(0.0)
+            self.voice_toggle_button.setChecked(False)
+            self.voice_toggle_button.setText("Start voice recording")
+            self._show_error("Voice recording stop failed", exc)
+
+    def update_manual_mic_level(self):
+        self.set_mic_level(self.voice_recorder.latest_rms)
+
+    def set_mic_level(self, level):
+        if not hasattr(self, "mic_level"):
+            return
+        level = float(level or 0.0)
+        percent = int(max(0.0, min(1.0, level / 0.08)) * 100)
+        self.mic_level.setValue(percent)
+        if level >= 0.008:
+            self.mic_signal_label.setText("Voice")
+            self.mic_signal_label.setObjectName("StatusLightOk")
+        elif level >= 0.003:
+            self.mic_signal_label.setText("Low")
+            self.mic_signal_label.setObjectName("StatusLightWarn")
+        else:
+            self.mic_signal_label.setText("Silent")
+            self.mic_signal_label.setObjectName("StatusLightBad" if self.voice_recording else "StatusLightWarn")
+        self.mic_signal_label.style().unpolish(self.mic_signal_label)
+        self.mic_signal_label.style().polish(self.mic_signal_label)
+
+    def start_transcription(self, audio_path, strip_wake_name_value=None):
+        if not self.stt.available():
+            self._show_error(
+                "Speech-to-text unavailable",
+                RuntimeError("faster-whisper is not installed. Install labpilot-ai[voice] to transcribe recorded audio."),
+            )
+            return
+        if self.transcription_thread and self.transcription_thread.isRunning():
+            self.log("Transcription already running; ignoring new audio.")
+            return
+        self.voice_status.setText("Transcribing Chinese/English command...")
+        self.transcription_thread = QtCore.QThread(self)
+        language = self.voice_language.currentData()
+        self.transcription_worker = TranscriptionWorker(
+            self.stt,
+            audio_path,
+            language=language,
+            strip_wake=strip_wake_name_value,
+        )
+        self.transcription_worker.moveToThread(self.transcription_thread)
+        self.transcription_thread.started.connect(self.transcription_worker.run)
+        self.transcription_worker.finished.connect(self.on_transcription_finished)
+        self.transcription_worker.failed.connect(self.on_transcription_failed)
+        self.transcription_worker.finished.connect(self.transcription_worker.deleteLater)
+        self.transcription_worker.failed.connect(self.transcription_worker.deleteLater)
+        self.transcription_worker.finished.connect(self.transcription_thread.quit)
+        self.transcription_worker.failed.connect(self.transcription_thread.quit)
+        self.transcription_thread.finished.connect(self.transcription_thread.deleteLater)
+        self.transcription_thread.finished.connect(self._clear_transcription_worker)
+        self.transcription_thread.start()
+
+    def on_transcription_finished(self, text, audio_path):
+        current = self.command_text.toPlainText().strip()
+        corrected = self.voice_lexicon.correct_text(text)
+        self.command_text.setPlainText((current + "\n" + corrected).strip())
+        self.voice_status.setText("Transcription corrected and added to command box.")
+        self.log(f"Audio transcription added from {audio_path}: raw={text} corrected={corrected}")
+        action = self.voice_after_transcribe.currentData()
+        if action == "parse":
+            self.parse_command(allow_auto=False)
+        elif action == "execute":
+            self.parse_command(allow_auto=False)
+            if self.last_safe:
+                self.execute_last(force_run=True)
+
+    def on_transcription_failed(self, message):
+        self.voice_status.setText("Transcription failed.")
+        self._show_error("Speech-to-text failed", RuntimeError(message))
+
+    def toggle_wake_standby(self):
+        if self.voice_standby.isChecked():
+            self.start_wake_standby()
+        else:
+            self.stop_wake_standby()
+
+    def start_wake_standby(self):
+        if self.wake_thread and self.wake_thread.isRunning():
+            return
+        if not self.stt.available():
+            self.voice_standby.blockSignals(True)
+            self.voice_standby.setChecked(False)
+            self.voice_standby.blockSignals(False)
+            self._show_error(
+                "Wake standby unavailable",
+                RuntimeError("faster-whisper is not installed. Install labpilot-ai[voice] to use wake standby mode."),
+                modal=False,
+            )
+            return
+        if not self.voice_recorder.available():
+            self.voice_standby.blockSignals(True)
+            self.voice_standby.setChecked(False)
+            self.voice_standby.blockSignals(False)
+            self._show_error(
+                "Wake standby unavailable",
+                RuntimeError("sounddevice is not installed. Install labpilot-ai[voice] to use wake standby mode."),
+                modal=False,
+            )
+            return
+        voice_cfg = self.project_settings.get("voice", {})
+        config = WakeAgentConfig(
+            wake_name=self.voice_wake_name.text().strip() or "labscript",
+            language_hint=self.voice_language.currentData(),
+            samplerate=int(voice_cfg.get("samplerate", 16000)),
+            channels=1,
+            silence_threshold=float(voice_cfg.get("silence_threshold", 0.01)),
+            silence_seconds=float(voice_cfg.get("silence_seconds", 1.2)),
+        )
+        self.wake_thread = QtCore.QThread(self)
+        self.wake_worker = WakeStandbyWorker(self.stt, config)
+        self.wake_worker.moveToThread(self.wake_thread)
+        self.wake_thread.started.connect(self.wake_worker.run)
+        self.wake_worker.status.connect(self.voice_status.setText)
+        self.wake_worker.level.connect(self.set_mic_level)
+        self.wake_worker.command_audio_ready.connect(
+            lambda path, wake_name: self.start_transcription(path, strip_wake_name_value=wake_name)
+        )
+        self.wake_worker.failed.connect(self.on_wake_standby_failed)
+        self.wake_worker.stopped.connect(self._on_wake_standby_stopped)
+        self.wake_worker.stopped.connect(self.wake_worker.deleteLater)
+        self.wake_worker.stopped.connect(self.wake_thread.quit)
+        self.wake_thread.finished.connect(self.wake_thread.deleteLater)
+        self.wake_thread.finished.connect(self._clear_wake_worker)
+        self.wake_thread.start()
+        self.log(f"Wake standby mode started with name '{config.wake_name}'.")
+
+    def stop_wake_standby(self):
+        if self.wake_worker:
+            self.wake_worker.stop()
+        self.voice_status.setText("Wake standby stopping...")
+
+    def _on_wake_standby_stopped(self):
+        self.voice_standby.blockSignals(True)
+        self.voice_standby.setChecked(False)
+        self.voice_standby.blockSignals(False)
+        self.voice_status.setText("Wake standby stopped.")
+        self.log("Wake standby mode stopped.")
+
+    def on_wake_standby_failed(self, message):
+        self.voice_status.setText("Wake standby failed.")
+        self._show_error("Wake standby failed", RuntimeError(message), modal=False)
+
+    def _clear_transcription_worker(self):
+        self.transcription_thread = None
+        self.transcription_worker = None
+
+    def _clear_wake_worker(self):
+        self.wake_thread = None
+        self.wake_worker = None
+
+    def parse_command(self, allow_auto=True):
+        user_text = ""
+        try:
+            client = LLMClient(
+                api_key=self.api_key.text().strip(),
+                base_url=self.base_url.text().strip(),
+                model=self.model.text().strip(),
+                mock=self.mock_llm.isChecked(),
+            )
+            user_text = self.command_text.toPlainText()
+            project_context = self.project_context_for_query(user_text, purpose="command")
+            command = client.parse_command(
+                user_text,
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                project_context=project_context,
+            )
             safe = self.validator.validate_command(command)
             self.last_command, self.last_safe = command, safe
             self.json_view.setPlainText("AI JSON:\n" + dumps(command, indent=2) + "\n\nSAFE:\n" + dumps(safe, indent=2))
-            self._fill_actions(command, safe)
+            self._fill_actions(safe)
+            self.record_command_event("parse_ok", user_text, {"command": command, "safe": safe, "project_context": self.last_project_context})
             self.log("Parse OK")
-            if self.auto_run.isChecked():
+            if hasattr(self, "clear_after_parse") and self.clear_after_parse.isChecked():
+                self.command_text.clear()
+            if allow_auto and self.auto_run.isChecked():
                 self.execute_last(force_run=True)
-            elif self.auto_write.isChecked():
+            elif allow_auto and self.auto_write.isChecked():
                 self.execute_last(force_run=False)
-        except Exception as e:
-            self.log(f"Parse/safety failed: {e}")
-            QtWidgets.QMessageBox.critical(self, "Parse/safety failed", str(e))
+        except Exception as exc:
+            self.record_command_event("parse_failed", user_text, {"error": str(exc)})
+            self._show_error("Parse/safety failed", exc)
 
-    def _fill_actions(self, command, safe):
-        actions = command.get("actions", [])
+    def dry_run_preview(self):
+        self.parse_command(allow_auto=False)
+        if self.last_safe:
+            self.json_view.appendPlainText("\n\nDRY-RUN PREVIEW:\n" + dumps(self.last_safe, indent=2))
+            self.log("Dry-run preview generated; no hardware action was executed.")
+
+    def show_retrieved_context(self):
+        context = self.last_project_context or self.project_context_for_query(self.command_text.toPlainText(), purpose="command")
+        if hasattr(self, "knowledge_preview"):
+            self.knowledge_preview.setPlainText(context or "No project context was retrieved.")
+        self._select_tab("Knowledge")
+
+    def _select_tab(self, title):
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == title:
+                self.tabs.setCurrentIndex(index)
+                return True
+        return False
+
+    def _fill_actions(self, safe):
+        actions = safe.get("actions", [])
         self.actions_table.setRowCount(len(actions))
-        for row, a in enumerate(actions):
-            vals = [a.get("type",""), a.get("name", a.get("path", "")), repr(a.get("value", "")), "validated"]
+        for row, action in enumerate(actions):
+            value = action.get("value", action.get("objective", action.get("plot_type", action.get("model", ""))))
+            vals = [action.get("type", ""), action.get("name", action.get("path", "")), repr(value), "validated"]
             for col, val in enumerate(vals):
-                item = QtWidgets.QTableWidgetItem(str(val)); item.setBackground(QtGui.QColor(225,255,225))
-                self.actions_table.setItem(row,col,item)
+                item = QtWidgets.QTableWidgetItem(str(val))
+                item.setBackground(QtGui.QColor(225, 255, 225))
+                self.actions_table.setItem(row, col, item)
 
     def execute_last(self, force_run=False):
         if not self.last_safe:
-            QtWidgets.QMessageBox.warning(self, "No safe command", "请先 Parse。")
+            QtWidgets.QMessageBox.warning(self, "No safe command", "Parse a command first.")
             return
         safe = self.last_safe
         engage = bool(force_run or safe.get("engage"))
         try:
             if self.dry_run.isChecked():
                 self.log("Dry run: not executing. " + dumps(safe))
+                self.record_command_event("dry_run", payload={"safe": safe, "force_run": force_run})
+                return
+            if safe.get("confirmations") and not self._confirm_high_risk(safe["confirmations"]):
+                self.log("Execution cancelled by user.")
+                self.record_command_event("cancelled", payload={"safe": safe, "force_run": force_run})
                 return
             if safe.get("globals"):
+                diff = self.rm.preview_diff(safe["globals"])
+                self.log("runmanager diff: " + dumps(diff))
                 self.rm.set_globals(safe["globals"])
                 self.log("set_globals OK: " + dumps(safe["globals"]))
+            for name, value in safe.get("blacs_manual", {}).items():
+                result = self.blacs.set_manual(name, value, program=self.blacs_program.isChecked())
+                self.log("BLACS set_manual OK: " + dumps(result))
+            for item in safe.get("load_h5", []):
+                self.h5_folder.setText(item["path"])
+                self.load_h5_table(recursive=item.get("recursive", False))
+            for item in safe.get("single_modules", []):
+                self.run_single_by_name(item["name"], item.get("params", {}))
+            for item in safe.get("multi_modules", []):
+                self.run_multi_by_name(item["name"], item.get("params", {}))
+            for item in safe.get("plots", []):
+                self.draw_plot_action(item)
+            for item in safe.get("fits", []):
+                self.fit_action(item)
+            if safe.get("optimization"):
+                self.start_optimizer_from_action(safe["optimization"])
+            for item in safe.get("optimization_feedback", []):
+                if item.get("source") == "manual_values":
+                    self.tell_optimizer_values(item.get("values", {}), metadata={"source": "manual_values"})
+                else:
+                    self.tell_optimizer_latest_h5(
+                        reload_h5=item.get("reload_h5", True),
+                        run_checked_modules=item.get("run_checked_modules", True),
+                    )
+            for item in safe.get("protocol_requests", []):
+                prompt = item.get("prompt", "")
+                context = self.project_context_for_query(prompt, purpose="protocol")
+                self.protocol_output.setPlainText(draft_protocol_suggestion(prompt, self.global_registry, project_context=context))
+            for item in safe.get("report_requests", []):
+                self.generate_report_from_ui(
+                    title=item.get("title", "LabPilot report"),
+                    include_errors=item.get("include_errors", True),
+                    include_knowledge_context=item.get("include_knowledge_context", True),
+                    include_optimizer_history=item.get("include_optimizer_history", True),
+                )
             if engage:
                 n = self.rm.n_shots()
-                ans = QtWidgets.QMessageBox.question(self, "Confirm engage", f"即将运行/提交 shot，预计 n_shots={n}。确认？", QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+                ans = QtWidgets.QMessageBox.question(
+                    self,
+                    "Confirm engage",
+                    f"About to submit shot(s). Estimated n_shots={n}. Continue?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
                 if ans == QtWidgets.QMessageBox.Yes:
-                    self.rm.set_run_shots(True); self.rm.engage(); self.log("engage OK")
+                    self.rm.set_run_shots(True)
+                    self.rm.engage()
+                    self.log("engage OK")
             self.refresh_globals()
-        except Exception as e:
-            self.log(f"Execute failed: {e}")
-            QtWidgets.QMessageBox.critical(self, "Execute failed", str(e))
+            self.record_command_event("execute_ok", payload={"safe": safe, "force_run": force_run, "engage": engage})
+        except Exception as exc:
+            self.record_command_event("execute_failed", payload={"safe": safe, "force_run": force_run, "error": str(exc)})
+            self._show_error("Execute failed", exc)
+
+    def _confirm_high_risk(self, confirmations):
+        text = "\n".join(f"{c['name']} ({c.get('risk')}): {c.get('description', '')}" for c in confirmations)
+        ans = QtWidgets.QMessageBox.question(
+            self,
+            "High risk confirmation",
+            "The following actions require confirmation:\n\n" + text,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        return ans == QtWidgets.QMessageBox.Yes
 
     def test_rm(self):
         try:
-            msg = self.rm.connect(); self.log(msg); self.statusBar().showMessage(str(msg))
-        except Exception as e:
-            self.log(f"runmanager connection failed: {e}")
-            QtWidgets.QMessageBox.critical(self, "runmanager failed", str(e))
+            msg = self.rm.connect()
+            self.log(msg)
+            self.statusBar().showMessage(str(msg))
+        except Exception as exc:
+            self._show_error("runmanager failed", exc)
 
     def refresh_globals(self):
         try:
-            g = self.rm.get_globals(); self._fill_globals(g); self.log(f"globals loaded: {len(g)}")
-        except Exception as e:
-            self.log(f"refresh globals failed: {e}")
+            g = self.rm.get_globals()
+            self._fill_globals(g)
+            self.log(f"globals loaded: {len(g)}")
+        except Exception as exc:
+            self._show_error("refresh globals failed", exc, modal=False)
 
-    def _fill_globals(self, g):
-        names = sorted(set(g.keys()) | set(self.global_registry.keys()))
+    def rollback_globals(self):
+        try:
+            values = self.rm.rollback_last()
+            self.log("rollback globals: " + dumps(values))
+            self.refresh_globals()
+        except Exception as exc:
+            self._show_error("rollback failed", exc)
+
+    def apply_selected_globals(self):
+        rows = sorted({index.row() for index in self.globals_table.selectedIndexes()})
+        if not rows:
+            row = self.globals_table.currentRow()
+            rows = [row] if row >= 0 else []
+        actions = []
+        for row in rows:
+            name_item = self.globals_table.item(row, 0)
+            value_item = self.globals_table.item(row, 1)
+            if not name_item:
+                continue
+            name = name_item.text()
+            if name not in self.global_registry:
+                continue
+            value = value_item.text() if value_item else ""
+            actions.append({"type": "set_global", "name": name, "value": value.strip("'\"")})
+        if not actions:
+            self.log("No selected registered globals to apply.")
+            return
+        try:
+            self.last_safe = self.validator.validate_command({"actions": actions})
+            self._fill_actions(self.last_safe)
+            self.execute_last(force_run=False)
+        except Exception as exc:
+            self._show_error("Apply selected globals failed", exc)
+
+    def build_array_scan_from_selected(self):
+        row = self.globals_table.currentRow()
+        if row < 0:
+            self.log("Select a registered global before building an array scan.")
+            return
+        name = self.globals_table.item(row, 0).text()
+        if name not in self.global_registry:
+            self.log(f"{name} is not registered in the global registry.")
+            return
+        start, ok = QtWidgets.QInputDialog.getDouble(self, "Array scan", f"{name} start value:")
+        if not ok:
+            return
+        stop, ok = QtWidgets.QInputDialog.getDouble(self, "Array scan", f"{name} stop value:")
+        if not ok:
+            return
+        points, ok = QtWidgets.QInputDialog.getInt(self, "Array scan", f"{name} number of points:", 5, 2, 100000)
+        if not ok:
+            return
+        try:
+            self.last_safe = self.validator.validate_command(
+                {"actions": [{"type": "set_global", "name": name, "value": {"linspace": [start, stop, points]}}]}
+            )
+            self._fill_actions(self.last_safe)
+            self.json_view.setPlainText("Array scan safe action:\n" + dumps(self.last_safe, indent=2))
+        except Exception as exc:
+            self._show_error("Build array scan failed", exc)
+
+    def preview_runmanager_shots(self):
+        try:
+            n = self.rm.n_shots()
+            self.log(f"runmanager preview n_shots={n}")
+            QtWidgets.QMessageBox.information(self, "Runmanager shot preview", f"Estimated n_shots={n}")
+        except Exception as exc:
+            self._show_error("Runmanager shot preview failed", exc)
+
+    def engage_checked_sequence_bools(self):
+        actions = []
+        for name, rule in self.global_registry.items():
+            if rule.get("type") == "bool" and (name.startswith("do_") or name.startswith("lyse_do_")):
+                actions.append({"type": "set_global", "name": name, "value": True})
+        if actions:
+            actions.append({"type": "engage"})
+        try:
+            self.last_safe = self.validator.validate_command({"actions": actions})
+            self._fill_actions(self.last_safe)
+            self.execute_last(force_run=True)
+        except Exception as exc:
+            self._show_error("Engage checked sequence bools failed", exc)
+
+    def _fill_globals(self, values):
+        names = sorted(set(values.keys()) | set(self.global_registry.keys()))
         self.globals_table.setRowCount(len(names))
-        for r,name in enumerate(names):
+        for row, name in enumerate(names):
             rule = self.global_registry.get(name, {})
-            vals = [name, repr(g.get(name, "")), "YES" if name in self.global_registry else "NO", rule.get("description", "")]
-            for c,val in enumerate(vals):
+            vals = [
+                name,
+                repr(values.get(name, "")),
+                rule.get("type", ""),
+                rule.get("unit", ""),
+                rule.get("risk", ""),
+                rule.get("description", ""),
+            ]
+            for col, val in enumerate(vals):
                 item = QtWidgets.QTableWidgetItem(str(val))
-                item.setBackground(QtGui.QColor(225,255,225) if name in self.global_registry else QtGui.QColor(245,245,245))
-                self.globals_table.setItem(r,c,item)
+                item.setBackground(QtGui.QColor(225, 255, 225) if name in self.global_registry else QtGui.QColor(245, 245, 245))
+                self.globals_table.setItem(row, col, item)
+
+    def test_blacs(self):
+        try:
+            self.log(str(self.blacs.test()))
+        except Exception as exc:
+            self._show_error("BLACS bridge failed", exc)
+
+    def set_selected_blacs(self):
+        row = self.blacs_table.currentRow()
+        if row < 0:
+            return
+        name = self.blacs_table.item(row, 0).text()
+        value_item = self.blacs_table.item(row, 5)
+        value = value_item.text() if value_item else ""
+        try:
+            safe = self.validator.validate_command({"actions": [{"type": "set_blacs_manual", "name": name, "value": value}]})
+            self.last_safe = safe
+            self.execute_last()
+        except Exception as exc:
+            self._show_error("BLACS validation failed", exc)
+
+    def apply_checked_blacs(self):
+        actions = []
+        for row in range(self.blacs_table.rowCount()):
+            name_item = self.blacs_table.item(row, 0)
+            if not name_item or name_item.checkState() != QtCore.Qt.Checked:
+                continue
+            value_item = self.blacs_table.item(row, 5)
+            value = value_item.text() if value_item else ""
+            actions.append({"type": "set_blacs_manual", "name": name_item.text(), "value": value})
+        if not actions:
+            self.log("No checked BLACS channels to apply.")
+            return
+        try:
+            self.last_safe = self.validator.validate_command({"actions": actions})
+            self._fill_actions(self.last_safe)
+            self.execute_last()
+        except Exception as exc:
+            self._show_error("Apply checked BLACS failed", exc)
 
     def _fill_blacs_registry(self):
         names = sorted(self.blacs_registry.keys())
         self.blacs_table.setRowCount(len(names))
-        for r,name in enumerate(names):
+        for row, name in enumerate(names):
             rule = self.blacs_registry[name]
-            vals = [name, rule.get("kind",""), rule.get("device",""), rule.get("channel",""), f"{rule.get('min','')}..{rule.get('max','')} {rule.get('unit','')}"]
-            for c,val in enumerate(vals):
-                self.blacs_table.setItem(r,c,QtWidgets.QTableWidgetItem(str(val)))
+            vals = [
+                name,
+                rule.get("kind", ""),
+                rule.get("device", ""),
+                rule.get("channel", ""),
+                f"{rule.get('min', '')}..{rule.get('max', '')} {rule.get('unit', '')}",
+                "",
+                rule.get("risk", ""),
+            ]
+            for col, val in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(str(val))
+                if col == 0:
+                    item.setCheckState(QtCore.Qt.Unchecked)
+                self.blacs_table.setItem(row, col, item)
+
+    def _save_project_setting_value(self, key, value):
+        settings = dict(self.project_settings or {})
+        settings[key] = value
+        self.settings.save_project_settings(settings)
+        self.project_settings = settings
+        if hasattr(self, "project_paths_editor"):
+            self.project_paths_editor.set_settings(settings)
+        if hasattr(self, "directory_table"):
+            self._fill_directory_table()
+        if hasattr(self, "project_tree"):
+            self._fill_project_tree()
+        self.log(f"Project setting saved: {key}={value}")
+
+    def load_sequence_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose sequence folder")
+        if folder:
+            self._save_project_setting_value("sequence_dir", folder)
+
+    def load_connection_table(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose connection table", "", "Python files (*.py);;All files (*.*)")
+        if path:
+            self._save_project_setting_value("connection_table", path)
+            if not self.project_settings.get("active_connection_table"):
+                self._save_project_setting_value("active_connection_table", path)
+
+    def load_lyse_modules_folder(self, key):
+        title = "Choose single modules folder" if key == "single_modules_dir" else "Choose multi modules folder"
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, title)
+        if folder:
+            self._save_project_setting_value(key, folder)
+
+    def _project_path(self, value, default=""):
+        raw = value or default
+        path = Path(str(raw))
+        if not path.is_absolute():
+            path = self.settings.project_dir / path
+        return path
+
+    def _active_sequence_path_text(self):
+        settings = default_directory_settings(self.project_settings, project_dir=self.settings.project_dir)
+        value = settings.get("active_sequence_file") or ""
+        if not value and settings.get("sequence_dir"):
+            folder = self._project_path(settings.get("sequence_dir"))
+            candidates = sorted(folder.glob("*.py")) if folder.exists() else []
+            if candidates:
+                value = str(candidates[0])
+        return str(value or "")
+
+    def _active_connection_table_text(self):
+        settings = default_directory_settings(self.project_settings, project_dir=self.settings.project_dir)
+        return str(settings.get("active_connection_table") or settings.get("connection_table") or "")
+
+    def refresh_co_sequence_paths(self):
+        if hasattr(self, "co_sequence_sequence_path"):
+            self.co_sequence_sequence_path.setText(self._active_sequence_path_text())
+        if hasattr(self, "co_sequence_connection_path"):
+            self.co_sequence_connection_path.setText(self._active_connection_table_text())
+        self.log("Co-Sequence paths refreshed from Directory settings.")
+
+    def browse_co_sequence_sequence(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose active sequence", "", "Python files (*.py);;All files (*.*)")
+        if path:
+            self.co_sequence_sequence_path.setText(path)
+            self._save_project_setting_value("active_sequence_file", path)
+
+    def browse_co_sequence_connection(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose active connection table", "", "Python files (*.py);;All files (*.*)")
+        if path:
+            self.co_sequence_connection_path.setText(path)
+            self._save_project_setting_value("active_connection_table", path)
+
+    def _co_sequence_log_dir(self):
+        return self._project_path(self.project_settings.get("co_sequence_log_dir"), "labpilot_outputs/co_sequence_logs")
+
+    def _command_log_dir(self):
+        return self._project_path(self.project_settings.get("command_log_dir"), "labpilot_outputs/command_logs")
+
+    def _experiment_log_dir(self):
+        return self._project_path(self.project_settings.get("experiment_log_dir"), "labpilot_outputs/experiment_logs")
+
+    def _parse_color_tags(self, text):
+        return [item.strip() for item in str(text or "").replace("\n", ",").split(",") if item.strip()]
+
+    def _append_jsonl(self, path, payload):
+        import json as _json
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(_json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+    def record_command_event(self, status, user_text=None, payload=None):
+        try:
+            payload = dict(payload or {})
+            payload.setdefault("status", status)
+            payload.setdefault("user_text", user_text if user_text is not None else self.command_text.toPlainText() if hasattr(self, "command_text") else "")
+            self.database.log_command_record(status, payload.get("user_text", ""), payload)
+            today = date.today().isoformat()
+            self._append_jsonl(self._command_log_dir() / today / "commands.jsonl", payload)
+        except Exception as exc:
+            self.log(f"command log failed: {exc}")
+
+    def detect_sequence_bools(self):
+        try:
+            import re
+
+            names = set()
+            for item in discover_source_files(self.project_settings, project_dir=self.settings.project_dir):
+                if item["category"] != "sequence" or item["path"].suffix.lower() != ".py":
+                    continue
+                text = item["path"].read_text(encoding="utf-8", errors="ignore")
+                names.update(re.findall(r"\bdo_[A-Za-z0-9_]+\b", text))
+                names.update(re.findall(r"\blyse_do_[A-Za-z0-9_]+\b", text))
+            found = sorted(names)
+            message = "\n".join(found) if found else "No do_* sequence bools detected."
+            self.log("Detected sequence bools:\n" + message)
+            QtWidgets.QMessageBox.information(self, "Detected sequence bools", message)
+        except Exception as exc:
+            self._show_error("Detect sequence bools failed", exc)
 
     def choose_h5_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose h5 folder")
         if folder:
             self.h5_folder.setText(folder)
 
-    def load_h5_table(self):
+    def load_h5_table(self, recursive=None):
         try:
-            df = load_h5_folder(self.h5_folder.text().strip())
-            self._fill_dataframe(self.h5_table, df)
-            self.log(f"loaded h5 files: {len(df)}")
-        except Exception as e:
-            self.log(f"load h5 failed: {e}")
-            QtWidgets.QMessageBox.critical(self, "load h5 failed", str(e))
+            recursive = self.h5_recursive.isChecked() if recursive is None else recursive
+            self.h5_df = load_h5_folder(self.h5_folder.text().strip(), recursive=recursive)
+            self._fill_dataframe(self.h5_table, self.h5_df)
+            self._update_column_combos()
+            self.log(f"loaded h5 files: {len(self.h5_df)}")
+        except Exception as exc:
+            self._show_error("load h5 failed", exc)
 
     def _fill_dataframe(self, table, df):
-        table.setRowCount(len(df)); table.setColumnCount(len(df.columns)); table.setHorizontalHeaderLabels([str(c) for c in df.columns])
-        for r in range(len(df)):
-            for c, col in enumerate(df.columns):
-                table.setItem(r,c,QtWidgets.QTableWidgetItem(str(df.iloc[r,c])))
+        preview_max = int(self.project_settings.get("lyse", {}).get("preview_max_rows", 2000))
+        visible = df.head(preview_max) if preview_max > 0 else df
+        table.setRowCount(len(visible))
+        table.setColumnCount(len(df.columns))
+        table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        for row in range(len(visible)):
+            for col, name in enumerate(df.columns):
+                table.setItem(row, col, QtWidgets.QTableWidgetItem(str(visible.iloc[row, col])))
+        if len(df) > len(visible):
+            self.statusBar().showMessage(f"Showing {len(visible)} of {len(df)} H5 rows; full table remains available for analysis.")
+
+    def _update_column_combos(self):
+        cols = [str(c) for c in (self.h5_df.columns if self.h5_df is not None else [])]
+        for combo in [self.x_col, self.y_col, self.z_col]:
+            combo.clear()
+            combo.addItems(cols)
+
+    def save_merged_results(self):
+        if self.h5_df is None:
+            self.log("No H5 table loaded.")
+            return
+        out_path = Path.cwd() / "labpilot_outputs" / "lyse_results" / "merged_results.csv"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.h5_df.to_csv(out_path, index=False)
+        self.log(f"Merged lyse results saved: {out_path}")
+
+    def export_h5_table(self):
+        if self.h5_df is None:
+            self.log("No H5 table loaded.")
+            return
+        out_path = Path.cwd() / "labpilot_outputs" / "lyse_results" / "h5_table_export.csv"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.h5_df.to_csv(out_path, index=False)
+        self.log(f"H5 table exported: {out_path}")
+
+    def open_analysis_output_folder(self):
+        path = Path.cwd() / "labpilot_outputs"
+        path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.resolve())))
+        self.log(f"Opened analysis output folder: {path}")
+
+    def _fill_module_lists(self):
+        self.single_modules.clear()
+        self.multi_modules.clear()
+        for name, cfg in sorted((self.lyse_registry.get("single_modules", {}) or {}).items(), key=lambda item: item[1].get("order", 1000)):
+            item = QtWidgets.QListWidgetItem(name)
+            item.setCheckState(QtCore.Qt.Checked if cfg.get("enabled_by_default") else QtCore.Qt.Unchecked)
+            self.single_modules.addItem(item)
+        for name, cfg in sorted((self.lyse_registry.get("multi_modules", {}) or {}).items(), key=lambda item: item[1].get("order", 1000)):
+            item = QtWidgets.QListWidgetItem(name)
+            item.setCheckState(QtCore.Qt.Checked if cfg.get("enabled_by_default") else QtCore.Qt.Unchecked)
+            self.multi_modules.addItem(item)
+
+    def selected_h5_path(self):
+        if self.h5_df is None or self.h5_df.empty:
+            raise RuntimeError("Load an h5 table first.")
+        row = self.h5_table.currentRow()
+        if row < 0:
+            row = len(self.h5_df) - 1
+        return self.h5_df.iloc[row]["filepath"]
+
+    def selected_h5_row(self):
+        if self.h5_df is None or self.h5_df.empty:
+            raise RuntimeError("Load an h5 table first.")
+        row = self.h5_table.currentRow()
+        return row if row >= 0 else len(self.h5_df) - 1
+
+    def _checked_names(self, list_widget):
+        names = []
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item.checkState() == QtCore.Qt.Checked:
+                names.append(item.text())
+        return names
+
+    def run_selected_single(self):
+        item = self.single_modules.currentItem()
+        if item:
+            try:
+                self.run_single_by_name(item.text(), {})
+            except Exception as exc:
+                self._show_error("lyse single module failed", exc)
+
+    def run_checked_single_selected(self):
+        names = self._checked_names(self.single_modules)
+        if not names:
+            self.log("No checked single modules.")
+            return {}
+        results = {}
+        for name in names:
+            try:
+                results[name] = self.run_single_by_name(name, {})
+            except Exception as exc:
+                self._show_error(f"lyse single module failed: {name}", exc)
+        return results
+
+    def run_checked_single_table(self):
+        if self.h5_df is None or self.h5_df.empty:
+            raise RuntimeError("Load an h5 table first.")
+        names = self._checked_names(self.single_modules)
+        if not names:
+            self.log("No checked single modules.")
+            return {}
+        results = {}
+        for row in range(len(self.h5_df)):
+            h5_path = self.h5_df.iloc[row]["filepath"]
+            for name in names:
+                try:
+                    results.setdefault(name, []).append(self.run_single_by_name(name, {}, h5_path=h5_path, row_index=row, refresh_table=False))
+                except Exception as exc:
+                    self._show_error(f"lyse single module failed: {name} {h5_path}", exc, modal=False)
+        self._refresh_h5_table_after_analysis()
+        return results
+
+    def run_single_by_name(self, name, params=None, h5_path=None, row_index=None, refresh_table=True):
+        if row_index is None and h5_path is None:
+            row_index = self.selected_h5_row()
+        if h5_path is None:
+            h5_path = self.h5_df.iloc[row_index]["filepath"]
+        result = run_single_module(self.lyse_registry, name, h5_path, params=params)
+        if row_index is not None:
+            self._write_result_to_dataframe(row_index, result)
+            if refresh_table:
+                self._refresh_h5_table_after_analysis()
+        self._record_analysis_result(
+            "single",
+            name,
+            result,
+            metadata={"h5_path": str(h5_path), "row_index": row_index, "params": params or {}},
+        )
+        self.log(f"single module {name}: " + dumps(result))
+        return result
+
+    def run_selected_multi(self):
+        item = self.multi_modules.currentItem()
+        if item:
+            try:
+                self.run_multi_by_name(item.text(), {})
+            except Exception as exc:
+                self._show_error("lyse multi module failed", exc)
+
+    def run_checked_multi_table(self):
+        names = self._checked_names(self.multi_modules)
+        if not names:
+            self.log("No checked multi modules.")
+            return {}
+        results = {}
+        for name in names:
+            try:
+                results[name] = self.run_multi_by_name(name, {})
+            except Exception as exc:
+                self._show_error(f"lyse multi module failed: {name}", exc)
+        return results
+
+    def run_multi_by_name(self, name, params=None):
+        if self.h5_df is None:
+            raise RuntimeError("Load an h5 table first.")
+        result = run_multi_module(self.lyse_registry, name, self.h5_df, params=params)
+        self._record_analysis_result("multi", name, result, metadata={"params": params or {}, "rows": len(self.h5_df)})
+        self.log(f"multi module {name}: " + dumps(result))
+        return result
+
+    def _write_result_to_dataframe(self, row_index, result):
+        if self.h5_df is None:
+            return
+        merge_result_columns(self.h5_df, row_index, result)
+
+    def _refresh_h5_table_after_analysis(self):
+        if self.h5_df is None:
+            return
+        self._fill_dataframe(self.h5_table, self.h5_df)
+        self._update_column_combos()
+
+    def draw_plot_from_ui(self):
+        action = {
+            "type": "plot",
+            "plot_type": self.plot_type.currentText(),
+            "x": self.x_col.currentText(),
+            "y": self.y_col.currentText(),
+            "z": self.z_col.currentText(),
+            "value": self.y_col.currentText(),
+        }
+        self.draw_plot_action(action)
+
+    def draw_plot_action(self, action):
+        if self.h5_df is None:
+            raise RuntimeError("Load an h5 table first.")
+        out_dir = Path.cwd() / "labpilot_outputs" / "figures"
+        out_path = out_dir / f"{action.get('plot_type', 'plot')}_{len(self.figure_paths) + 1}.png"
+        plot_type = action.get("plot_type", "scatter_line")
+        x = action.get("x")
+        y = action.get("y") or action.get("value")
+        z = action.get("z") or action.get("value")
+        if plot_type == "scatter_line":
+            fig = plotting.scatter_line(self.h5_df, x, y, out_path=out_path)
+        elif plot_type == "mean_errorbar":
+            fig = plotting.mean_errorbar(self.h5_df, x, y, out_path=out_path)
+        elif plot_type == "histogram":
+            fig = plotting.histogram(self.h5_df, y, out_path=out_path)
+        elif plot_type == "scatter2d":
+            fig = plotting.scatter2d(self.h5_df, x, y, z, out_path=out_path)
+        elif plot_type == "heatmap2d":
+            fig = plotting.heatmap2d(self.h5_df, x, y, z, out_path=out_path)
+        elif plot_type == "surface3d":
+            fig = plotting.surface3d(self.h5_df, x, y, z, out_path=out_path)
+        else:
+            raise RuntimeError(f"Unsupported plot type: {plot_type}")
+        self.figure_paths.append(str(out_path))
+        self._show_figure(fig)
+        self._record_analysis_result(
+            "plot",
+            plot_type,
+            {"status": "ok", "figure_path": str(out_path), "plot_type": plot_type, "x": x, "y": y, "z": z},
+            metadata=action,
+        )
+        self.log(f"plot saved: {out_path}")
+
+    def _show_figure(self, fig):
+        while self.figure_layout.count():
+            item = self.figure_layout.takeAt(0)
+            if item.widget():
+                old_widget = item.widget()
+                if hasattr(old_widget, "figure"):
+                    plt.close(old_widget.figure)
+                old_widget.deleteLater()
+        self.figure_layout.addWidget(FigureCanvas(fig))
+        plt.close(fig)
+
+    def fit_from_ui(self):
+        action = {
+            "type": "fit",
+            "model": self.fit_model.currentText(),
+            "x": self.x_col.currentText(),
+            "y": self.y_col.currentText(),
+            "z": self.z_col.currentText(),
+        }
+        self.fit_action(action)
+
+    def fit_action(self, action):
+        if self.h5_df is None:
+            raise RuntimeError("Load an h5 table first.")
+        model = action.get("model", "linear")
+        x = action.get("x")
+        y = action.get("y") or action.get("value")
+        z = action.get("z") or action.get("value")
+        if model in {"gaussian2d", "double_gaussian2d"}:
+            if not (x and y and z):
+                raise RuntimeError("2D fitting requires x, y, and z/value columns.")
+            result = fit_xyz(self.h5_df[x], self.h5_df[y], self.h5_df[z], model=model)
+        elif self.plot_type.currentText() == "histogram" or not x:
+            result = fit_histogram(self.h5_df[y], model=model)
+        else:
+            result = fit_xy(self.h5_df[x], self.h5_df[y], model=model)
+        self.fit_results.append(result)
+        self._record_analysis_result("fit", model, result, metadata=action)
+        self.log("fit result: " + dumps(result))
+        return result
+
+    def generate_report_from_ui(self, title="LabPilot analysis report", include_errors=True, include_knowledge_context=True, include_optimizer_history=True):
+        if not isinstance(title, str):
+            title = "LabPilot analysis report"
+        text = generate_markdown_report(
+            title,
+            self.h5_df,
+            self.fit_results,
+            self.figure_paths,
+            analysis_records=self.analysis_records,
+            error_records=self.error_records if include_errors else None,
+            optimizer_history=self.optimizer_last_session if include_optimizer_history else None,
+            knowledge_context=self.last_project_context if include_knowledge_context else "",
+        )
+        out_path = Path.cwd() / "labpilot_outputs" / "reports" / "analysis_report.md"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        self._record_analysis_result("report", title, {"status": "ok", "path": str(out_path)}, metadata={"figures": self.figure_paths})
+        self.log(f"report saved: {out_path}")
+        return out_path
+
+    def _record_analysis_result(self, kind, name, result, metadata=None):
+        try:
+            row = self.result_store.append(kind, name, result, metadata=metadata)
+            self.analysis_records.append(row)
+            self._fill_analysis_records()
+            return row
+        except Exception as exc:
+            self.log(f"analysis result store failed: {exc}")
+            return None
+
+    def _fill_analysis_records(self):
+        if not hasattr(self, "analysis_results_table"):
+            return
+        self.analysis_results_table.setRowCount(len(self.analysis_records))
+        for row_index, row in enumerate(self.analysis_records):
+            result = row.get("result", {})
+            status = result.get("status", "ok") if isinstance(result, dict) else "ok"
+            summary = dumps(result)[:300] if isinstance(result, dict) else str(result)[:300]
+            values = [row.get("kind", ""), row.get("name", ""), status, summary]
+            for col, value in enumerate(values):
+                self.analysis_results_table.setItem(row_index, col, QtWidgets.QTableWidgetItem(str(value)))
+
+    def _fill_optimizer_params(self):
+        rows = []
+        for name, rule in self.global_registry.items():
+            if rule.get("type") in {"float", "int"} and ("min" in rule and "max" in rule):
+                rows.append((name, rule))
+        self.opt_params_table.setRowCount(len(rows))
+        for row, (name, rule) in enumerate(rows):
+            use = QtWidgets.QTableWidgetItem("")
+            use.setCheckState(QtCore.Qt.Unchecked)
+            values = [use, name, str(rule.get("min", 0)), str(rule.get("max", 1)), "5"]
+            for col, value in enumerate(values):
+                item = value if isinstance(value, QtWidgets.QTableWidgetItem) else QtWidgets.QTableWidgetItem(value)
+                self.opt_params_table.setItem(row, col, item)
+
+    def optimizer_spec_from_ui(self):
+        parameters = {}
+        for row in range(self.opt_params_table.rowCount()):
+            use = self.opt_params_table.item(row, 0)
+            if use is None or use.checkState() != QtCore.Qt.Checked:
+                continue
+            name = self.opt_params_table.item(row, 1).text()
+            parameters[name] = {
+                "min": float(self.opt_params_table.item(row, 2).text()),
+                "max": float(self.opt_params_table.item(row, 3).text()),
+                "points": int(self.opt_params_table.item(row, 4).text()),
+            }
+        action = {
+            "type": "start_optimization",
+            "method": self.opt_method.currentText(),
+            "mode": self.opt_mode.currentText(),
+            "objective": self.opt_objective.text().strip(),
+            "parameters": parameters,
+            "max_iterations": self.opt_iterations.value(),
+            "repeats": 1,
+            "auto_loop": False,
+            "run_checked_modules": self.opt_run_checked_modules.isChecked() if hasattr(self, "opt_run_checked_modules") else True,
+            "poll_interval_s": self.opt_poll_interval.value() if hasattr(self, "opt_poll_interval") else 1.0,
+            "h5_timeout_s": self.opt_h5_timeout.value() if hasattr(self, "opt_h5_timeout") else 120.0,
+            "generate_report_on_complete": self.opt_report_on_complete.isChecked() if hasattr(self, "opt_report_on_complete") else False,
+        }
+        return self.validator.validate_command({"actions": [action]})["optimization"]
+
+    def start_optimizer_from_ui(self):
+        try:
+            self.start_optimizer_from_action(self.optimizer_spec_from_ui())
+        except Exception as exc:
+            self._show_error("Optimizer start failed", exc)
+
+    def start_optimizer_from_action(self, spec):
+        if spec.get("type") == "stop_optimization":
+            self.optimizer_loop = None
+            self.optimizer_status.appendPlainText("Optimizer stopped.")
+            self.set_optimizer_state("idle")
+            return
+        if spec.get("auto_loop"):
+            self.start_supervised_loop_from_action(spec)
+            return
+        self.optimizer_loop = OptimizerLoop(spec)
+        self.set_optimizer_state("running")
+        self.optimizer_status.setPlainText("Optimizer started:\n" + dumps(spec, indent=2))
+        self._optimizer_ask_next()
+
+    def _optimizer_ask_next(self):
+        if not self.optimizer_loop:
+            return None
+        params = self.optimizer_loop.ask()
+        self.optimizer_pending_params = params
+        self.optimizer_status.appendPlainText("\nNext params:\n" + dumps(params, indent=2))
+        return params
+
+    def apply_optimizer_params(self, force_run=False):
+        if not self.optimizer_pending_params:
+            self._optimizer_ask_next()
+        if not self.optimizer_pending_params:
+            self.optimizer_status.appendPlainText("No pending params.")
+            return
+        safe = self.validator.validate_command(
+            {"actions": [{"type": "set_global", "name": name, "value": value} for name, value in self.optimizer_pending_params.items()]}
+        )
+        self.last_safe = safe
+        self.json_view.setPlainText("OPTIMIZER SAFE:\n" + dumps(safe, indent=2))
+        self._fill_actions(safe)
+        self.set_optimizer_state("running")
+        self.execute_last(force_run=force_run)
+
+    def apply_optimizer_params_and_engage(self):
+        self.apply_optimizer_params(force_run=True)
+
+    def tell_optimizer_result(self):
+        if not self.optimizer_loop or not self.optimizer_pending_params:
+            self.optimizer_status.appendPlainText("No optimizer point is pending.")
+            return
+        try:
+            values = json.loads(self.opt_result_json.text())
+            self.tell_optimizer_values(values, metadata={"source": "manual_result_json"})
+        except Exception as exc:
+            self._show_error("Optimizer tell failed", exc)
+
+    def tell_optimizer_values(self, values, metadata=None):
+        if not self.optimizer_loop or not self.optimizer_pending_params:
+            raise RuntimeError("No optimizer point is pending.")
+        value = self.optimizer_loop.tell(self.optimizer_pending_params, values, metadata=metadata)
+        feedback = {
+            "status": "ok",
+            "objective": self.optimizer_loop.session.objective,
+            "value": value,
+            "params": self.optimizer_pending_params,
+            "best": self.optimizer_loop.best(),
+            "metadata": metadata or {},
+        }
+        self._record_analysis_result("optimizer_tell", self.optimizer_loop.session.objective, feedback, metadata=metadata)
+        self.optimizer_status.appendPlainText(f"\nObjective value: {value}\nBest:\n{dumps(self.optimizer_loop.best(), indent=2)}")
+        self.set_optimizer_state("running")
+        self._optimizer_ask_next()
+        return feedback
+
+    def tell_optimizer_latest_h5(self, reload_h5=True, run_checked_modules=True):
+        if not self.optimizer_loop or not self.optimizer_pending_params:
+            self.optimizer_status.appendPlainText("No optimizer point is pending.")
+            return None
+        try:
+            if reload_h5 and self.h5_folder.text().strip():
+                self.load_h5_table()
+            if self.h5_df is None or self.h5_df.empty:
+                raise RuntimeError("Load an h5 table before evaluating optimizer feedback.")
+            row = latest_row_position(self.h5_df)
+            h5_path = self.h5_df.iloc[row]["filepath"] if "filepath" in self.h5_df.columns else ""
+            checked_singles = []
+            checked_multis = []
+            extra_values = {}
+            if run_checked_modules:
+                checked_singles = self._checked_names(self.single_modules)
+                for name in checked_singles:
+                    self.run_single_by_name(name, {}, h5_path=h5_path, row_index=row, refresh_table=False)
+                if checked_singles:
+                    self._refresh_h5_table_after_analysis()
+                checked_multis = self._checked_names(self.multi_modules)
+                for name in checked_multis:
+                    result = self.run_multi_by_name(name, {})
+                    extra_values.update(self._prefix_objective_values(name, result))
+            feedback = tell_optimizer_from_dataframe(
+                self.optimizer_loop,
+                self.h5_df,
+                row_position=row,
+                extra_values=extra_values,
+                metadata={
+                    "source": "latest_h5",
+                    "checked_singles": checked_singles,
+                    "checked_multis": checked_multis,
+                },
+            )
+            self._record_analysis_result("optimizer_tell", self.optimizer_loop.session.objective, feedback, metadata=feedback["metadata"])
+            self.opt_result_json.setText(dumps(feedback["values"]))
+            self.optimizer_status.appendPlainText(
+                "\nLatest lyse feedback:\n"
+                + dumps(
+                    {
+                        "row_position": feedback["row_position"],
+                        "objective_value": feedback["objective_value"],
+                        "best": feedback["best"],
+                    },
+                    indent=2,
+                )
+            )
+            self._optimizer_ask_next()
+            return feedback
+        except Exception as exc:
+            self.set_optimizer_state("error")
+            self._show_error("Optimizer latest lyse feedback failed", exc)
+            return None
+
+    def _prefix_objective_values(self, prefix, result):
+        values = objective_values_from_row(result or {})
+        out = {}
+        for key, value in values.items():
+            out[key] = value
+            out[f"{prefix}.{key}"] = value
+        return out
+
+    def start_supervised_loop_from_ui(self):
+        try:
+            spec = dict(self.optimizer_spec_from_ui())
+            spec["auto_loop"] = True
+            spec["run_checked_modules"] = self.opt_run_checked_modules.isChecked()
+            spec["poll_interval_s"] = self.opt_poll_interval.value()
+            spec["h5_timeout_s"] = self.opt_h5_timeout.value()
+            spec["generate_report_on_complete"] = self.opt_report_on_complete.isChecked()
+            self.start_supervised_loop_from_action(spec)
+        except Exception as exc:
+            self._show_error("Supervised optimizer loop start failed", exc)
+
+    def start_supervised_loop_from_action(self, spec):
+        if self.auto_loop_thread and self.auto_loop_thread.isRunning():
+            QtWidgets.QMessageBox.warning(self, "Optimizer loop running", "Stop the current supervised loop before starting another one.")
+            return
+        h5_folder = self.h5_folder.text().strip() if hasattr(self, "h5_folder") else ""
+        dry_run = self.dry_run.isChecked() if hasattr(self, "dry_run") else True
+        if not dry_run and not h5_folder:
+            QtWidgets.QMessageBox.warning(self, "Missing H5 folder", "Choose an H5 output folder before starting a real supervised loop.")
+            return
+        checked_singles = self._checked_names(self.single_modules) if hasattr(self, "single_modules") else []
+        checked_multis = self._checked_names(self.multi_modules) if hasattr(self, "multi_modules") else []
+        approved = self._confirm_supervised_loop_start(spec, checked_singles, checked_multis, h5_folder, dry_run)
+        if not approved:
+            self.optimizer_status.appendPlainText("Supervised loop cancelled by user.")
+            return
+        self.set_optimizer_state("running")
+        self.auto_loop_thread = QtCore.QThread(self)
+        self.auto_loop_worker = OptimizerAutoLoopWorker(
+            spec,
+            self.validator,
+            self.rm,
+            self.lyse_registry,
+            h5_folder,
+            h5_recursive=self.h5_recursive.isChecked() if hasattr(self, "h5_recursive") else False,
+            checked_singles=checked_singles,
+            checked_multis=checked_multis,
+            dry_run=dry_run,
+            high_risk_approved=approved,
+        )
+        self.auto_loop_worker.moveToThread(self.auto_loop_thread)
+        self.auto_loop_thread.started.connect(self.auto_loop_worker.run)
+        self.auto_loop_worker.status.connect(self.on_auto_loop_status)
+        self.auto_loop_worker.step_result.connect(self.on_auto_loop_step)
+        self.auto_loop_worker.dataframe_ready.connect(self.on_auto_loop_dataframe)
+        self.auto_loop_worker.failed.connect(lambda message: self._show_error("Supervised optimizer loop failed", RuntimeError(message), modal=False))
+        self.auto_loop_worker.finished.connect(self.on_auto_loop_finished)
+        self.auto_loop_worker.finished.connect(self.auto_loop_worker.deleteLater)
+        self.auto_loop_worker.finished.connect(self.auto_loop_thread.quit)
+        self.auto_loop_thread.finished.connect(self.auto_loop_thread.deleteLater)
+        self.auto_loop_thread.finished.connect(self._clear_auto_loop_worker)
+        self.optimizer_status.setPlainText("Supervised loop starting:\n" + dumps(spec, indent=2))
+        self.auto_loop_thread.start()
+
+    def _confirm_supervised_loop_start(self, spec, checked_singles, checked_multis, h5_folder, dry_run):
+        high_risk = []
+        for name in (spec.get("parameters") or {}).keys():
+            rule = self.global_registry.get(name, {})
+            if rule.get("require_confirm") or str(rule.get("risk", "")).lower() == "high":
+                high_risk.append(name)
+        summary = {
+            "method": spec.get("method"),
+            "mode": spec.get("mode"),
+            "objective": spec.get("objective"),
+            "parameters": spec.get("parameters"),
+            "max_iterations": spec.get("max_iterations"),
+            "dry_run": dry_run,
+            "mock_runmanager": self.mock_rm.isChecked() if hasattr(self, "mock_rm") else True,
+            "h5_folder": h5_folder,
+            "checked_singles": checked_singles,
+            "checked_multis": checked_multis,
+            "high_risk": high_risk,
+        }
+        text = "Start supervised optimization loop?\n\n" + dumps(summary, indent=2)
+        if high_risk:
+            text += "\n\nHigh-risk parameters are included. Confirm only after checking the hardware state."
+        ans = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm supervised optimizer loop",
+            text,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        return ans == QtWidgets.QMessageBox.Yes
+
+    def pause_supervised_loop(self):
+        if self.auto_loop_worker:
+            self.auto_loop_worker.request_pause()
+            self.set_optimizer_state("paused")
+            self.optimizer_status.appendPlainText("Pause requested; loop will pause after the current safe point.")
+
+    def resume_supervised_loop(self):
+        if self.auto_loop_worker:
+            self.auto_loop_worker.resume()
+            self.set_optimizer_state("running")
+            self.optimizer_status.appendPlainText("Resume requested.")
+
+    def stop_supervised_loop(self):
+        if self.auto_loop_worker:
+            self.auto_loop_worker.request_stop()
+            self.set_optimizer_state("paused")
+            self.optimizer_status.appendPlainText("Stop requested; loop will stop at the next safe boundary.")
+
+    def save_optimizer_history_ui(self):
+        try:
+            session = self.optimizer_last_session
+            if session is None and self.optimizer_loop is not None:
+                session = self.optimizer_loop.session.as_dict()
+            if session is None:
+                raise RuntimeError("No optimizer history is available.")
+            out_path = Path.cwd() / "labpilot_outputs" / "optimizer" / "manual_saved_history.json"
+            save_optimization_history(out_path, session)
+            self.optimizer_status.appendPlainText(f"Optimizer history saved: {out_path}")
+        except Exception as exc:
+            self._show_error("Save optimizer history failed", exc)
+
+    def on_auto_loop_status(self, message):
+        self.optimizer_status.appendPlainText(str(message))
+        self.statusBar().showMessage(str(message))
+        low = str(message).lower()
+        if "waiting" in low and "h5" in low:
+            self.set_optimizer_state("waiting_h5")
+        elif "lyse" in low:
+            self.set_optimizer_state("running_lyse")
+        elif "pause" in low:
+            self.set_optimizer_state("paused")
+        elif "error" in low or "failed" in low:
+            self.set_optimizer_state("error")
+        elif "running" in low or "iteration" in low:
+            self.set_optimizer_state("running")
+
+    def on_auto_loop_step(self, result):
+        self.optimizer_last_session = result.get("session")
+        status = result.get("status")
+        summary = {
+            "status": status,
+            "iteration": result.get("iteration"),
+            "params": result.get("params"),
+            "objective_value": result.get("objective_value"),
+            "best": result.get("best"),
+            "message": result.get("message", ""),
+            "error": result.get("error", ""),
+        }
+        self.optimizer_status.appendPlainText("\nAuto loop step:\n" + dumps(summary, indent=2))
+        if status in {"point_complete", "dry_run_preview", "error"}:
+            self._record_analysis_result("optimizer_auto_loop", status, summary, metadata={"session_id": result.get("session_id")})
+        if status == "error":
+            self.set_optimizer_state("error")
+        elif status == "point_complete":
+            self.set_optimizer_state("running")
+
+    def on_auto_loop_dataframe(self, dataframe):
+        self.h5_df = dataframe
+        self._fill_dataframe(self.h5_table, self.h5_df)
+        self._update_column_combos()
+
+    def on_auto_loop_finished(self, result):
+        self.optimizer_last_session = result.get("session", self.optimizer_last_session)
+        self.optimizer_status.appendPlainText("\nSupervised loop finished:\n" + dumps(result, indent=2))
+        self.set_optimizer_state("complete" if result.get("status") == "complete" else result.get("status", "idle"))
+        if result.get("status") == "complete" and result.get("generate_report_on_complete"):
+            self.generate_report_from_ui("LabPilot supervised optimization report")
+
+    def _clear_auto_loop_worker(self):
+        self.auto_loop_thread = None
+        self.auto_loop_worker = None
+
+    def import_protocol_text(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import text or Markdown", "", "Text files (*.txt *.md *.markdown);;All files (*.*)")
+        if not path:
+            return
+        try:
+            text = import_protocol_file(path)
+            self.protocol_text.appendPlainText(f"\n\n[Imported: {path}]\n{text}")
+            self.log(f"Imported protocol text: {path}")
+        except Exception as exc:
+            self._show_error("Protocol text import failed", exc)
+
+    def import_protocol_pdf(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import PDF", "", "PDF files (*.pdf);;All files (*.*)")
+        if not path:
+            return
+        try:
+            text = import_protocol_file(path)
+            self.protocol_text.appendPlainText(f"\n\n[Imported PDF: {path}]\n{text}")
+            self.log(f"Imported protocol PDF: {path}")
+        except Exception as exc:
+            self._show_error("Protocol PDF import failed", exc)
+
+    def attach_protocol_image(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Attach image path",
+            "",
+            "Image files (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;All files (*.*)",
+        )
+        if not path:
+            return
+        note, ok = QtWidgets.QInputDialog.getText(self, "Image note", "Optional human note for this image:")
+        if not ok:
+            note = ""
+        try:
+            attachment = describe_image_attachment(path, note)
+            self.protocol_attachments.append(attachment)
+            self.protocol_attachment_list.setPlainText("\n\n".join(self.protocol_attachments))
+            self.log(f"Attached protocol image path: {path}")
+        except Exception as exc:
+            self._show_error("Attach protocol image failed", exc)
+
+    def clear_protocol_attachments(self):
+        self.protocol_attachments = []
+        if hasattr(self, "protocol_attachment_list"):
+            self.protocol_attachment_list.clear()
+        self.log("Protocol attachments cleared.")
+
+    def protocol_prompt_text(self):
+        return build_protocol_prompt(self.protocol_text.toPlainText(), self.protocol_attachments)
+
+    def send_protocol_to_command(self):
+        text = self.protocol_output.toPlainText().strip()
+        if not text:
+            text = self.protocol_prompt_text()
+        self.command_text.setPlainText(text)
+        self.tabs.setCurrentIndex(0)
+        self.log("Protocol suggestion copied to Command box. It was not parsed or executed.")
+
+    def knowledge_db_path(self):
+        return project_db_path(self.project_settings, project_dir=self.settings.project_dir)
+
+    def knowledge_indexer(self):
+        return KnowledgeIndexer(self.knowledge_db_path())
+
+    def scan_knowledge_sources(self):
+        try:
+            files = discover_source_files(self.project_settings, project_dir=self.settings.project_dir)
+            self.knowledge_results = [
+                {
+                    "category": item["category"],
+                    "path": str(item["path"]),
+                    "line_start": "",
+                    "line_end": "",
+                    "summary": "",
+                    "snippet": "",
+                    "status": "discovered",
+                }
+                for item in files
+            ]
+            self._fill_knowledge_table(self.knowledge_results)
+            self.knowledge_preview.setPlainText(f"Discovered {len(files)} supported source files.")
+            self._fill_project_tree()
+            self.log(f"Knowledge sources discovered: {len(files)}")
+        except Exception as exc:
+            self._show_error("Scan knowledge sources failed", exc)
+
+    def build_knowledge_index(self, rebuild=False):
+        try:
+            stats = self.knowledge_indexer().index_project(
+                self.project_settings,
+                project_dir=self.settings.project_dir,
+                rebuild=rebuild,
+            )
+            self.knowledge_preview.setPlainText("Knowledge index updated:\n" + dumps(stats, indent=2))
+            self.log("Knowledge index updated: " + dumps(stats))
+            self._fill_project_tree()
+            if hasattr(self, "knowledge_query") and self.knowledge_query.text().strip():
+                self.search_knowledge_ui()
+            return stats
+        except Exception as exc:
+            self._show_error("Build knowledge index failed", exc)
+            return {}
+
+    def search_knowledge_ui(self):
+        try:
+            query = self.knowledge_query.text().strip()
+            if not query:
+                query = self.command_text.toPlainText().strip() if hasattr(self, "command_text") else ""
+            results = KnowledgeSearch(self.knowledge_db_path()).search(query, limit=20)
+            self.knowledge_results = results
+            self._fill_knowledge_table(results)
+            self.knowledge_preview.setPlainText(f"Search query: {query}\nResults: {len(results)}")
+            self.log(f"Knowledge search results: {len(results)} for {query!r}")
+            return results
+        except Exception as exc:
+            self._show_error("Search knowledge failed", exc)
+            return []
+
+    def _fill_knowledge_table(self, rows):
+        if not hasattr(self, "knowledge_table"):
+            return
+        self.knowledge_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            line_start = row.get("line_start", "")
+            line_end = row.get("line_end", "")
+            lines = f"{line_start}-{line_end}" if line_start != "" else ""
+            values = [
+                row.get("category", ""),
+                row.get("path", ""),
+                lines,
+                row.get("summary", ""),
+                row.get("snippet", ""),
+                row.get("status", "match"),
+            ]
+            for col, value in enumerate(values):
+                self.knowledge_table.setItem(row_index, col, QtWidgets.QTableWidgetItem(str(value)))
+
+    def selected_knowledge_result(self):
+        if not self.knowledge_results:
+            return None
+        row = self.knowledge_table.currentRow() if hasattr(self, "knowledge_table") else -1
+        if row < 0:
+            row = 0
+        if row >= len(self.knowledge_results):
+            return None
+        return self.knowledge_results[row]
+
+    def preview_selected_knowledge(self):
+        item = self.selected_knowledge_result()
+        if not item:
+            self.knowledge_preview.setPlainText("No knowledge snippet selected.")
+            return
+        text = (
+            f"category: {item.get('category')}\n"
+            f"file: {item.get('path')}\n"
+            f"lines: {item.get('line_start', '')}-{item.get('line_end', '')}\n\n"
+            f"summary:\n{item.get('summary', '')}\n\n"
+            f"snippet:\n{item.get('snippet', '')}"
+        )
+        self.knowledge_preview.setPlainText(text)
+
+    def send_knowledge_to_protocol(self):
+        item = self.selected_knowledge_result()
+        if not item:
+            self.log("No knowledge snippet selected.")
+            return
+        text = (
+            f"\n\n[Knowledge snippet: {item.get('category')}]\n"
+            f"File: {item.get('path')}\n"
+            f"Lines: {item.get('line_start', '')}-{item.get('line_end', '')}\n"
+            f"{item.get('snippet', '')}"
+        )
+        self.protocol_text.appendPlainText(text)
+        self._select_tab("Protocol")
+        self.log("Knowledge snippet copied to Protocol page.")
+
+    def _set_co_sequence_status(self, status, *, warning=False, error=False):
+        if not hasattr(self, "co_sequence_status"):
+            return
+        self.co_sequence_status.setText(f"Status: {status}")
+        if error:
+            self.co_sequence_status.setObjectName("StatusLightError")
+        elif warning:
+            self.co_sequence_status.setObjectName("StatusLightWarn")
+        else:
+            self.co_sequence_status.setObjectName("StatusLightOk")
+        self.co_sequence_status.style().unpolish(self.co_sequence_status)
+        self.co_sequence_status.style().polish(self.co_sequence_status)
+
+    def generate_co_sequence_patch(self):
+        try:
+            self._set_co_sequence_status("Generating", warning=True)
+            instruction = self.co_sequence_instruction.toPlainText().strip()
+            if not instruction:
+                raise RuntimeError("Enter a Co-Sequence instruction first.")
+            sequence_path = self.co_sequence_sequence_path.text().strip()
+            connection_path = self.co_sequence_connection_path.text().strip()
+            if not sequence_path or not connection_path:
+                raise RuntimeError("Select both active sequence and connection table files.")
+            if not Path(sequence_path).exists() or not Path(connection_path).exists():
+                raise RuntimeError("Selected sequence or connection table file does not exist.")
+            context = self.project_context_for_query(instruction, purpose="co_sequence")
+            self.co_sequence_context.setPlainText(context or "No Knowledge snippets retrieved.")
+            client = LLMClient(
+                api_key=self.api_key.text().strip(),
+                base_url=self.base_url.text().strip(),
+                model=self.model.text().strip(),
+                mock=self.mock_llm.isChecked(),
+            )
+            max_chars = int(self.project_settings.get("co_sequence", {}).get("max_file_chars_for_ai", 60000))
+            self.co_sequence_plan = client.propose_co_sequence_patch(
+                instruction,
+                sequence_path,
+                connection_path,
+                project_context=context,
+                max_file_chars=max_chars,
+            )
+            manual_tags = self._parse_color_tags(self.co_sequence_color_tags.text())
+            if manual_tags:
+                self.co_sequence_plan.setdefault("color_tags", [])
+                self.co_sequence_plan["color_tags"].extend(manual_tags)
+            self.co_sequence_diff.setPlainText(dumps(self.co_sequence_plan, indent=2))
+            self.co_sequence_summary.setPlainText("Patch generated. Validate before applying.\n")
+            self._set_co_sequence_status("Generated")
+            self.log("Co-Sequence patch generated.")
+        except Exception as exc:
+            self._set_co_sequence_status("Failed", error=True)
+            self._show_error("Co-Sequence patch generation failed", exc)
+
+    def validate_co_sequence_patch_ui(self):
+        try:
+            self._set_co_sequence_status("Validating", warning=True)
+            plan = self.co_sequence_plan
+            if not plan:
+                text = self.co_sequence_diff.toPlainText().strip()
+                if text:
+                    plan = json.loads(text)
+                    self.co_sequence_plan = plan
+            if not plan:
+                raise RuntimeError("Generate or paste a patch plan first.")
+            result = validate_patch_plan(
+                plan,
+                self.co_sequence_sequence_path.text().strip(),
+                self.co_sequence_connection_path.text().strip(),
+            )
+            self.co_sequence_validation = result
+            parts = [
+                "Validation: " + ("OK" if result.ok else "FAILED"),
+                "Summary: " + result.summary,
+                "",
+                "Errors:",
+                "\n".join(f"- {e}" for e in result.errors) or "- none",
+                "",
+                "Warnings:",
+                "\n".join(f"- {w}" for w in result.warnings) or "- none",
+                "",
+                "Validated diffs:",
+            ]
+            for preview in result.previews:
+                parts.extend([f"\n## {preview['path']}", preview["unified_diff"]])
+            self.co_sequence_summary.setPlainText("\n".join(parts))
+            if result.previews:
+                self.co_sequence_diff.setPlainText("\n\n".join(preview["unified_diff"] for preview in result.previews))
+            self._set_co_sequence_status("Validated" if result.ok else "Failed", error=not result.ok)
+            self.log("Co-Sequence patch validation " + ("OK" if result.ok else "failed"))
+            return result
+        except Exception as exc:
+            self._set_co_sequence_status("Failed", error=True)
+            self._show_error("Co-Sequence patch validation failed", exc)
+            return None
+
+    def apply_co_sequence_patch_ui(self):
+        try:
+            self._set_co_sequence_status("Applying", warning=True)
+            result = self.co_sequence_validation or self.validate_co_sequence_patch_ui()
+            if not result or not result.ok:
+                raise RuntimeError("Patch is not valid.")
+            if self.co_sequence_review_required.isChecked():
+                answer = QtWidgets.QMessageBox.question(
+                    self,
+                    "Apply Co-Sequence patch",
+                    "Apply the validated patch to the selected sequence/connection table files? Backups and logs will be created.",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if answer != QtWidgets.QMessageBox.Yes:
+                    self._set_co_sequence_status("Validated")
+                    self.log("Co-Sequence patch application cancelled.")
+                    return
+            require_backup = bool(self.project_settings.get("co_sequence", {}).get("require_backup", True))
+            applied = apply_patch_plan(
+                self.co_sequence_plan,
+                self.co_sequence_sequence_path.text().strip(),
+                self.co_sequence_connection_path.text().strip(),
+                require_backup=require_backup,
+            )
+            applied["operator_note"] = self.co_sequence_summary.toPlainText()[:4000]
+            store = CodeChangeLogStore(self._co_sequence_log_dir())
+            log_result = store.append(applied)
+            self.database.log_code_change_record(applied.get("status", "applied"), applied.get("summary", ""), applied)
+            backup_paths = [item.get("backup_path", "") for item in applied.get("applied", []) if item.get("backup_path")]
+            applied_summary = {
+                "backups": backup_paths,
+                "log": log_result,
+            }
+            self.co_sequence_summary.appendPlainText("\nApplied and logged:\n" + dumps(applied_summary, indent=2))
+            self._set_co_sequence_status("Applied")
+            self.log("Co-Sequence patch applied and logged.")
+        except Exception as exc:
+            self._set_co_sequence_status("Failed", error=True)
+            self._show_error("Co-Sequence patch apply failed", exc)
+
+    def reject_co_sequence_patch(self):
+        self.co_sequence_plan = None
+        self.co_sequence_validation = None
+        self.co_sequence_diff.clear()
+        self.co_sequence_summary.setPlainText("Patch rejected. No files were modified.")
+        self._set_co_sequence_status("Rejected", warning=True)
+        self.log("Co-Sequence patch rejected.")
+
+    def add_manual_code_log(self):
+        try:
+            note = self.co_sequence_summary.toPlainText().strip() or self.co_sequence_instruction.toPlainText().strip()
+            if not note:
+                note, ok = QtWidgets.QInputDialog.getMultiLineText(self, "Manual code log", "Log note:")
+                if not ok:
+                    return
+            files = [
+                {"path": self.co_sequence_sequence_path.text().strip()},
+                {"path": self.co_sequence_connection_path.text().strip()},
+            ]
+            record = {
+                "summary": note,
+                "status": "manual_note",
+                "files": files,
+                "color_tags": self._parse_color_tags(self.co_sequence_color_tags.text()),
+            }
+            result = CodeChangeLogStore(self._co_sequence_log_dir()).append(record)
+            self.database.log_code_change_record("manual_note", note[:300], record)
+            self.co_sequence_summary.appendPlainText("\nManual log saved:\n" + dumps(result, indent=2))
+            self.log("Manual code log saved.")
+        except Exception as exc:
+            self._show_error("Manual code log failed", exc)
+
+    def _fill_directory_table(self):
+        if not hasattr(self, "directory_table"):
+            return
+        settings = default_directory_settings(self.project_settings, project_dir=self.settings.project_dir)
+        self.directory_table.setRowCount(len(DIRECTORY_FIELDS))
+        for row, field in enumerate(DIRECTORY_FIELDS):
+            key = field["key"]
+            value = str(settings.get(key, ""))
+            path = self._project_path(value) if value else None
+            exists = bool(path and path.exists())
+            modified = ""
+            if exists:
+                try:
+                    modified = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
+                except Exception:
+                    modified = ""
+            items = [
+                field["label"],
+                value,
+                field["kind"],
+                "yes" if exists else "no",
+                field.get("source", ""),
+                modified,
+                "",
+            ]
+            for col, value_text in enumerate(items):
+                item = QtWidgets.QTableWidgetItem(str(value_text))
+                if col == 0:
+                    item.setData(QtCore.Qt.UserRole, key)
+                    item.setToolTip(field.get("meaning", ""))
+                if col == 3:
+                    item.setBackground(QtGui.QColor(225, 255, 225) if exists else QtGui.QColor(255, 245, 210))
+                self.directory_table.setItem(row, col, item)
+            browse = QtWidgets.QPushButton("Browse")
+            browse.clicked.connect(lambda checked=False, r=row: self.browse_directory_row(r))
+            self.directory_table.setCellWidget(row, 6, browse)
+
+    def browse_directory_row(self, row=None):
+        row = self.directory_table.currentRow() if row is None else row
+        if row < 0:
+            return
+        key_item = self.directory_table.item(row, 0)
+        if not key_item:
+            return
+        key = key_item.data(QtCore.Qt.UserRole)
+        field = next((item for item in DIRECTORY_FIELDS if item["key"] == key), None)
+        if not field:
+            return
+        if field["kind"] in {"file", "sqlite"}:
+            if field["kind"] == "sqlite":
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f"Choose {field['label']}", "", "SQLite database (*.sqlite *.db);;All files (*.*)")
+            else:
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", "Python files (*.py);;YAML files (*.yaml *.yml);;All files (*.*)")
+        else:
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Choose {field['label']}")
+        if path:
+            self.directory_table.setItem(row, 1, QtWidgets.QTableWidgetItem(path))
+            self.directory_detail.setPlainText(f"{field['label']}: {field.get('meaning', '')}")
+
+    def directory_values_from_table(self):
+        values = dict(self.project_settings)
+        for row in range(self.directory_table.rowCount()):
+            key_item = self.directory_table.item(row, 0)
+            path_item = self.directory_table.item(row, 1)
+            if key_item:
+                values[key_item.data(QtCore.Qt.UserRole)] = path_item.text() if path_item else ""
+        return values
+
+    def save_directory_paths(self):
+        try:
+            values = self.directory_values_from_table()
+            for key in ["co_sequence_log_dir", "experiment_log_dir", "command_log_dir", "lyse_results_dir"]:
+                if values.get(key):
+                    self._project_path(values[key]).mkdir(parents=True, exist_ok=True)
+            path = self.settings.save_project_settings(values)
+            self.log(f"Directory paths saved: {path}")
+            self.reload_runtime_config()
+        except Exception as exc:
+            self._show_error("Save Directory paths failed", exc)
+
+    def validate_directory_paths_ui(self):
+        try:
+            values = self.directory_values_from_table()
+            messages = validate_directory_settings(values, project_dir=self.settings.project_dir)
+            if messages:
+                self.directory_detail.setPlainText("\n".join(f"{m['level']} {m['key']}: {m['message']}" for m in messages))
+            else:
+                self.directory_detail.setPlainText("All configured Directory paths validated.")
+            self.log(f"Directory validation messages: {len(messages)}")
+            return messages
+        except Exception as exc:
+            self._show_error("Directory validation failed", exc)
+            return []
+
+    def detect_directory_active_files(self):
+        try:
+            values = self.directory_values_from_table()
+            values = default_directory_settings(values, project_dir=self.settings.project_dir)
+            if not values.get("active_connection_table") and values.get("connection_table"):
+                values["active_connection_table"] = values["connection_table"]
+            if not values.get("active_sequence_file") and values.get("sequence_dir"):
+                folder = self._project_path(values.get("sequence_dir"))
+                candidates = sorted(folder.glob("*.py")) if folder.exists() else []
+                if candidates:
+                    values["active_sequence_file"] = str(candidates[0])
+            if hasattr(self, "h5_folder") and self.h5_folder.text().strip():
+                values["h5_output_dir"] = self.h5_folder.text().strip()
+            self.project_settings.update(values)
+            self._fill_directory_table()
+            self.directory_detail.setPlainText(
+                "Best-effort detection complete. Manual Directory paths remain authoritative."
+            )
+            self.log("Directory active files detected.")
+        except Exception as exc:
+            self._show_error("Directory active file detection failed", exc)
+
+    def open_selected_directory_path(self):
+        row = self.directory_table.currentRow()
+        if row < 0:
+            self.log("Select a Directory row first.")
+            return
+        item = self.directory_table.item(row, 1)
+        if not item or not item.text().strip():
+            return
+        path = self._project_path(item.text().strip())
+        folder = path if path.is_dir() else path.parent
+        folder.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder.resolve())))
+        self.log(f"Opened Directory folder: {folder}")
+
+    def _experiment_log_date_text(self):
+        return self.exp_log_date.date().toString("yyyy-MM-dd")
+
+    def _experiment_log_data(self):
+        date_text = self._experiment_log_date_text()
+        context = ""
+        if self.exp_log_include_knowledge.isChecked():
+            query = f"experiment log {date_text} " + self.exp_log_notes.toPlainText()
+            context = self.project_context_for_query(query, purpose="experiment_log")
+        code_records = self.database.list_code_change_records(date_text=date_text, limit=500)
+        file_records = CodeChangeLogStore(self._co_sequence_log_dir()).records_for_date(date_text)
+        for record in file_records:
+            code_records.append({"created_at": record.get("created_at", ""), "status": record.get("status", ""), "summary": record.get("summary", ""), "payload": record})
+        return {
+            "date": date_text,
+            "notes": self.exp_log_notes.toPlainText(),
+            "command_records": self.database.list_command_records(date_text=date_text, limit=500),
+            "code_change_records": code_records,
+            "analysis_records": self.analysis_records,
+            "error_records": self.error_records,
+            "sequence_path": self._active_sequence_path_text(),
+            "connection_table_path": self._active_connection_table_text(),
+            "h5_output_dir": self.h5_folder.text().strip() if hasattr(self, "h5_folder") else self.project_settings.get("h5_output_dir", ""),
+            "knowledge_context": context,
+        }
+
+    def generate_daily_experiment_log(self):
+        try:
+            data = self._experiment_log_data()
+            fmt = self.exp_log_format.currentText()
+            length = self.exp_log_length.currentData()
+            self.experiment_log_text = generate_experiment_log(
+                data,
+                output_format=fmt,
+                length_mode=length,
+                paragraph_count=self.exp_log_paragraphs.value(),
+            )
+            self.exp_log_preview.setPlainText(self.experiment_log_text)
+            self.log("Daily experiment log generated.")
+            return self.experiment_log_text
+        except Exception as exc:
+            self._show_error("Generate experiment log failed", exc)
+            return ""
+
+    def save_daily_experiment_log(self):
+        try:
+            if not self.experiment_log_text:
+                self.generate_daily_experiment_log()
+            date_text = self._experiment_log_date_text()
+            fmt = self.exp_log_format.currentText()
+            path = save_experiment_log(self._experiment_log_dir(), date_text, self.experiment_log_text, fmt)
+            self.database.log_experiment_log_record(date_text, fmt, str(path), {"path": str(path)})
+            self.log(f"Daily experiment log saved: {path}")
+            return path
+        except Exception as exc:
+            self._show_error("Save experiment log failed", exc)
+            return None
+
+    def open_experiment_log_folder(self):
+        folder = self._experiment_log_dir() / self._experiment_log_date_text()
+        folder.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder.resolve())))
+        self.log(f"Opened experiment log folder: {folder}")
+
+    def project_context_for_query(self, query, purpose="command"):
+        if not self.project_settings.get("knowledge_context_enabled", True):
+            return ""
+        if purpose == "command" and hasattr(self, "knowledge_command_enabled") and not self.knowledge_command_enabled.isChecked():
+            return ""
+        if purpose == "protocol" and hasattr(self, "knowledge_protocol_enabled") and not self.knowledge_protocol_enabled.isChecked():
+            return ""
+        knowledge_cfg = self.project_settings.get("knowledge", {})
+        max_items = int(knowledge_cfg.get("max_context_items", 6))
+        max_chars = int(knowledge_cfg.get("max_context_chars", 4000))
+        if purpose == "error":
+            max_items = min(max_items, 3)
+            max_chars = min(max_chars, 1400)
+        context, results = build_project_context(
+            query,
+            self.project_settings,
+            project_dir=self.settings.project_dir,
+            max_items=max_items,
+            max_chars=max_chars,
+        )
+        self.last_project_context = context
+        if results and hasattr(self, "knowledge_preview"):
+            self.knowledge_results = results
+            self._fill_knowledge_table(results)
+            self.knowledge_preview.setPlainText(context)
+        return context
+
+    def generate_protocol_suggestion(self):
+        prompt = self.protocol_prompt_text()
+        context = self.project_context_for_query(prompt, purpose="protocol")
+        text = draft_protocol_suggestion(prompt, self.global_registry, project_context=context)
+        self.protocol_output.setPlainText(text)
+
+    def _show_error(self, title, exc, modal=True):
+        msg = f"{title}: {exc}"
+        try:
+            context = self.project_context_for_query(f"{title} {exc}", purpose="error")
+        except Exception:
+            context = ""
+        kind = self._error_kind_from_title(title)
+        severity = "hardware_pause" if self._is_hardware_error(kind, title) else "error"
+        record = self.error_center.capture_exception(
+            title,
+            exc,
+            kind=kind,
+            severity=severity,
+            context=context,
+            modal=modal,
+        )
+        if severity == "hardware_pause" and self.project_settings.get("ui", {}).get("pause_hardware_on_error", True):
+            if self.auto_loop_worker:
+                self.auto_loop_worker.request_pause()
+            self.set_optimizer_state("error")
+        advice = record.advice
+        if context:
+            advice += "\n\nRelated project context:\n" + context[:1400]
+        self.log(msg + "\n" + advice)
+        popups = self.project_settings.get("ui", {}).get("error_popups", True)
+        if modal and popups:
+            QtWidgets.QMessageBox.critical(self, title, f"{exc}\n\nSuggestions:\n{advice}")
+
+    def _error_kind_from_title(self, title):
+        low = str(title or "").lower()
+        if "speech" in low or "voice" in low or "stt" in low:
+            return "stt"
+        if "runmanager" in low:
+            return "runmanager"
+        if "blacs" in low:
+            return "blacs"
+        if "lyse" in low or "h5" in low:
+            return "lyse"
+        if "optimizer" in low:
+            return "optimizer"
+        if "knowledge" in low:
+            return "knowledge"
+        if "protocol" in low and "pdf" in low:
+            return "dependency"
+        if "parse" in low or "llm" in low:
+            return "llm"
+        return "ui"
+
+    def _is_hardware_error(self, kind, title):
+        if kind in {"runmanager", "blacs", "optimizer"}:
+            return True
+        low = str(title or "").lower()
+        return "engage" in low or "hardware" in low
+
+    def closeEvent(self, event):
+        if self.voice_recording:
+            try:
+                self.voice_recorder.stop_to_wav()
+            except Exception:
+                pass
+        if self.wake_worker:
+            self.wake_worker.stop()
+        if self.auto_loop_worker:
+            self.auto_loop_worker.request_stop()
+        event.accept()

@@ -8,3 +8,13 @@ def project_root() -> Path:
 def default_config_dir() -> Path:
     # During editable development, configs live at repo_root/configs.
     return project_root() / "configs"
+
+
+def app_icon_path() -> Path:
+    for path in [
+        project_root() / "label.png",
+        Path(__file__).resolve().parents[1] / "label.png",
+    ]:
+        if path.exists():
+            return path
+    return project_root() / "label.png"

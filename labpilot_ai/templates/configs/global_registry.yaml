@@ -1,0 +1,17 @@
+duration_tof_ms:
+  backend: runmanager
+  type: float
+  allow_array: true
+  min: 0.0
+  max: 20.0
+  max_points: 100
+  unit: ms
+  risk: low
+  aliases: [TOF, tof, time of flight]
+  description: Time of flight before imaging.
+do_Rabi:
+  backend: runmanager
+  type: bool
+  risk: low
+  aliases: [Rabi]
+  description: Enable a Rabi sequence branch in labscript.

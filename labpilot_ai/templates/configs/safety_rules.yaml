@@ -1,0 +1,2 @@
+dry_run_default: true
+high_risk_requires_confirmation: true

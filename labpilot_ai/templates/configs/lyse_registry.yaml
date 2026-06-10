@@ -1,0 +1,16 @@
+single_modules:
+  example_single:
+    path: plugins/single_modules/example_single.py
+    enabled_by_default: true
+    order: 10
+    description: Minimal single-shot analysis example.
+    params: {}
+    outputs: [N_total]
+multi_modules:
+  example_multi:
+    path: plugins/multi_modules/example_multi.py
+    enabled_by_default: false
+    order: 10
+    description: Minimal multi-shot analysis example.
+    params: {}
+    outputs: [mean_N_total]

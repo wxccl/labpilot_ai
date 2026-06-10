@@ -1,2 +1,0 @@
-[console_scripts]
-labpilot-ai = labpilot_ai.main:main

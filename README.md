@@ -1,87 +1,121 @@
-# LabPilot AI Starter
+# LabPilot AI
 
-这是一个本地开发用的 **AI 实验控制软件骨架**。第一版重点是：
+LabPilot AI is an industrial-style local AI copilot for labscript-suite experiments. It does not modify labscript, runmanager, BLACS, or lyse internals. Instead, it wraps stable boundaries: registry whitelists, local safety validation, runmanager/BLACS/lyse adapters, HDF5-compatible data, SQLite/JSONL logs, and a PyQt5 desktop UI.
 
-- 统一项目结构；
-- PyQt5 主界面；
-- DeepSeek/OpenAI 兼容 API 自然语言解析；
-- runmanager globals 读写与 engage；
-- 安全白名单、类型检查、范围检查、数组扫描；
-- lyse/HDF5 数据加载基础框架；
-- BLACS manual、optimizer、voice、protocol designer 预留模块。
+The first release is designed to be safe by default: Mock LLM, Mock runmanager/BLACS, and Dry-run workflows can demonstrate the full loop before any real hardware action is enabled.
 
-默认支持 **mock 模式**：没有 labscript/runmanager 也能打开 UI 和测试指令解析。
+## Main Features
 
-## 本地开发安装
+- Industrial PyQt5 UI: Command, Runmanager, BLACS Manual, Lyse, Optimizer, Co-Sequence, Experiment Log, Protocol, Knowledge, Directory, Diagnostics, Error Center, and Settings.
+- Voice input: manual recording, standby wake mode, Chinese/English transcription, CPU/GPU faster-whisper backends, scientific-term correction, and microphone signal display.
+- AI command schema: strict JSON actions using `type`, including `set_global`, `set_blacs_manual`, `engage`, `load_h5`, `run_single_lyse`, `run_multi_lyse`, `plot`, `fit`, `start_optimization`, and `generate_report`.
+- Safety layer: whitelist validation, type/range/array checks, high-risk confirmations, dry-run previews, diffs, rollback hooks, SQLite audit records, and Error Center reporting.
+- runmanager control: globals read/write, float/int/bool/array scan handling, shot preview, and engage through adapters.
+- BLACS manual control: mock/localhost bridge client, limited to registered manual channels.
+- lyse/HDF5 workflow: H5 folder loading, single/multi module selection, result table merging, JSONL/SQLite cache, plots, fits, and reports.
+- Optimizer: grid and Bayesian ask/tell, plus supervised auto loop: set parameters, engage, wait for new H5, run checked lyse modules, evaluate objective, and continue safely.
+- Knowledge base: local SQLite FTS index over sequence code, connection table, lyse modules, labscript source, manuals, papers, and registries. Remote LLMs only receive short retrieved snippets.
+- Protocol Designer: import text/Markdown/PDF text and image paths to generate experiment-design suggestions without executing them.
+- Co-Sequence: AI-assisted restricted diffs for only the active sequence file and active connection table, with validation, backup, review, color tags, and change logs.
+- Experiment Log: daily Markdown/LaTeX/DokuWiki logs from natural-language commands, run records, optimizer/analysis records, Co-Sequence changes, errors, and Knowledge snippets.
+- Directory: the primary path console for active sequence, connection table, globals, BLACS context, lyse folders, H5 output, Knowledge sources, manuals, papers, and log folders.
+- Package templates: PyPI installs include default configs, example plugins, `label.png`, and the manual templates.
 
-进入项目根目录：
+## First-Release Limits
 
-```bash
-cd labpilot_ai_starter
-pip install -e .
-```
+- LabPilot AI does not modify labscript-suite internals.
+- Co-Sequence never edits arbitrary files; it is restricted to the active sequence `.py` and active connection table `.py`.
+- Co-Sequence does not automatically run experiments after code edits.
+- lyse fitting and plotting parameters are stored in LabPilot analysis records, JSONL, SQLite, and reports. The first release does not write fitting results back into original H5 files.
+- Knowledge snippets are short context references only; LabPilot AI does not execute arbitrary source code from the Knowledge database.
+- Real runmanager/BLACS/lyse hardware workflows must be validated in the lab in stages: low-risk globals, one shot, small grid scan, then BLACS single-channel tests.
 
-在你的 labscript conda 环境里推荐：
+## Install
 
-```bash
-conda activate labscript
-cd D:\timing sequence\GPT\labpilot_ai_starter
-pip install -e .
-```
-
-## 设置 API key
-
-PowerShell 临时设置：
+Use the labscript conda environment or another environment that can import the labscript suite:
 
 ```powershell
-$env:DEEPSEEK_API_KEY="你的 key"
+conda activate labscript
+cd E:\Labpilot\labpilot_ai
+pip install -e .
+```
+
+Optional extras:
+
+```powershell
+pip install -e ".[voice]"      # sounddevice + faster-whisper
+pip install -e ".[fit,opt]"    # scipy + scikit-optimize/optuna
+pip install -e ".[docs]"       # pypdf
+pip install -e ".[dev]"        # pytest/black/ruff
+```
+
+Launch:
+
+```powershell
+labpilot-ai
+```
+
+or:
+
+```powershell
+python -m labpilot_ai
+```
+
+## API Configuration
+
+DeepSeek/OpenAI-compatible settings can be entered in the UI or provided as environment variables:
+
+```powershell
+$env:DEEPSEEK_API_KEY="your key"
 $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
 $env:DEEPSEEK_MODEL="deepseek-v4-pro"
 ```
 
-没有 key 时可勾选 UI 中的 `Mock LLM`，用内置规则解析做本地测试。
+If no key is available, keep `Mock LLM` enabled to test parsing and safety flows offline.
 
-## 启动
+## Project Templates
 
-```bash
-labpilot-ai
+On first run, click `Init/repair project templates` in Settings to copy clean local templates:
+
+- `configs/global_registry.yaml`
+- `configs/blacs_manual_registry.yaml`
+- `configs/lyse_registry.yaml`
+- `configs/project_settings.yaml`
+- `plugins/single_modules/`
+- `plugins/multi_modules/`
+- `manual/`
+
+Existing local files are not overwritten. Registry saves create `.bak` backups.
+
+## Voice And CUDA Notes
+
+CPU mode is the most stable default:
+
+```yaml
+voice:
+  device: "cpu"
+  compute_type: "int8"
+  model_size: "small"
+  isolated_stt: true
 ```
 
-或者：
+GPU STT on RTX cards can use:
 
-```bash
-python -m labpilot_ai
+```yaml
+voice:
+  device: "cuda"
+  gpu_compute_type: "float16"
 ```
 
-## 第一轮测试流程
+If Windows reports `Library cublas64_12.dll is not found or cannot be loaded`, run Diagnostics. LabPilot AI includes CUDA DLL path discovery for CUDA Toolkit, `nvidia-cublas-cu12`, `nvidia-cudnn-cu12`, and CTranslate2 directories. See `manual/01_voice/cuda_troubleshooting.md`.
 
-1. 打开软件。
-2. 先勾选 `Mock runmanager` 和 `Dry run`。
-3. 在 Command 页面输入：
+## Release Checks
 
-```text
-把 TOF 改成 17 ms，不运行
+```powershell
+cd E:\Labpilot\labpilot_ai
+python -m compileall -q labpilot_ai
+python -m pytest -q
+git diff --check
 ```
 
-4. 点击 `Parse`，检查动作表。
-5. 取消 `Dry run` 但保留 `Mock runmanager`，点击 `Execute`，测试 mock 写入。
-6. 进入真实实验电脑后，取消 `Mock runmanager`，确保 runmanager GUI/server 已打开，再测试 `Test connection`。
-
-## 重要安全原则
-
-- AI 只输出 JSON 动作；
-- 真正执行前必须通过本地 safety validator；
-- 所有可控变量必须在 `configs/global_registry.yaml` 中登记；
-- 高风险参数应设置 `risk: high` 和 `require_confirm: true`；
-- 自动运行 shot 默认关闭。
-
-## Labscript h5_lock note
-
-This build imports `labscript_utils.h5_lock` at process startup through
-`labpilot_ai.bootstrap_labscript.install_h5_lock()` and also uses lazy `h5py`
-imports in the HDF5 loader. This avoids the common labscript error:
-
-`h5py has already been imported. h5_lock must be imported before h5py.`
-
-If you still see that error, close all Python/IPython/Jupyter processes that
-already imported `h5py`, then start LabPilot AI from a fresh terminal.
+Before publishing, confirm the wheel/sdist does not contain API keys, experiment H5 data, `labpilot_outputs/`, pycache, build folders, or egg-info.

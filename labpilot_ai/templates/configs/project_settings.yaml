@@ -1,0 +1,56 @@
+sequence_dir: ""
+active_sequence_file: ""
+connection_table: ""
+active_connection_table: ""
+runmanager_globals_path: ""
+blacs_connection_context_path: ""
+h5_output_dir: ""
+lyse_results_dir: "labpilot_outputs/lyse_results"
+single_modules_dir: "plugins/single_modules"
+multi_modules_dir: "plugins/multi_modules"
+labscript_source_dir: ""
+manual_dir: "manual"
+paper_dir: ""
+knowledge_db_path: "labpilot_outputs/knowledge/labpilot_knowledge.sqlite"
+co_sequence_log_dir: "labpilot_outputs/co_sequence_logs"
+experiment_log_dir: "labpilot_outputs/experiment_logs"
+command_log_dir: "labpilot_outputs/command_logs"
+knowledge_context_enabled: true
+shot_naming_rule: "labscript_default"
+co_sequence:
+  review_required_default: true
+  max_file_chars_for_ai: 60000
+  require_backup: true
+experiment_log:
+  default_format: "markdown"
+  default_length: "one_a4"
+directory:
+  remember_last_paths: true
+ui:
+  error_popups: true
+  error_center_enabled: true
+  pause_hardware_on_error: true
+knowledge:
+  max_context_items: 6
+  max_context_chars: 4000
+lyse:
+  preview_max_rows: 2000
+ai:
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4-flash"
+  temperature: 0
+voice:
+  model_size: "small"
+  profile: "balanced"
+  device: "cpu"
+  compute_type: "int8"
+  gpu_compute_type: "float16"
+  gpu_enabled: false
+  model_lifetime: "isolated_release"
+  max_gpu_model_size: "large-v3"
+  language: "zh,en"
+  isolated_stt: true
+  wake_name: "labscript"
+  samplerate: 16000
+  silence_threshold: 0.01
+  silence_seconds: 1.2

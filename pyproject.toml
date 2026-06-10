@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.1.1"
-description = "Local AI copilot for labscript suite: runmanager globals, lyse data, BLACS manual stubs, optimizer skeleton."
+version = "0.1.2"
+description = "Industrial AI copilot for labscript-suite experiments: voice commands, runmanager/BLACS/lyse control, optimization, Knowledge, Co-Sequence, and supervised logs."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{name = "LabPilot AI Developers"}]
@@ -24,6 +24,7 @@ dev = ["pytest", "black", "ruff"]
 fit = ["scipy>=1.9"]
 voice = ["sounddevice", "faster-whisper"]
 opt = ["scikit-optimize", "optuna"]
+docs = ["pypdf"]
 
 [project.scripts]
 labpilot-ai = "labpilot_ai.main:main"
@@ -35,3 +36,12 @@ labpilot-ai = "labpilot_ai.main:main"
 [tool.setuptools.packages.find]
 include = ["labpilot_ai*"]
 exclude = ["configs*", "plugins*", "tests*", "examples*"]
+
+[tool.setuptools.package-data]
+labpilot_ai = [
+    "label.png",
+    "templates/configs/*.yaml",
+    "templates/manual/**/*.md",
+    "templates/plugins/single_modules/*.py",
+    "templates/plugins/multi_modules/*.py",
+]
