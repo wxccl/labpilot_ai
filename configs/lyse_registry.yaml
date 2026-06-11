@@ -1,15 +1,53 @@
 single_modules:
   example_single:
     path: plugins/single_modules/example_single.py
+    mode: labpilot_module
     enabled_by_default: true
     order: 10
     description: Minimal single-shot analysis example.
     params: {}
-
+  utils:
+    path: E:/Labpilot/labai_test/timeseq/single/utils.py
+    mode: lyse_script
+    enabled_by_default: true
+    order: 20
+    description: Auto registered single-shot lyse analysis script.
+    params: {}
+  utilsfunc:
+    path: E:/Labpilot/labai_test/timeseq/single/utilsfunc.py
+    mode: lyse_script
+    enabled_by_default: true
+    order: 30
+    description: Auto registered single-shot lyse analysis script.
+    params: {}
+  utilsPCA:
+    path: E:/Labpilot/labai_test/timeseq/single/utilsPCA.py
+    mode: lyse_script
+    enabled_by_default: true
+    order: 40
+    description: Auto registered single-shot lyse analysis script.
+    params: {}
 multi_modules:
   example_multi:
     path: plugins/multi_modules/example_multi.py
+    mode: labpilot_module
     enabled_by_default: false
     order: 10
     description: Minimal multi-shot analysis example.
     params: {}
+  lyse_multishot_absorbimaging_BEC_analyse:
+    path: E:/Labpilot/labai_test/timeseq/multi/lyse_multishot_absorbimaging_BEC_analyse.py
+    mode: lyse_script
+    enabled_by_default: true
+    order: 20
+    description: Auto registered multi-shot lyse analysis script.
+    params: {}
+  utils:
+    path: E:/Labpilot/labai_test/timeseq/multi/utils.py
+    mode: lyse_script
+    enabled_by_default: true
+    order: 30
+    description: Auto registered multi-shot lyse analysis script.
+    params: {}
+  utilsmulti:
+    enabled_by_default: false
