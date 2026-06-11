@@ -49,7 +49,6 @@ from labpilot_ai.optimizer.experiment_loop import OptimizerLoop
 from labpilot_ai.optimizer.history import save_optimization_history
 from labpilot_ai.optimizer.lyse_feedback import latest_row_position, objective_values_from_row, tell_optimizer_from_dataframe
 from labpilot_ai.runmanager_ctrl.backend import RunmanagerBackend
-from labpilot_ai.runmanager_ctrl.sequence_variable_discovery import discover_sequence_globals
 from labpilot_ai.safety.validator import SafetyValidator
 from labpilot_ai.storage.database import LabPilotDatabase
 from labpilot_ai.utils.json_utils import dumps
@@ -1023,58 +1022,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _runmanager_page(self):
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
-
         buttons = QtWidgets.QHBoxLayout()
         test = QtWidgets.QPushButton("Test connection")
         test.clicked.connect(self.test_rm)
         refresh = QtWidgets.QPushButton("Refresh globals")
         refresh.clicked.connect(self.refresh_globals)
+        rollback = QtWidgets.QPushButton("Rollback last write")
+        rollback.clicked.connect(self.rollback_globals)
         engage = QtWidgets.QPushButton("Engage from last action")
         engage.clicked.connect(lambda: self.execute_last(force_run=True))
+        apply_selected = QtWidgets.QPushButton("Apply selected globals")
+        apply_selected.clicked.connect(self.apply_selected_globals)
         build_array = QtWidgets.QPushButton("Build array scan")
         build_array.clicked.connect(self.build_array_scan_from_selected)
+        preview_shots = QtWidgets.QPushButton("Preview shots")
+        preview_shots.clicked.connect(self.preview_runmanager_shots)
+        engage_bools = QtWidgets.QPushButton("Engage checked sequence bools")
+        engage_bools.clicked.connect(self.engage_checked_sequence_bools)
         load_sequence = QtWidgets.QPushButton("Load sequence folder")
         load_sequence.clicked.connect(self.load_sequence_folder)
-        ai_parse = QtWidgets.QPushButton("AI parse sequence variables")
-        ai_parse.setToolTip("Parse active sequence code and auto-complete the runmanager global registry")
-        ai_parse.clicked.connect(self.ai_parse_sequence_variables)
+        load_connection = QtWidgets.QPushButton("Load connection table")
+        load_connection.clicked.connect(self.load_connection_table)
+        detect_bools = QtWidgets.QPushButton("Detect sequence bools")
+        detect_bools.clicked.connect(self.detect_sequence_bools)
         index_sequence = QtWidgets.QPushButton("Index sequence code")
         index_sequence.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
-
-        for button in [test, refresh, engage, build_array, load_sequence, ai_parse, index_sequence]:
+        for button in [test, refresh, rollback, engage, apply_selected, build_array, preview_shots, engage_bools, load_sequence, load_connection, detect_bools, index_sequence]:
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
-
-        status_row = QtWidgets.QHBoxLayout()
-        self.rm_shots_label = QtWidgets.QLabel("n_shots: --")
-        self.rm_shots_label.setObjectName("StatusLightOk")
-        self.rm_autowrite_label = QtWidgets.QLabel("Editing a registered value cell auto-uploads it through SafetyValidator")
-        self.rm_autowrite_label.setObjectName("StatusLightWarn")
-        status_row.addWidget(QtWidgets.QLabel("Runmanager"))
-        status_row.addWidget(self.rm_shots_label)
-        status_row.addWidget(self.rm_autowrite_label, 1)
-        layout.addLayout(status_row)
-
         self.globals_table = QtWidgets.QTableWidget(0, 6)
         self.globals_table.setHorizontalHeaderLabels(["name", "value", "type", "unit", "risk", "description"])
         self.globals_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self._loading_globals_table = False
-        self._pending_global_edit = None
-        self.globals_table.itemChanged.connect(self._on_globals_table_item_changed)
         layout.addWidget(self.globals_table, 1)
-
-        self.global_upload_timer = QtCore.QTimer(self)
-        self.global_upload_timer.setSingleShot(True)
-        self.global_upload_timer.setInterval(500)
-        self.global_upload_timer.timeout.connect(self._global_value_changed_timer_timeout)
-
-        self.rm_shots_timer = QtCore.QTimer(self)
-        self.rm_shots_timer.setInterval(2500)
-        self.rm_shots_timer.timeout.connect(lambda: self.update_runmanager_shot_preview(silent=True))
-        self.rm_shots_timer.start()
-        QtCore.QTimer.singleShot(0, lambda: self.update_runmanager_shot_preview(silent=True))
         return w
+
     def _blacs_page(self):
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
@@ -2448,70 +2430,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             g = self.rm.get_globals()
             self._fill_globals(g)
-            self.update_runmanager_shot_preview(silent=True)
             self.log(f"globals loaded: {len(g)}")
         except Exception as exc:
             self._show_error("refresh globals failed", exc, modal=False)
-
-    def update_runmanager_shot_preview(self, silent=True):
-        try:
-            n = self.rm.n_shots()
-            self._set_runmanager_shot_preview(n, ok=True)
-            return n
-        except Exception as exc:
-            self._set_runmanager_shot_preview("unavailable", ok=False)
-            if not silent:
-                self._show_error("Runmanager shot preview failed", exc)
-            return None
-
-    def _set_runmanager_shot_preview(self, value, ok=True):
-        if not hasattr(self, "rm_shots_label"):
-            return
-        self.rm_shots_label.setText(f"n_shots: {value}")
-        self.rm_shots_label.setObjectName("StatusLightOk" if ok else "StatusLightWarn")
-        self.rm_shots_label.style().unpolish(self.rm_shots_label)
-        self.rm_shots_label.style().polish(self.rm_shots_label)
-
-    def _on_globals_table_item_changed(self, item):
-        if getattr(self, "_loading_globals_table", False):
-            return
-        if item is None or item.column() != 1:
-            return
-        row = item.row()
-        name_item = self.globals_table.item(row, 0)
-        if not name_item:
-            return
-        name = name_item.text().strip()
-        if name not in self.global_registry:
-            self.log(f"Auto upload skipped: {name} is not in global registry.")
-            return
-        self._pending_global_edit = (row, name, item.text())
-        if hasattr(self, "global_upload_timer"):
-            self.global_upload_timer.start()
-        else:
-            self._global_value_changed_timer_timeout()
-
-    def _global_value_changed_timer_timeout(self):
-        payload = getattr(self, "_pending_global_edit", None)
-        self._pending_global_edit = None
-        if not payload:
-            return
-        row, name, value = payload
-        current_name_item = self.globals_table.item(row, 0) if hasattr(self, "globals_table") else None
-        if not current_name_item or current_name_item.text().strip() != name:
-            return
-        self.auto_upload_global_from_table_value(name, value)
-
-    def auto_upload_global_from_table_value(self, name, value):
-        try:
-            action = {"type": "set_global", "name": name, "value": str(value).strip().strip("'\"")}
-            self.last_safe = self.validator.validate_command({"actions": [action]})
-            self._fill_actions(self.last_safe)
-            self.log(f"Auto uploading global: {name} = {action['value']}")
-            self.execute_last(force_run=False)
-            self.update_runmanager_shot_preview(silent=True)
-        except Exception as exc:
-            self._show_error(f"Auto upload global failed: {name}", exc)
 
     def rollback_globals(self):
         try:
@@ -2575,110 +2496,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Build array scan failed", exc)
 
     def preview_runmanager_shots(self):
-        n = self.update_runmanager_shot_preview(silent=False)
-        if n is not None:
-            self.log(f"runmanager live n_shots={n}")
+        try:
+            n = self.rm.n_shots()
+            self.log(f"runmanager preview n_shots={n}")
+            QtWidgets.QMessageBox.information(self, "Runmanager shot preview", f"Estimated n_shots={n}")
+        except Exception as exc:
+            self._show_error("Runmanager shot preview failed", exc)
 
     def engage_checked_sequence_bools(self):
-        self.log("Engage checked sequence bools was removed from the Runmanager UI.")
+        actions = []
+        for name, rule in self.global_registry.items():
+            if rule.get("type") == "bool" and (name.startswith("do_") or name.startswith("lyse_do_")):
+                actions.append({"type": "set_global", "name": name, "value": True})
+        if actions:
+            actions.append({"type": "engage"})
+        try:
+            self.last_safe = self.validator.validate_command({"actions": actions})
+            self._fill_actions(self.last_safe)
+            self.execute_last(force_run=True)
+        except Exception as exc:
+            self._show_error("Engage checked sequence bools failed", exc)
 
     def _fill_globals(self, values):
         names = sorted(set(values.keys()) | set(self.global_registry.keys()))
-        self._loading_globals_table = True
-        self.globals_table.blockSignals(True)
-        try:
-            self.globals_table.setRowCount(len(names))
-            for row, name in enumerate(names):
-                rule = self.global_registry.get(name, {})
-                vals = [
-                    name,
-                    repr(values.get(name, rule.get("default", ""))),
-                    rule.get("type", ""),
-                    rule.get("unit", ""),
-                    rule.get("risk", ""),
-                    rule.get("description", ""),
-                ]
-                for col, val in enumerate(vals):
-                    item = QtWidgets.QTableWidgetItem(str(val))
-                    item.setBackground(QtGui.QColor(225, 255, 225) if name in self.global_registry else QtGui.QColor(245, 245, 245))
-                    if col != 1:
-                        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
-                    self.globals_table.setItem(row, col, item)
-        finally:
-            self.globals_table.blockSignals(False)
-            self._loading_globals_table = False
-        self.update_runmanager_shot_preview(silent=True)
-
-    def ai_parse_sequence_variables(self):
-        """Parse labscript sequence code and merge discovered globals into the runmanager registry."""
-        try:
-            from pathlib import Path
-            from labpilot_ai.runmanager_ctrl.sequence_variable_discovery import discover_sequence_globals
-
-            try:
-                self.project_settings = self.settings.load_project_settings()
-            except Exception:
-                self.project_settings = getattr(self, "project_settings", {}) or {}
-
-            project_dir = getattr(self.settings, "project_dir", None) or Path.cwd()
-            registry, report = discover_sequence_globals(
-                self.project_settings,
-                self.global_registry,
-                project_dir=project_dir,
-            )
-
-            if not report.get("files"):
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "AI parse sequence variables",
-                    "No sequence .py file or folder was found. Set active_sequence_file or sequence_folder in Settings -> Project Paths, or use Load sequence folder first.",
-                )
-                return
-
-            path = self.settings.save_global_registry(registry)
-            self.global_registry = registry
-            self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
-
-            message = (
-                "AI parsed sequence variables:\n"
-                f"Files: {len(report.get('files', []))}\n"
-                f"Discovered: {report.get('discovered', 0)}\n"
-                f"Added: {len(report.get('added', []))}\n"
-                f"Updated: {len(report.get('updated', []))}\n"
-                f"Saved: {path}"
-            )
-            self.log(message)
-            if report.get("parse_errors"):
-                self.log("AI parse warnings:\n" + "\n".join(report.get("parse_errors", [])[:20]))
-
-            try:
-                self.reload_runtime_config()
-            except Exception:
-                pass
-            try:
-                self.refresh_globals()
-            except Exception:
-                pass
-            if hasattr(self, "global_editor"):
-                try:
-                    if hasattr(self, "_global_registry_rows"):
-                        self.global_editor.set_rows(self._global_registry_rows())
-                    else:
-                        from labpilot_ai.config.registry_editor import build_global_registry
-                        self.global_editor.set_rows(build_global_registry(self.global_registry))
-                except Exception:
-                    pass
-
-            QtWidgets.QMessageBox.information(self, "AI parse sequence variables", message)
-        except Exception as exc:
-            if hasattr(self, "_show_error"):
-                self._show_error("AI parse sequence variables failed", exc)
-            elif hasattr(self, "record_error"):
-                self.record_error("AI parse sequence variables failed", exc)
-            elif hasattr(self, "handle_error"):
-                self.handle_error("AI parse sequence variables failed", exc)
-            else:
-                QtWidgets.QMessageBox.critical(self, "AI parse sequence variables failed", str(exc))
+        self.globals_table.setRowCount(len(names))
+        for row, name in enumerate(names):
+            rule = self.global_registry.get(name, {})
+            vals = [
+                name,
+                repr(values.get(name, "")),
+                rule.get("type", ""),
+                rule.get("unit", ""),
+                rule.get("risk", ""),
+                rule.get("description", ""),
+            ]
+            for col, val in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(str(val))
+                item.setBackground(QtGui.QColor(225, 255, 225) if name in self.global_registry else QtGui.QColor(245, 245, 245))
+                self.globals_table.setItem(row, col, item)
 
     def test_blacs(self):
         try:

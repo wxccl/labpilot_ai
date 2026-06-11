@@ -2610,76 +2610,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_runmanager_shot_preview(silent=True)
 
     def ai_parse_sequence_variables(self):
-        """Parse labscript sequence code and merge discovered globals into the runmanager registry."""
+        """Parse sequence code and merge discovered globals into the global registry."""
         try:
             from pathlib import Path
-            from labpilot_ai.runmanager_ctrl.sequence_variable_discovery import discover_sequence_globals
+            from labpilot_ai.runmanager_ctrl.sequence_discovery import discover_sequence_globals
 
-            try:
-                self.project_settings = self.settings.load_project_settings()
-            except Exception:
-                self.project_settings = getattr(self, "project_settings", {}) or {}
-
-            project_dir = getattr(self.settings, "project_dir", None) or Path.cwd()
-            registry, report = discover_sequence_globals(
-                self.project_settings,
-                self.global_registry,
-                project_dir=project_dir,
+            old_registry = dict(self.global_registry or {})
+            new_registry, report = discover_sequence_globals(
+                self.project_settings or {},
+                old_registry,
+                project_dir=Path.cwd(),
             )
 
-            if not report.get("files"):
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "AI parse sequence variables",
-                    "No sequence .py file or folder was found. Set active_sequence_file or sequence_folder in Settings -> Project Paths, or use Load sequence folder first.",
-                )
-                return
-
-            path = self.settings.save_global_registry(registry)
-            self.global_registry = registry
+            self.global_registry = new_registry
+            self.settings.save_global_registry(self.global_registry)
             self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
 
-            message = (
-                "AI parsed sequence variables:\n"
-                f"Files: {len(report.get('files', []))}\n"
-                f"Discovered: {report.get('discovered', 0)}\n"
-                f"Added: {len(report.get('added', []))}\n"
-                f"Updated: {len(report.get('updated', []))}\n"
-                f"Saved: {path}"
-            )
-            self.log(message)
-            if report.get("parse_errors"):
-                self.log("AI parse warnings:\n" + "\n".join(report.get("parse_errors", [])[:20]))
-
-            try:
-                self.reload_runtime_config()
-            except Exception:
-                pass
-            try:
-                self.refresh_globals()
-            except Exception:
-                pass
             if hasattr(self, "global_editor"):
                 try:
-                    if hasattr(self, "_global_registry_rows"):
-                        self.global_editor.set_rows(self._global_registry_rows())
-                    else:
-                        from labpilot_ai.config.registry_editor import build_global_registry
-                        self.global_editor.set_rows(build_global_registry(self.global_registry))
+                    self.global_editor.set_rows(build_global_registry(self.global_registry))
                 except Exception:
                     pass
 
+            if hasattr(self, "globals_table"):
+                try:
+                    self.refresh_globals()
+                except Exception:
+                    pass
+
+            files = report.get("files", []) or []
+            added = report.get("added", []) or []
+            updated = report.get("updated", []) or []
+            skipped = report.get("skipped", []) or []
+
+            message = (
+                "AI parsed sequence variables:
+"
+                f"Files scanned: {len(files)}
+"
+                f"Added: {len(added)}
+"
+                f"Updated: {len(updated)}
+"
+                f"Skipped: {len(skipped)}
+"
+                f"Total registry variables: {len(self.global_registry)}"
+            )
+            self.log(message)
             QtWidgets.QMessageBox.information(self, "AI parse sequence variables", message)
         except Exception as exc:
-            if hasattr(self, "_show_error"):
-                self._show_error("AI parse sequence variables failed", exc)
-            elif hasattr(self, "record_error"):
+            if hasattr(self, "record_error"):
                 self.record_error("AI parse sequence variables failed", exc)
             elif hasattr(self, "handle_error"):
                 self.handle_error("AI parse sequence variables failed", exc)
             else:
                 QtWidgets.QMessageBox.critical(self, "AI parse sequence variables failed", str(exc))
-
     def test_blacs(self):
         try:
             self.log(str(self.blacs.test()))
