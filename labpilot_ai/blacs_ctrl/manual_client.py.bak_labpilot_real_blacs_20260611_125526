@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import json
+from urllib import error, request
+from typing import Any
+
+
+class BlacsBridgeConnectionError(RuntimeError):
+    pass
+
+
+class BlacsManualClient:
+    """
+    Client for LabPilot AI BLACS manual bridge.
+
+    There are three possible modes:
+    1. mock=True: no network, no hardware.
+    2. placeholder bridge: labpilot_ai.blacs_ctrl.manual_bridge_server, useful only for HTTP tests.
+    3. real BLACS bridge: labpilot_ai.blacs_bridge.plugin, running inside the BLACS process.
+
+    The client deliberately reports which bridge type it sees so the UI/user does not confuse
+    the placeholder bridge with a real BLACS connection.
+    """
+
+    PLACEHOLDER_SERVICE = "labpilot-blacs-manual-bridge"
+    REAL_SERVICE = "labpilot-real-blacs-bridge"
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, mock: bool = True):
+        self.host = host
+        self.port = int(port)
+        self.mock = bool(mock)
+        self.values: dict[str, Any] = {}
+        self._last_status: dict[str, Any] | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def _url(self, path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        return self.base_url + path
+
+    def _read_json(self, path: str, timeout: float = 10.0) -> dict[str, Any]:
+        try:
+            with request.urlopen(self._url(path), timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except error.URLError as exc:
+            raise BlacsBridgeConnectionError(
+                f"BLACS bridge failed: {exc}\n"
+                f"- Expected bridge URL: {self.base_url}\n"
+                "- If you are only testing LabPilot AI, switch BLACS mode to Mock.\n"
+                "- If you want localhost bridge testing, start the placeholder bridge server.\n"
+                "- If you want real BLACS, install/start the BLACS plugin bridge inside BLACS."
+            ) from exc
+        except Exception as exc:
+            raise BlacsBridgeConnectionError(f"BLACS bridge request failed at {self._url(path)}: {exc}") from exc
+
+        try:
+            payload = json.loads(raw or "{}")
+        except Exception as exc:
+            raise RuntimeError(f"BLACS bridge returned non-JSON response from {path}: {raw[:500]!r}") from exc
+
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            raise RuntimeError(payload.get("error") or f"BLACS bridge error at {path}")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"BLACS bridge returned unexpected payload at {path}: {payload!r}")
+        return payload
+
+    def _post_json(self, path: str, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = request.Request(
+            self._url(path),
+            data=data,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except error.URLError as exc:
+            raise BlacsBridgeConnectionError(
+                f"BLACS bridge failed: {exc}\n"
+                f"- Expected bridge URL: {self.base_url}\n"
+                "- Check BLACS mode, bridge process/plugin, host/port, and firewall."
+            ) from exc
+
+        try:
+            result = json.loads(raw or "{}")
+        except Exception as exc:
+            raise RuntimeError(f"BLACS bridge returned non-JSON response from {path}: {raw[:500]!r}") from exc
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(result.get("error") or "BLACS bridge manual write failed")
+        return result
+
+    def status(self) -> dict[str, Any]:
+        if self.mock:
+            payload = {
+                "ok": True,
+                "service": "mock-blacs-bridge",
+                "bridge_type": "mock",
+                "is_real_blacs": False,
+                "values": dict(self.values),
+            }
+            self._last_status = payload
+            return payload
+        payload = self._read_json("/status", timeout=5)
+        service = payload.get("service", "")
+        payload["is_real_blacs"] = service == self.REAL_SERVICE
+        payload["is_placeholder"] = service == self.PLACEHOLDER_SERVICE
+        self._last_status = payload
+        return payload
+
+    def test(self) -> str:
+        """Return a human-readable diagnostic string. Do not raise for normal connection failures."""
+        if self.mock:
+            return "mock-blacs-bridge: ok"
+        try:
+            payload = self.status()
+        except Exception as exc:
+            return str(exc)
+
+        service = payload.get("service", "unknown")
+        if service == self.REAL_SERVICE:
+            return "connected to real BLACS bridge: ok"
+        if service == self.PLACEHOLDER_SERVICE:
+            return (
+                "connected to placeholder BLACS bridge: ok, but this is NOT real BLACS hardware control. "
+                "Use it only for HTTP/UI tests."
+            )
+        return f"connected to unknown BLACS bridge service={service!r}: {payload}"
+
+    def is_real_bridge(self) -> bool:
+        try:
+            return bool(self.status().get("is_real_blacs"))
+        except Exception:
+            return False
+
+    def discover_channels(self) -> list[dict[str, Any]]:
+        if self.mock:
+            return [
+                {
+                    "name": name,
+                    "kind": "manual",
+                    "device": "mock",
+                    "channel": name,
+                    "type": "bool" if isinstance(value, bool) else "float",
+                    "current_value": value,
+                    "risk": "low",
+                    "bridge_type": "mock",
+                }
+                for name, value in sorted(self.values.items())
+            ]
+
+        payload = self._read_json("/channels", timeout=10)
+        channels = payload.get("channels", [])
+        if not isinstance(channels, list):
+            raise RuntimeError(f"BLACS bridge /channels returned invalid channels: {channels!r}")
+        return channels
+
+    def get_values(self) -> dict[str, Any]:
+        if self.mock:
+            return dict(self.values)
+        payload = self._read_json("/values", timeout=10)
+        values = payload.get("values", {})
+        if not isinstance(values, dict):
+            raise RuntimeError(f"BLACS bridge /values returned invalid values: {values!r}")
+        return values
+
+    def set_manual(self, name: str, value: Any, program: bool = False) -> dict[str, Any]:
+        if self.mock:
+            self.values[name] = value
+            return {"ok": True, "mock": True, "name": name, "value": value, "program": bool(program)}
+
+        return self._post_json(
+            "/set_manual",
+            {"name": name, "value": value, "program": bool(program)},
+            timeout=10,
+        )

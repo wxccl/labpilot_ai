@@ -1,12 +1,1 @@
-Example_Bias_voltage:
-  backend: blacs_manual
-  kind: AO
-  device: NI_DAQ
-  channel: ao0
-  type: float
-  min: -1.0
-  max: 1.0
-  unit: V
-  risk: medium
-  aliases: [bias voltage]
-  description: Example manual AO voltage. Replace with a real BLACS channel.
+{}

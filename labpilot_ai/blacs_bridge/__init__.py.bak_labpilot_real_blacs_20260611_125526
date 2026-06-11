@@ -1,0 +1,4 @@
+"""BLACS-side bridge plugin for LabPilot AI.
+
+This package is intended to be imported by BLACS, not by the normal LabPilot UI process.
+"""

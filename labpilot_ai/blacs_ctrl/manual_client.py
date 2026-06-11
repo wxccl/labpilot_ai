@@ -1,37 +1,110 @@
+from __future__ import annotations
+
 import json
-from urllib import request
+from urllib import error, request
+
+
+class BlacsBridgeConnectionError(ConnectionError):
+    pass
 
 
 class BlacsManualClient:
-    """Placeholder client for BLACS localhost bridge."""
-    def __init__(self, host="127.0.0.1", port=8765, mock=True):
+    """Client for LabPilot BLACS manual bridges.
+
+    mock=True keeps all values local. mock=False talks to a localhost bridge.
+    A real BLACS bridge reports service='labpilot-real-blacs-bridge'.
+    The legacy placeholder bridge reports service='labpilot-blacs-manual-bridge'.
+    """
+
+    def __init__(self, host="127.0.0.1", port=8765, mock=True, token=None):
         self.host = host
-        self.port = port
-        self.mock = mock
+        self.port = int(port)
+        self.mock = bool(mock)
+        self.token = token
         self.values = {}
 
-    def test(self):
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def _headers(self):
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["X-LabPilot-Token"] = self.token
+        return headers
+
+    def _get_json(self, path: str, timeout=10):
+        try:
+            req = request.Request(f"{self.base_url}{path}", headers=self._headers(), method="GET")
+            with request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8")
+        except error.URLError as exc:
+            raise BlacsBridgeConnectionError(f"Cannot connect to BLACS bridge at {self.base_url}: {exc}") from exc
+        try:
+            return json.loads(text)
+        except Exception:
+            return {"ok": True, "raw": text}
+
+    def _post_json(self, path: str, payload: dict, timeout=10):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        try:
+            req = request.Request(f"{self.base_url}{path}", data=data, headers=self._headers(), method="POST")
+            with request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8")
+        except error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8")
+                payload = json.loads(body)
+                raise RuntimeError(payload.get("error") or body) from exc
+            except RuntimeError:
+                raise
+            except Exception:
+                raise RuntimeError(str(exc)) from exc
+        except error.URLError as exc:
+            raise BlacsBridgeConnectionError(f"Cannot connect to BLACS bridge at {self.base_url}: {exc}") from exc
+        return json.loads(text)
+
+    def status(self):
         if self.mock:
+            return {"ok": True, "service": "mock-blacs-bridge", "mock": True}
+        return self._get_json("/status", timeout=5)
+
+    def test(self):
+        payload = self.status()
+        service = payload.get("service", "unknown")
+        if service == "mock-blacs-bridge":
             return "mock-blacs-bridge: ok"
-        with request.urlopen(f"http://{self.host}:{self.port}/status", timeout=5) as resp:
-            return resp.read().decode("utf-8")
+        if service == "labpilot-real-blacs-bridge":
+            return "connected to real running BLACS bridge"
+        if service == "labpilot-blacs-manual-bridge":
+            return "connected to placeholder bridge only; not real BLACS hardware"
+        return json.dumps(payload, ensure_ascii=False)
+
+    def is_real_bridge(self) -> bool:
+        return self.status().get("service") == "labpilot-real-blacs-bridge"
+
+    def debug(self):
+        if self.mock:
+            return {"ok": True, "mock": True, "values": dict(self.values)}
+        return self._get_json("/debug", timeout=10)
 
     def discover_channels(self):
         if self.mock:
             return [
                 {
                     "name": name,
+                    "bridge_name": name,
                     "kind": "manual",
                     "device": "mock",
                     "channel": name,
                     "type": "float" if not isinstance(value, bool) else "bool",
                     "current_value": value,
                     "risk": "low",
+                    "require_confirm": False,
                 }
                 for name, value in sorted(self.values.items())
             ]
-        with request.urlopen(f"http://{self.host}:{self.port}/channels", timeout=10) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        payload = self._get_json("/channels", timeout=10)
         if isinstance(payload, dict) and payload.get("ok") is False:
             raise RuntimeError(payload.get("error") or "BLACS bridge channel discovery failed")
         return payload.get("channels", payload if isinstance(payload, list) else [])
@@ -39,25 +112,18 @@ class BlacsManualClient:
     def get_values(self):
         if self.mock:
             return dict(self.values)
-        with request.urlopen(f"http://{self.host}:{self.port}/values", timeout=10) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        payload = self._get_json("/values", timeout=10)
         if isinstance(payload, dict) and payload.get("ok") is False:
             raise RuntimeError(payload.get("error") or "BLACS bridge value readback failed")
         return payload.get("values", payload if isinstance(payload, dict) else {})
 
-    def set_manual(self, name, value, program=False):
+    def set_manual(self, name, value, program=False, **extra):
         if self.mock:
             self.values[name] = value
-            return {"mock": True, "name": name, "value": value, "program": program}
-        payload = json.dumps({"name": name, "value": value, "program": bool(program)}).encode("utf-8")
-        req = request.Request(
-            f"http://{self.host}:{self.port}/set_manual",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        if isinstance(payload, dict) and payload.get("ok") is False:
-            raise RuntimeError(payload.get("error") or "BLACS bridge manual write failed")
-        return payload
+            return {"mock": True, "ok": True, "name": name, "value": value, "program": program}
+        payload = {"name": name, "value": value, "program": bool(program)}
+        payload.update(extra)
+        result = self._post_json("/set_manual", payload, timeout=10)
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(result.get("error") or "BLACS bridge manual write failed")
+        return result

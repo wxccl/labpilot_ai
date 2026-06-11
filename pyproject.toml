@@ -28,6 +28,8 @@ docs = ["pypdf"]
 
 [project.scripts]
 labpilot-ai = "labpilot_ai.main:main"
+labpilot-blacs-bridge = "labpilot_ai.blacs_ctrl.manual_bridge_server:main"
+labpilot-blacs-real-bridge-info = "labpilot_ai.blacs_bridge.plugin:diagnostic_main"
 
 # Important: this project uses a flat-layout and also has top-level
 # directories named configs/ and plugins/. Tell setuptools explicitly that
