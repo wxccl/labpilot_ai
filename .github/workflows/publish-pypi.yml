@@ -1,18 +1,27 @@
 name: Publish to PyPI
 
 on:
+  workflow_dispatch:
   release:
     types: [published]
-  workflow_dispatch:
 
 jobs:
   build:
     name: Build distributions
     runs-on: ubuntu-latest
 
+    outputs:
+      package_version: ${{ steps.version.outputs.version }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Show commit
+        run: |
+          git rev-parse HEAD
+          git status --short
+          sed -n '1,160p' pyproject.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,8 +33,55 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install build twine
 
+      - name: Read package version
+        id: version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+          print(f"version={version}")
+          PY
+
+      - name: Show package version
+        run: |
+          echo "Package version: ${{ steps.version.outputs.version }}"
+
+      - name: Clean old builds
+        run: |
+          rm -rf dist build *.egg-info labpilot_ai.egg-info
+          find . -maxdepth 3 -type f \( -name "*.whl" -o -name "*.tar.gz" \) -print
+
       - name: Build package
         run: python -m build
+
+      - name: Verify built distributions
+        run: |
+          ls -la dist
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+
+          files = sorted(p.name for p in Path("dist").iterdir())
+          print("pyproject version =", version)
+          print("dist files =", files)
+
+          expected = [
+              f"labpilot_ai-{version}-py3-none-any.whl",
+              f"labpilot_ai-{version}.tar.gz",
+          ]
+
+          missing = [name for name in expected if name not in files]
+          if missing:
+              raise SystemExit(f"Missing expected distributions: {missing}")
+
+          wrong = [name for name in files if version not in name]
+          if wrong:
+              raise SystemExit(f"Found distributions for a different version: {wrong}")
+          PY
 
       - name: Check distributions
         run: python -m twine check dist/*
@@ -54,6 +110,10 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
+
+      - name: Show distributions before upload
+        run: |
+          ls -la dist
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
