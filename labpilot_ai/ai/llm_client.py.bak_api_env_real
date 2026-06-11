@@ -8,58 +8,12 @@ from .prompt_builder import build_command_prompt
 
 class LLMClient:
     def __init__(self, api_key=None, base_url=None, model=None, use_thinking=True, mock=False):
-        """OpenAI-compatible LLM client.
-
-        In production mode this reads API credentials from the operating-system
-        environment at construction time.  It never writes the secret key to a
-        repository or YAML file.
-        """
-        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
-        openai_key = os.getenv("OPENAI_API_KEY")
-
-        if api_key:
-            self.api_key = api_key
-            self.api_key_source = "argument"
-        elif deepseek_key:
-            self.api_key = deepseek_key
-            self.api_key_source = "DEEPSEEK_API_KEY"
-        elif openai_key:
-            self.api_key = openai_key
-            self.api_key_source = "OPENAI_API_KEY"
-        else:
-            self.api_key = None
-            self.api_key_source = "missing"
-
-        if base_url:
-            self.base_url = base_url
-        elif self.api_key_source == "DEEPSEEK_API_KEY":
-            self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        elif self.api_key_source == "OPENAI_API_KEY":
-            self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        else:
-            self.base_url = os.getenv("DEEPSEEK_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.deepseek.com"
-
-        if model:
-            self.model = model
-        elif self.api_key_source == "DEEPSEEK_API_KEY":
-            self.model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        elif self.api_key_source == "OPENAI_API_KEY":
-            self.model = os.getenv("OPENAI_MODEL", "gpt-4.1")
-        else:
-            self.model = os.getenv("DEEPSEEK_MODEL") or os.getenv("OPENAI_MODEL") or "deepseek-v4-flash"
-
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.base_url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.use_thinking = use_thinking
-        self.mock = bool(mock)
+        self.mock = mock
 
-    def status(self):
-        """Return a safe, non-secret status dictionary for UI/log display."""
-        return {
-            "mock": bool(self.mock),
-            "api_key_found": bool(self.api_key),
-            "api_key_source": self.api_key_source,
-            "base_url": self.base_url,
-            "model": self.model,
-        }
     def parse_command(self, user_text: str, global_registry: dict, blacs_registry=None, lyse_registry=None, project_context=None) -> dict:
         if self.mock or not self.api_key:
             result = self._mock_parse(user_text, global_registry)

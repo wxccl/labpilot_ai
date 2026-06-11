@@ -2,7 +2,7 @@ import numpy as np
 
 
 class RunmanagerBackend:
-    def __init__(self, mock=False, timeout=10):
+    def __init__(self, mock=True, timeout=10):
         self.mock = mock
         self.timeout = timeout
         self._client = None

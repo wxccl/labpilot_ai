@@ -1,4 +1,3 @@
-import os
 import json
 import queue
 import time
@@ -680,8 +679,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.error_center.install_global_hooks(qt_message_handler=True)
 
         self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
-        self.rm = RunmanagerBackend(mock=False)
-        self.blacs = BlacsManualClient(mock=False)
+        self.rm = RunmanagerBackend(mock=True)
+        self.blacs = BlacsManualClient(mock=True)
         voice_cfg = self.project_settings.get("voice", {})
         self.voice_lexicon = VoiceLexicon.from_registries(
             self.global_registry,
@@ -734,144 +733,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.experiment_log_text = ""
 
         self._build_ui()
-        self._install_llm_api_status_panel()
-        self._install_runtime_status_widgets()
-        self._force_real_connections()
         self.log("LabPilot AI loaded. Default mode: Mock LLM, Mock runmanager, Mock BLACS, Dry run.")
-
-
-    def _update_llm_mode(self):
-        """Legacy slot kept for compatibility; LLM mock mode has been removed."""
-        self.refresh_llm_status()
-    def _llm_api_status_text(self):
-        client = getattr(self, "llm", None)
-        if client is None:
-            client = LLMClient(mock=False)
-            self.llm = client
-        status = client.status() if hasattr(client, "status") else {
-            "mock": getattr(client, "mock", False),
-            "api_key_found": bool(getattr(client, "api_key", None)),
-            "api_key_source": getattr(client, "api_key_source", "unknown"),
-            "base_url": getattr(client, "base_url", ""),
-            "model": getattr(client, "model", ""),
-        }
-        if status.get("api_key_found"):
-            return f"LLM real: {status.get('api_key_source')} | {status.get('model')} | {status.get('base_url')}"
-        return "LLM real requested, but API key missing. Set DEEPSEEK_API_KEY or OPENAI_API_KEY and restart."
-
-    def refresh_llm_status(self):
-        self.llm = LLMClient(mock=False)
-        text = self._llm_api_status_text()
-        try:
-            if not hasattr(self, "llm_status_label"):
-                self.llm_status_label = QtWidgets.QLabel()
-                self.statusBar().addPermanentWidget(self.llm_status_label)
-            self.llm_status_label.setText(text)
-        except Exception:
-            pass
-        self.log(text)
-        return text
-
-    def _force_real_connections(self):
-        """Force real LLM/runmanager/BLACS mode and show safe API status."""
-        for attr in ("mock_llm", "mock_rm", "mock_runmanager", "mock_blacs"):
-            widget = getattr(self, attr, None)
-            if widget is None:
-                continue
-            try:
-                widget.blockSignals(True)
-                widget.setChecked(False)
-                widget.setEnabled(False)
-                widget.setVisible(False)
-                widget.blockSignals(False)
-            except Exception:
-                pass
-        self.llm = LLMClient(mock=False)
-        self.rm = RunmanagerBackend(mock=False)
-        self.blacs = BlacsManualClient(mock=False)
-        self.refresh_llm_status()
-        self.log("Real modes forced: runmanager=real, BLACS=localhost bridge")
-
-    def _install_runtime_status_widgets(self):
-        """Install always-visible runtime/API status labels in the main UI."""
-        try:
-            if not hasattr(self, "llm_status_label"):
-                self.llm_status_label = QtWidgets.QLabel("LLM: checking...")
-                self.llm_status_label.setObjectName("llm_status_label")
-                self.llm_status_label.setMinimumWidth(360)
-                self.statusBar().addPermanentWidget(self.llm_status_label, 1)
-            self.refresh_llm_api_status_ui(log=True)
-        except Exception as exc:
-            try:
-                self.log(f"LLM status UI setup failed: {exc}")
-            except Exception:
-                pass
-
-    def _llm_runtime_status(self):
-        """Return sanitized LLM runtime status without exposing the full API key."""
-        client = LLMClient(mock=False)
-        if hasattr(client, "status"):
-            status = dict(client.status())
-        else:
-            status = {
-                "mock": bool(getattr(client, "mock", False)),
-                "api_key_found": bool(getattr(client, "api_key", None)),
-                "api_key_source": getattr(client, "api_key_source", ""),
-                "base_url": getattr(client, "base_url", ""),
-                "model": getattr(client, "model", ""),
-            }
-        source = status.get("api_key_source") or ""
-        if not source:
-            if os.getenv("DEEPSEEK_API_KEY"):
-                source = "DEEPSEEK_API_KEY"
-            elif os.getenv("OPENAI_API_KEY"):
-                source = "OPENAI_API_KEY"
-            else:
-                source = "missing"
-        raw_key = os.getenv(source, "") if source.endswith("_API_KEY") else ""
-        if raw_key:
-            masked = raw_key[:8] + "..." + raw_key[-4:] if len(raw_key) > 12 else "***"
-        else:
-            masked = "missing"
-        status["api_key_source"] = source
-        status["api_key_masked"] = masked
-        status["api_key_found"] = bool(raw_key or status.get("api_key_found"))
-        return status
-
-    def refresh_llm_api_status_ui(self, log=False):
-        """Refresh visible LLM API status from system environment variables."""
-        try:
-            status = self._llm_runtime_status()
-            found = bool(status.get("api_key_found")) and not bool(status.get("mock"))
-            source = status.get("api_key_source", "missing")
-            model = status.get("model", "") or "unknown-model"
-            base_url = status.get("base_url", "") or "unknown-base-url"
-            masked = status.get("api_key_masked", "missing")
-            if found:
-                text = f"LLM: REAL API loaded | {source} | {model}"
-                style = "color: #1B7F3A; font-weight: 600;"
-            else:
-                text = "LLM: API key missing"
-                style = "color: #BF1D2D; font-weight: 600;"
-            if hasattr(self, "llm_status_label"):
-                self.llm_status_label.setText(text)
-                self.llm_status_label.setToolTip(
-                    f"source={source}\nmodel={model}\nbase_url={base_url}\nkey={masked}"
-                )
-                self.llm_status_label.setStyleSheet(style)
-            if log:
-                self.log(f"{text} | base_url={base_url} | key={masked}")
-            return status
-        except Exception as exc:
-            if hasattr(self, "llm_status_label"):
-                self.llm_status_label.setText(f"LLM: status error: {exc}")
-                self.llm_status_label.setStyleSheet("color: #BF1D2D; font-weight: 600;")
-            if log:
-                try:
-                    self.log(f"LLM status error: {exc}")
-                except Exception:
-                    pass
-            return {"error": str(exc)}
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -1012,23 +874,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.base_url = QtWidgets.QLineEdit(ai_cfg.get("base_url", "https://api.deepseek.com"))
         self.model = QtWidgets.QLineEdit(ai_cfg.get("model", "deepseek-v4-flash"))
         self.mock_llm = QtWidgets.QCheckBox("Mock LLM")
-        self.mock_llm.setVisible(False)
-        self.mock_llm.setEnabled(False)
-        self.mock_llm.setVisible(False)
-        self.mock_llm.setEnabled(False)
         self.mock_llm.setChecked(True)
         self.mock_rm = QtWidgets.QCheckBox("Mock runmanager")
-        self.mock_rm.setVisible(False)
-        self.mock_rm.setEnabled(False)
-        self.mock_rm.setVisible(False)
-        self.mock_rm.setEnabled(False)
         self.mock_rm.setChecked(True)
         self.mock_rm.stateChanged.connect(self._update_rm_mode)
         self.mock_blacs = QtWidgets.QCheckBox("Mock BLACS")
-        self.mock_blacs.setVisible(False)
-        self.mock_blacs.setEnabled(False)
-        self.mock_blacs.setVisible(False)
-        self.mock_blacs.setEnabled(False)
         self.mock_blacs.setChecked(True)
         self.mock_blacs.stateChanged.connect(self._update_blacs_mode)
         self.dry_run = QtWidgets.QCheckBox("Dry run")
@@ -2127,11 +1977,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("Error Center cleared.")
 
     def switch_to_mock_dry_run(self):
-        """Legacy safety button: mock modes are removed; keep Dry run enabled only."""
+        if hasattr(self, "mock_llm"):
+            self.mock_llm.setChecked(True)
+        if hasattr(self, "mock_rm"):
+            self.mock_rm.setChecked(True)
+        if hasattr(self, "mock_blacs"):
+            self.mock_blacs.setChecked(True)
         if hasattr(self, "dry_run"):
             self.dry_run.setChecked(True)
-        self._force_real_connections()
-        self.log("Mock modes have been removed. Real connections kept; Dry run enabled.")
+        self._update_rm_mode()
+        self._update_blacs_mode()
+        self.log("Switched to Mock LLM, Mock runmanager, Mock BLACS, and Dry run.")
+
     def set_optimizer_state(self, state):
         self.optimizer_status_state = str(state or "idle")
         if hasattr(self, "optimizer_state_label"):
@@ -2140,168 +1997,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.optimizer_state_label.setObjectName("StatusLightWarn" if warn else "StatusLightOk")
             self.optimizer_state_label.style().unpolish(self.optimizer_state_label)
             self.optimizer_state_label.style().polish(self.optimizer_state_label)
-
-
-    def _install_llm_api_status_panel(self):
-        """Install an always-visible LLM API status panel in the UI."""
-        if getattr(self, "_llm_api_status_panel_installed", False):
-            self.update_llm_api_status()
-            return
-        self._llm_api_status_panel_installed = True
-
-        self.llm_api_status_label = QtWidgets.QLabel("LLM API: checking...")
-        self.llm_api_status_label.setObjectName("llm_api_status_label")
-        self.llm_api_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.llm_api_status_label.setMinimumWidth(520)
-        self.llm_api_status_label.setStyleSheet(
-            "QLabel { padding: 4px 8px; border: 1px solid #999; "
-            "border-radius: 4px; background: #fff8dc; color: #262626; font-weight: 600; }"
-        )
-        try:
-            self.statusBar().addPermanentWidget(self.llm_api_status_label, 1)
-        except Exception:
-            pass
-
-        self.llm_api_status_dock = QtWidgets.QDockWidget("LLM API Status", self)
-        self.llm_api_status_dock.setObjectName("llm_api_status_dock")
-        self.llm_api_status_dock.setAllowedAreas(
-            QtCore.Qt.TopDockWidgetArea
-            | QtCore.Qt.BottomDockWidgetArea
-            | QtCore.Qt.LeftDockWidgetArea
-            | QtCore.Qt.RightDockWidgetArea
-        )
-
-        host = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(host)
-        layout.setContentsMargins(8, 6, 8, 6)
-
-        title = QtWidgets.QLabel("LLM API")
-        title.setStyleSheet("QLabel { font-weight: 700; font-size: 13px; }")
-        layout.addWidget(title)
-
-        self.llm_api_status_big_label = QtWidgets.QLabel("checking...")
-        self.llm_api_status_big_label.setObjectName("llm_api_status_big_label")
-        self.llm_api_status_big_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.llm_api_status_big_label.setStyleSheet(
-            "QLabel { padding: 5px 10px; border: 1px solid #999; "
-            "border-radius: 5px; background: #fff8dc; color: #262626; font-weight: 600; }"
-        )
-        layout.addWidget(self.llm_api_status_big_label, 1)
-
-        refresh = QtWidgets.QPushButton("Refresh LLM API status")
-        refresh.clicked.connect(self.update_llm_api_status)
-        layout.addWidget(refresh)
-
-        self.llm_api_status_dock.setWidget(host)
-        self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self.llm_api_status_dock)
-        self.update_llm_api_status()
-
-    def _mask_api_key_for_ui(self, value):
-        value = str(value or "")
-        if not value:
-            return ""
-        if len(value) <= 12:
-            return "***"
-        return value[:6] + "..." + value[-4:]
-
-    def _llm_status_dict_for_ui(self):
-        """Return current LLM status without exposing the full key."""
-        client = getattr(self, "llm", None)
-        if client is None:
-            client = LLMClient(mock=False)
-            self.llm = client
-        else:
-            try:
-                # After the no-mock patch, force any stale UI-created client into real mode.
-                client.mock = False
-            except Exception:
-                pass
-
-        if hasattr(client, "status"):
-            status = dict(client.status())
-        else:
-            api_key = getattr(client, "api_key", "")
-            source = "unknown"
-            try:
-                import os
-                if os.getenv("DEEPSEEK_API_KEY"):
-                    source = "DEEPSEEK_API_KEY"
-                elif os.getenv("OPENAI_API_KEY"):
-                    source = "OPENAI_API_KEY"
-            except Exception:
-                pass
-            status = {
-                "mock": bool(getattr(client, "mock", False)),
-                "api_key_found": bool(api_key),
-                "api_key_source": source,
-                "base_url": getattr(client, "base_url", ""),
-                "model": getattr(client, "model", ""),
-            }
-        # Never show the complete secret in UI.
-        status["api_key_preview"] = self._mask_api_key_for_ui(getattr(client, "api_key", ""))
-        return status
-
-    def update_llm_api_status(self):
-        """Refresh visible LLM API status labels."""
-        try:
-            status = self._llm_status_dict_for_ui()
-            source = status.get("api_key_source") or "unknown"
-            model = status.get("model") or "unknown-model"
-            base_url = status.get("base_url") or "unknown-base-url"
-            key_preview = status.get("api_key_preview") or ""
-            mock = bool(status.get("mock"))
-            found = bool(status.get("api_key_found"))
-
-            if found and not mock:
-                one_line = f"LLM API: REAL LOADED | {source} | {model}"
-                detail = f"REAL API loaded   source={source}   model={model}   base_url={base_url}   key={key_preview}"
-                style = (
-                    "QLabel { padding: 5px 10px; border: 1px solid #2e7d32; "
-                    "border-radius: 5px; background: #e8f5e9; color: #1b5e20; font-weight: 700; }"
-                )
-            elif found and mock:
-                one_line = f"LLM API: KEY FOUND but MOCK MODE | {source} | {model}"
-                detail = f"Key found but client is mock=True   source={source}   model={model}   base_url={base_url}   key={key_preview}"
-                style = (
-                    "QLabel { padding: 5px 10px; border: 1px solid #ef6c00; "
-                    "border-radius: 5px; background: #fff3e0; color: #e65100; font-weight: 700; }"
-                )
-            else:
-                one_line = "LLM API: MISSING KEY | set DEEPSEEK_API_KEY or OPENAI_API_KEY"
-                detail = "Missing API key. Set DEEPSEEK_API_KEY or OPENAI_API_KEY, then restart PowerShell / VS Code / LabPilot AI."
-                style = (
-                    "QLabel { padding: 5px 10px; border: 1px solid #b71c1c; "
-                    "border-radius: 5px; background: #ffebee; color: #b71c1c; font-weight: 700; }"
-                )
-
-            for attr in ("llm_api_status_label", "llm_api_status_big_label"):
-                label = getattr(self, attr, None)
-                if label is not None:
-                    label.setText(one_line if attr == "llm_api_status_label" else detail)
-                    label.setToolTip(detail)
-                    label.setStyleSheet(style)
-            try:
-                self.statusBar().showMessage(one_line, 8000)
-            except Exception:
-                pass
-            try:
-                if hasattr(self, "log"):
-                    self.log(detail)
-            except Exception:
-                pass
-            return status
-        except Exception as exc:
-            msg = f"LLM API: status error: {exc}"
-            for attr in ("llm_api_status_label", "llm_api_status_big_label"):
-                label = getattr(self, attr, None)
-                if label is not None:
-                    label.setText(msg)
-                    label.setToolTip(msg)
-            try:
-                self.statusBar().showMessage(msg, 8000)
-            except Exception:
-                pass
-            return {"error": str(exc)}
 
     def log(self, msg):
         if hasattr(self, "log_text"):
@@ -2386,13 +2081,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return report
 
     def _update_rm_mode(self):
-        """Legacy slot kept for compatibility; runmanager mock mode has been removed."""
-        self.rm = RunmanagerBackend(mock=False)
-        self.log("runmanager mode: real")
+        self.rm = RunmanagerBackend(mock=self.mock_rm.isChecked())
+        self.log(f"runmanager mode: {'mock' if self.mock_rm.isChecked() else 'real'}")
+
     def _update_blacs_mode(self):
-        """Legacy slot kept for compatibility; BLACS mock mode has been removed."""
-        self.blacs = BlacsManualClient(mock=False)
-        self.log("BLACS mode: localhost bridge")
+        self.blacs = BlacsManualClient(mock=self.mock_blacs.isChecked())
+        self.log(f"BLACS mode: {'mock' if self.mock_blacs.isChecked() else 'localhost bridge'}")
+
     def transcribe_audio_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose audio file", "", "Audio files (*.wav *.mp3 *.m4a *.flac);;All files (*.*)")
         if not path:
@@ -2599,7 +2294,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 api_key=self.api_key.text().strip(),
                 base_url=self.base_url.text().strip(),
                 model=self.model.text().strip(),
-                mock=False,
+                mock=self.mock_llm.isChecked(),
             )
             user_text = self.command_text.toPlainText()
             project_context = self.project_context_for_query(user_text, purpose="command")
@@ -2915,30 +2610,76 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_runmanager_shot_preview(silent=True)
 
     def ai_parse_sequence_variables(self):
-        """Parse sequence code and merge discovered variables into the global registry."""
+        """Parse labscript sequence code and merge discovered globals into the runmanager registry."""
         try:
-            registry, report = discover_sequence_globals(self.project_settings, self.global_registry, project_dir=Path.cwd())
-            self.global_registry = registry
-            self.settings.save_global_registry(registry)
-            self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
+            from pathlib import Path
+            from labpilot_ai.runmanager_ctrl.sequence_variable_discovery import discover_sequence_globals
+
             try:
-                self._fill_globals(self.rm.get_globals())
+                self.project_settings = self.settings.load_project_settings()
             except Exception:
-                self._fill_globals({})
-            summary = [
-                f"files: {len(report.get('files', []))}",
-                f"added: {len(report.get('added', []))}",
-                f"updated: {len(report.get('updated', []))}",
-            ]
-            message = "AI parsed sequence variables:\n" + "\n".join(summary)
+                self.project_settings = getattr(self, "project_settings", {}) or {}
+
+            project_dir = getattr(self.settings, "project_dir", None) or Path.cwd()
+            registry, report = discover_sequence_globals(
+                self.project_settings,
+                self.global_registry,
+                project_dir=project_dir,
+            )
+
+            if not report.get("files"):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "AI parse sequence variables",
+                    "No sequence .py file or folder was found. Set active_sequence_file or sequence_folder in Settings -> Project Paths, or use Load sequence folder first.",
+                )
+                return
+
+            path = self.settings.save_global_registry(registry)
+            self.global_registry = registry
+            self.validator = SafetyValidator(self.global_registry, self.blacs_registry, self.lyse_registry)
+
+            message = (
+                "AI parsed sequence variables:\n"
+                f"Files: {len(report.get('files', []))}\n"
+                f"Discovered: {report.get('discovered', 0)}\n"
+                f"Added: {len(report.get('added', []))}\n"
+                f"Updated: {len(report.get('updated', []))}\n"
+                f"Saved: {path}"
+            )
             self.log(message)
-            QtWidgets.QMessageBox.information(self, "AI parsed sequence variables", message)
+            if report.get("parse_errors"):
+                self.log("AI parse warnings:\n" + "\n".join(report.get("parse_errors", [])[:20]))
+
+            try:
+                self.reload_runtime_config()
+            except Exception:
+                pass
+            try:
+                self.refresh_globals()
+            except Exception:
+                pass
+            if hasattr(self, "global_editor"):
+                try:
+                    if hasattr(self, "_global_registry_rows"):
+                        self.global_editor.set_rows(self._global_registry_rows())
+                    else:
+                        from labpilot_ai.config.registry_editor import build_global_registry
+                        self.global_editor.set_rows(build_global_registry(self.global_registry))
+                except Exception:
+                    pass
+
+            QtWidgets.QMessageBox.information(self, "AI parse sequence variables", message)
         except Exception as exc:
-            if hasattr(self, "record_error"):
+            if hasattr(self, "_show_error"):
+                self._show_error("AI parse sequence variables failed", exc)
+            elif hasattr(self, "record_error"):
                 self.record_error("AI parse sequence variables failed", exc)
+            elif hasattr(self, "handle_error"):
+                self.handle_error("AI parse sequence variables failed", exc)
             else:
-                self.log(f"AI parse sequence variables failed: {exc}")
-            QtWidgets.QMessageBox.warning(self, "AI parse sequence variables failed", str(exc))
+                QtWidgets.QMessageBox.critical(self, "AI parse sequence variables failed", str(exc))
+
     def test_blacs(self):
         try:
             self.log(str(self.blacs.test()))
@@ -4144,7 +3885,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "parameters": spec.get("parameters"),
             "max_iterations": spec.get("max_iterations"),
             "dry_run": dry_run,
-            "mock_runmanager": False if hasattr(self, "mock_rm") else True,
+            "mock_runmanager": self.mock_rm.isChecked() if hasattr(self, "mock_rm") else True,
             "h5_folder": h5_folder,
             "checked_singles": checked_singles,
             "checked_multis": checked_multis,
@@ -4452,7 +4193,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 api_key=self.api_key.text().strip(),
                 base_url=self.base_url.text().strip(),
                 model=self.model.text().strip(),
-                mock=False,
+                mock=self.mock_llm.isChecked(),
             )
             max_chars = int(self.project_settings.get("co_sequence", {}).get("max_file_chars_for_ai", 60000))
             self.co_sequence_plan = client.propose_co_sequence_patch(
