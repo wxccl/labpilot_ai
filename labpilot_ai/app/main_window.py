@@ -17,6 +17,13 @@ from labpilot_ai.ai.protocol_importer import build_protocol_prompt, describe_ima
 from labpilot_ai.ai.protocol_designer import draft_protocol_suggestion
 from labpilot_ai.analysis import plotting
 from labpilot_ai.analysis.fit_models import fit_histogram, fit_xy, fit_xyz
+from labpilot_ai.analysis.plot_specs import (
+    PLOT_SPECS,
+    default_plot_columns,
+    numeric_varying_columns,
+    required_columns,
+    valid_fit_models,
+)
 from labpilot_ai.analysis.report_generator import generate_markdown_report
 from labpilot_ai.app.error_center import ErrorCenter
 from labpilot_ai.app.theme import APP_STYLE
@@ -45,7 +52,7 @@ from labpilot_ai.experiment_log import generate_experiment_log, save_experiment_
 from labpilot_ai.knowledge.context_builder import build_project_context
 from labpilot_ai.knowledge.indexer import KnowledgeIndexer, discover_source_files, project_db_path, source_counts
 from labpilot_ai.knowledge.search import KnowledgeSearch
-from labpilot_ai.lyse_ctrl.h5_loader import load_h5_folder, read_shot_summary
+from labpilot_ai.lyse_ctrl.h5_loader import iter_h5_paths, load_h5_folder, read_shot_summary
 from labpilot_ai.lyse_ctrl.multi_runner import run_multi_module
 from labpilot_ai.lyse_ctrl.result_store import JsonlResultStore, default_result_store_path, merge_result_columns
 from labpilot_ai.lyse_ctrl.single_runner import run_single_module
@@ -514,6 +521,8 @@ class RegistryEditorWidget(QtWidgets.QWidget):
         layout.addLayout(header)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(8)
         self.table = QtWidgets.QTableWidget(0, len(self.fields))
         self.table.setHorizontalHeaderLabels(self.fields)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
@@ -840,10 +849,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_safe = None
         self.last_user_requested_run = False
         self.h5_df = None
+        self.h5_file_states = {}
+        self.h5_read_errors = {}
+        self.h5_auto_loading = False
         self.visible_h5_columns = None
         self.fit_results = []
         self.figure_paths = []
         self.analysis_records = []
+        self.plot_column_candidates = []
         self.result_store = JsonlResultStore(default_result_store_path())
         self.optimizer_loop = None
         self.optimizer_pending_params = None
@@ -858,8 +871,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.co_sequence_plan = None
         self.co_sequence_validation = None
         self.experiment_log_text = ""
+        self.lyse_auto_load_timer = QtCore.QTimer(self)
+        lyse_cfg = self.project_settings.get("lyse", {}) or {}
+        self.lyse_auto_load_timer.setInterval(int(lyse_cfg.get("auto_load_interval_ms", 1000)))
+        self.lyse_auto_load_timer.timeout.connect(self.auto_refresh_h5_table)
 
         self._build_ui()
+        self.lyse_auto_load_timer.start()
         self._install_llm_api_status_panel()
         self._install_runtime_status_widgets()
         self._force_real_connections()
@@ -1066,6 +1084,13 @@ class MainWindow(QtWidgets.QMainWindow):
         button.setToolTip(tooltip)
         button.clicked.connect(lambda checked=False, s=slot: s())
         return button
+
+    def _make_splitter(self, orientation):
+        splitter = QtWidgets.QSplitter(orientation)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        splitter.setOpaqueResize(True)
+        return splitter
 
     def _project_dock(self):
         dock = QtWidgets.QDockWidget("Project", self)
@@ -1328,7 +1353,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
         layout.addWidget(top)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split = self._make_splitter(QtCore.Qt.Horizontal)
         layout.addWidget(split, 1)
 
         left = QtWidgets.QWidget()
@@ -1596,124 +1621,95 @@ class MainWindow(QtWidgets.QMainWindow):
     def _lyse_page(self):
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
-        row = QtWidgets.QHBoxLayout()
+
+        source_row = QtWidgets.QHBoxLayout()
+        source_row.addWidget(QtWidgets.QLabel("H5 output folder"))
         self.h5_folder = QtWidgets.QLineEdit(self.project_settings.get("h5_output_dir", ""))
         self.h5_recursive = QtWidgets.QCheckBox("Recursive")
-        browse = QtWidgets.QPushButton("Choose h5 folder")
-        browse.clicked.connect(self.choose_h5_folder)
-        load = QtWidgets.QPushButton("Load h5 table")
-        load.clicked.connect(lambda: self.load_h5_table())
-        add_h5_files = QtWidgets.QPushButton("Add H5 files")
+        self.lyse_auto_load = QtWidgets.QCheckBox("Auto load finished shots")
+        self.lyse_auto_load.setChecked(bool((self.project_settings.get("lyse", {}) or {}).get("auto_load_finished_shots", True)))
+        self.lyse_auto_load.toggled.connect(self._update_lyse_auto_load_status)
+        self.lyse_auto_status = QtWidgets.QLabel("Auto load idle")
+        self.lyse_auto_status.setObjectName("StatusLightOk")
+        source_row.addWidget(self.h5_folder, 1)
+        source_row.addWidget(self.h5_recursive)
+        source_row.addWidget(self.lyse_auto_load)
+        source_row.addWidget(self.lyse_auto_status)
+        self.h5_folder.textChanged.connect(lambda _text: self._update_lyse_auto_load_status())
+        layout.addLayout(source_row)
+
+        filebox_tools = QtWidgets.QHBoxLayout()
+        self.lyse_analysis_running = QtWidgets.QPushButton("Analysis running")
+        self.lyse_analysis_running.setCheckable(True)
+        self.lyse_analysis_running.setChecked(True)
+        self.lyse_analysis_running.toggled.connect(self._on_lyse_analysis_running_toggled)
+        mark_not_done = QtWidgets.QPushButton("Mark as not done")
+        mark_not_done.clicked.connect(self.mark_selected_h5_not_done)
+        run_multishot = QtWidgets.QPushButton("Run multishot analysis")
+        run_multishot.clicked.connect(self.run_checked_multi_table)
+        add_h5_files = QtWidgets.QPushButton("Add shots")
+        add_h5_files.setToolTip("Add shots")
         add_h5_files.clicked.connect(self.add_h5_files)
-        save_merged = QtWidgets.QPushButton("Save merged results")
-        save_merged.clicked.connect(self.save_merged_results)
-        export_h5 = QtWidgets.QPushButton("Export selected H5 table")
-        export_h5.clicked.connect(self.export_h5_table)
-        open_output = QtWidgets.QPushButton("Open analysis output folder")
-        open_output.clicked.connect(self.open_analysis_output_folder)
-        load_single_dir = QtWidgets.QPushButton("Load single modules folder")
-        load_single_dir.clicked.connect(lambda: self.load_lyse_modules_folder("single_modules_dir"))
-        load_multi_dir = QtWidgets.QPushButton("Load multi modules folder")
-        load_multi_dir.clicked.connect(lambda: self.load_lyse_modules_folder("multi_modules_dir"))
-        scan_lyse_modules = QtWidgets.QPushButton("Scan .py modules")
-        scan_lyse_modules.clicked.connect(self.auto_scan_lyse_modules_ui)
-        index_analysis = QtWidgets.QPushButton("Index analysis code")
-        index_analysis.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
-        for widget in [
-            self.h5_folder,
-            self.h5_recursive,
-            browse,
-            load,
-            add_h5_files,
-            save_merged,
-            export_h5,
-            open_output,
-            load_single_dir,
-            load_multi_dir,
-            scan_lyse_modules,
-            index_analysis,
-        ]:
-            row.addWidget(widget, 1 if widget is self.h5_folder else 0)
-        layout.addLayout(row)
-
-        h5_tools = QtWidgets.QHBoxLayout()
-        remove_rows = QtWidgets.QPushButton("Remove selected rows")
+        remove_rows = QtWidgets.QPushButton("Remove selected shots")
+        remove_rows.setToolTip("Remove selected shots")
         remove_rows.clicked.connect(self.remove_selected_h5_rows)
-        clear_rows = QtWidgets.QPushButton("Clear table")
-        clear_rows.clicked.connect(self.clear_h5_table)
-        reload_rows = QtWidgets.QPushButton("Reload selected")
-        reload_rows.clicked.connect(self.reload_selected_h5_rows)
-        column_chooser = QtWidgets.QPushButton("Column chooser")
+        column_chooser = QtWidgets.QPushButton("Columns...")
         column_chooser.clicked.connect(self.open_column_chooser)
-        send_plot = QtWidgets.QPushButton("Send selected columns to Plot")
-        send_plot.clicked.connect(self.send_selected_columns_to_plot)
-        send_fit = QtWidgets.QPushButton("Send selected columns to Fit")
-        send_fit.clicked.connect(self.send_selected_columns_to_fit)
-        for widget in [remove_rows, clear_rows, reload_rows, column_chooser, send_plot, send_fit]:
-            h5_tools.addWidget(widget)
-        h5_tools.addStretch()
-        layout.addLayout(h5_tools)
+        for widget in [self.lyse_analysis_running, mark_not_done, run_multishot, add_h5_files, remove_rows, column_chooser]:
+            filebox_tools.addWidget(widget)
+        filebox_tools.addStretch()
+        layout.addLayout(filebox_tools)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        split = self._make_splitter(QtCore.Qt.Vertical)
         layout.addWidget(split, 1)
         self.h5_table = QtWidgets.QTableWidget(0, 0)
         split.addWidget(self.h5_table)
 
         lower = QtWidgets.QWidget()
         lower_layout = QtWidgets.QHBoxLayout(lower)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
+        lower_split = self._make_splitter(QtCore.Qt.Horizontal)
+        lower_layout.addWidget(lower_split, 1)
 
-        module_box = QtWidgets.QGroupBox("Lyse modules")
-        module_layout = QtWidgets.QVBoxLayout(module_box)
-        self.single_modules = QtWidgets.QListWidget()
-        self.multi_modules = QtWidgets.QListWidget()
+        module_box = QtWidgets.QGroupBox("Analysis routines")
+        module_layout = QtWidgets.QHBoxLayout(module_box)
+        self.single_modules = self._make_lyse_module_table("single_modules")
+        self.multi_modules = self._make_lyse_module_table("multi_modules")
         self._fill_module_lists()
-        module_tools = QtWidgets.QGridLayout()
-        add_py = QtWidgets.QPushButton("Add .py")
-        add_py.clicked.connect(self.add_lyse_module_file)
-        add_folder = QtWidgets.QPushButton("Add folder")
-        add_folder.clicked.connect(self.add_lyse_module_folder)
-        remove_py = QtWidgets.QPushButton("Remove selected .py")
-        remove_py.clicked.connect(self.remove_selected_lyse_module)
-        toggle_module = QtWidgets.QPushButton("Enable/disable selected")
-        toggle_module.clicked.connect(self.toggle_selected_lyse_module)
-        move_up = QtWidgets.QPushButton("Move up")
-        move_up.clicked.connect(lambda: self.move_selected_lyse_module(-1))
-        move_down = QtWidgets.QPushButton("Move down")
-        move_down.clicked.connect(lambda: self.move_selected_lyse_module(1))
-        open_py = QtWidgets.QPushButton("Open .py")
-        open_py.clicked.connect(self.open_selected_lyse_module_file)
-        open_folder_button = QtWidgets.QPushButton("Open containing folder")
-        open_folder_button.clicked.connect(self.open_selected_lyse_module_folder)
-        for index, button in enumerate([add_py, add_folder, remove_py, toggle_module, move_up, move_down, open_py, open_folder_button]):
-            module_tools.addWidget(button, index // 2, index % 2)
-        run_single = QtWidgets.QPushButton("Run selected single on selected shot")
-        run_single.clicked.connect(self.run_selected_single)
-        run_checked_single = QtWidgets.QPushButton("Run checked singles on selected shot")
-        run_checked_single.clicked.connect(self.run_checked_single_selected)
-        run_checked_single_table = QtWidgets.QPushButton("Run checked singles on table")
-        run_checked_single_table.clicked.connect(self.run_checked_single_table)
-        run_multi = QtWidgets.QPushButton("Run selected multi on table")
-        run_multi.clicked.connect(self.run_selected_multi)
-        run_checked_multi = QtWidgets.QPushButton("Run checked multis on table")
-        run_checked_multi.clicked.connect(self.run_checked_multi_table)
-        module_layout.addWidget(QtWidgets.QLabel("Single"))
-        module_layout.addWidget(self.single_modules)
-        module_layout.addLayout(module_tools)
-        module_layout.addWidget(run_single)
-        module_layout.addWidget(run_checked_single)
-        module_layout.addWidget(run_checked_single_table)
-        module_layout.addWidget(QtWidgets.QLabel("Multi"))
-        module_layout.addWidget(self.multi_modules)
-        module_layout.addWidget(run_multi)
-        module_layout.addWidget(run_checked_multi)
-        lower_layout.addWidget(module_box, 1)
+        module_layout.addWidget(
+            self._lyse_routine_panel(
+                "Singleshot routines",
+                self.single_modules,
+                "single_modules",
+                run_selected=self.run_selected_single,
+                run_checked=self.run_checked_single_selected,
+                run_table=self.run_checked_single_table,
+            ),
+            1,
+        )
+        module_layout.addWidget(
+            self._lyse_routine_panel(
+                "Multishot routines",
+                self.multi_modules,
+                "multi_modules",
+                run_selected=self.run_selected_multi,
+                run_checked=self.run_checked_multi_table,
+                run_table=self.run_checked_multi_table,
+            ),
+            1,
+        )
+        lower_split.addWidget(module_box)
+        split.addWidget(lower)
+        split.setSizes([620, 260])
 
-        plot_box = QtWidgets.QGroupBox("Plot, fit, report")
-        plot_layout = QtWidgets.QGridLayout(plot_box)
+        analysis_box = QtWidgets.QGroupBox("Plot, fit, report")
+        analysis_layout = QtWidgets.QGridLayout(analysis_box)
         self.plot_type = QtWidgets.QComboBox()
-        self.plot_type.addItems(["scatter_line", "mean_errorbar", "histogram", "scatter2d", "heatmap2d", "surface3d"])
+        for key, spec in PLOT_SPECS.items():
+            self.plot_type.addItem(spec.label, key)
+            self.plot_type.setItemData(self.plot_type.count() - 1, spec.description, QtCore.Qt.ToolTipRole)
+        self.plot_type.currentIndexChanged.connect(self._on_plot_type_changed)
         self.fit_model = QtWidgets.QComboBox()
-        self.fit_model.addItems(["linear", "gaussian", "logarithmic", "exponential", "lorentzian", "gaussian2d", "double_gaussian2d"])
         self.x_col = QtWidgets.QComboBox()
         self.y_col = QtWidgets.QComboBox()
         self.z_col = QtWidgets.QComboBox()
@@ -1726,35 +1722,109 @@ class MainWindow(QtWidgets.QMainWindow):
         fit.clicked.connect(self.fit_from_ui)
         report = QtWidgets.QPushButton("Generate report")
         report.clicked.connect(lambda: self.generate_report_from_ui())
-        multi_report = QtWidgets.QPushButton("Generate multi report")
+        multi_report = QtWidgets.QPushButton("Multi report")
         multi_report.clicked.connect(lambda: self.generate_report_from_ui("LabPilot multi analysis report"))
-        plot_layout.addWidget(QtWidgets.QLabel("Plot"), 0, 0)
-        plot_layout.addWidget(self.plot_type, 0, 1)
-        plot_layout.addWidget(QtWidgets.QLabel("Fit"), 0, 2)
-        plot_layout.addWidget(self.fit_model, 0, 3)
-        plot_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
-        plot_layout.addWidget(self.x_col, 1, 1)
-        plot_layout.addWidget(QtWidgets.QLabel("y/value"), 1, 2)
-        plot_layout.addWidget(self.y_col, 1, 3)
-        plot_layout.addWidget(QtWidgets.QLabel("z/color"), 2, 0)
-        plot_layout.addWidget(self.z_col, 2, 1)
-        plot_layout.addWidget(draw, 3, 0)
-        plot_layout.addWidget(fit, 3, 1)
-        plot_layout.addWidget(report, 3, 2)
-        plot_layout.addWidget(multi_report, 3, 3)
+        analysis_layout.addWidget(QtWidgets.QLabel("Plot"), 0, 0)
+        analysis_layout.addWidget(self.plot_type, 0, 1)
+        analysis_layout.addWidget(QtWidgets.QLabel("Fit"), 0, 2)
+        analysis_layout.addWidget(self.fit_model, 0, 3)
+        analysis_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
+        analysis_layout.addWidget(self.x_col, 1, 1)
+        analysis_layout.addWidget(QtWidgets.QLabel("y/value"), 1, 2)
+        analysis_layout.addWidget(self.y_col, 1, 3)
+        analysis_layout.addWidget(QtWidgets.QLabel("z/color"), 2, 0)
+        analysis_layout.addWidget(self.z_col, 2, 1)
+        analysis_layout.addWidget(draw, 3, 0)
+        analysis_layout.addWidget(fit, 3, 1)
+        analysis_layout.addWidget(report, 3, 2)
+        analysis_layout.addWidget(multi_report, 3, 3)
         self.figure_area = QtWidgets.QWidget()
         self.figure_layout = QtWidgets.QVBoxLayout(self.figure_area)
-        plot_layout.addWidget(self.figure_area, 4, 0, 1, 4)
+        self.figure_area.setMinimumHeight(160)
+        analysis_layout.addWidget(self.figure_area, 4, 0, 1, 4)
         self.analysis_results_table = QtWidgets.QTableWidget(0, 4)
         self.analysis_results_table.setHorizontalHeaderLabels(["kind", "name", "status", "summary"])
         self.analysis_results_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.analysis_results_table.setMaximumHeight(150)
-        plot_layout.addWidget(QtWidgets.QLabel("Analysis records"), 5, 0)
-        plot_layout.addWidget(self.analysis_results_table, 6, 0, 1, 4)
-        lower_layout.addWidget(plot_box, 2)
-        split.addWidget(lower)
-        split.setSizes([520, 320])
+        self.analysis_results_table.setMaximumHeight(130)
+        analysis_layout.addWidget(QtWidgets.QLabel("Analysis records"), 5, 0, 1, 4)
+        analysis_layout.addWidget(self.analysis_results_table, 6, 0, 1, 4)
+        lower_split.addWidget(analysis_box)
+        lower_split.setSizes([560, 760])
+        self._on_plot_type_changed()
+        self._update_lyse_auto_load_status()
         return w
+
+    def _make_lyse_module_table(self, group):
+        table = QtWidgets.QTableWidget(0, 6)
+        table.setProperty("module_group", group)
+        table.setHorizontalHeaderLabels(["use", "name", "mode", "path", "order", "status"])
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        table.itemChanged.connect(self._on_lyse_module_table_item_changed)
+        table.itemSelectionChanged.connect(lambda g=group: self._update_lyse_module_buttons(g))
+        return table
+
+    def _make_table_item(self, text="", *, editable=True, checkable=False, checked=False, user_data=None):
+        item = QtWidgets.QTableWidgetItem(str(text))
+        flags = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+        if editable:
+            flags |= QtCore.Qt.ItemIsEditable
+        if checkable:
+            flags |= QtCore.Qt.ItemIsUserCheckable
+            item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        item.setFlags(flags)
+        if user_data is not None:
+            item.setData(QtCore.Qt.UserRole, user_data)
+        return item
+
+    def _lyse_routine_panel(self, title, list_widget, group, *, run_selected, run_checked, run_table):
+        panel = QtWidgets.QGroupBox(title)
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.addWidget(list_widget, 1)
+
+        file_tools = QtWidgets.QGridLayout()
+        add_button = QtWidgets.QPushButton("Add .py")
+        add_button.clicked.connect(lambda _checked=False, g=group: self.add_lyse_module_file(g))
+        add_folder = QtWidgets.QPushButton("Add folder")
+        add_folder.clicked.connect(lambda _checked=False, g=group: self.add_lyse_module_folder(g))
+        remove_button = QtWidgets.QPushButton("Remove selected")
+        remove_button.clicked.connect(lambda _checked=False, g=group: self.remove_selected_lyse_module(g))
+        open_button = QtWidgets.QPushButton("Open .py")
+        open_button.clicked.connect(lambda _checked=False, g=group: self.open_selected_lyse_module_file(g))
+        open_folder = QtWidgets.QPushButton("Open folder")
+        open_folder.clicked.connect(lambda _checked=False, g=group: self.open_selected_lyse_module_folder(g))
+        toggle_button = QtWidgets.QPushButton("Enable/disable")
+        toggle_button.clicked.connect(lambda _checked=False, g=group: self.toggle_selected_lyse_module(g))
+        for index, button in enumerate([add_button, add_folder, remove_button, open_button, open_folder, toggle_button]):
+            file_tools.addWidget(button, index // 3, index % 3)
+        layout.addLayout(file_tools)
+
+        order_tools = QtWidgets.QHBoxLayout()
+        for text, direction in [("Top", -9999), ("Up", -1), ("Down", 1), ("Bottom", 9999)]:
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(lambda _checked=False, g=group, d=direction: self.move_selected_lyse_module(d, g))
+            order_tools.addWidget(button)
+        layout.addLayout(order_tools)
+
+        run_tools = QtWidgets.QHBoxLayout()
+        selected_button = QtWidgets.QPushButton("Run selected")
+        selected_button.clicked.connect(run_selected)
+        checked_button = QtWidgets.QPushButton("Run checked")
+        checked_button.clicked.connect(run_checked)
+        table_button = QtWidgets.QPushButton("Run checked on table")
+        table_button.clicked.connect(run_table)
+        for button in [selected_button, checked_button, table_button]:
+            run_tools.addWidget(button)
+        layout.addLayout(run_tools)
+        return panel
 
     def _optimizer_page(self):
         w = QtWidgets.QWidget()
@@ -1889,7 +1959,7 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.addStretch()
         layout.addLayout(buttons)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split = self._make_splitter(QtCore.Qt.Horizontal)
         self.co_sequence_context = QtWidgets.QPlainTextEdit()
         self.co_sequence_context.setReadOnly(True)
         self.co_sequence_context.setPlaceholderText("Knowledge snippets used for this code change will appear here.")
@@ -2376,6 +2446,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
         if hasattr(self, "h5_folder"):
             self.h5_folder.setText(self.project_settings.get("h5_output_dir", ""))
+        if hasattr(self, "lyse_auto_load"):
+            lyse_cfg = self.project_settings.get("lyse", {}) or {}
+            self.lyse_auto_load.setChecked(bool(lyse_cfg.get("auto_load_finished_shots", True)))
+            self._update_lyse_auto_load_status()
         if hasattr(self, "knowledge_command_enabled"):
             enabled = bool(self.project_settings.get("knowledge_context_enabled", True))
             self.knowledge_command_enabled.setChecked(enabled)
@@ -4233,6 +4307,123 @@ class MainWindow(QtWidgets.QMainWindow):
         if folder:
             self.h5_folder.setText(folder)
 
+    def _update_lyse_auto_load_status(self):
+        if not hasattr(self, "lyse_auto_status"):
+            return
+        enabled = bool(getattr(self, "lyse_auto_load", None) and self.lyse_auto_load.isChecked())
+        folder = self.h5_folder.text().strip() if hasattr(self, "h5_folder") else ""
+        if not enabled:
+            text = "Auto load paused"
+            status = "StatusLightWarn"
+        elif not folder:
+            text = "Auto load: no H5 folder"
+            status = "StatusLightWarn"
+        elif not Path(folder).exists():
+            text = "Auto load: folder missing"
+            status = "StatusLightError"
+        else:
+            text = "Auto load watching"
+            status = "StatusLightOk"
+        self.lyse_auto_status.setText(text)
+        self.lyse_auto_status.setObjectName(status)
+        self.lyse_auto_status.style().unpolish(self.lyse_auto_status)
+        self.lyse_auto_status.style().polish(self.lyse_auto_status)
+
+    def _on_lyse_analysis_running_toggled(self, checked):
+        if hasattr(self, "lyse_analysis_running"):
+            self.lyse_analysis_running.setText("Analysis running" if checked else "Analysis paused")
+        self.log("Lyse analysis " + ("running" if checked else "paused"))
+
+    def _h5_state(self, path):
+        stat = Path(path).stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _remember_h5_states(self):
+        self.h5_file_states = {}
+        if self.h5_df is None or self.h5_df.empty or "filepath" not in self.h5_df.columns:
+            return
+        for value in self.h5_df["filepath"].dropna():
+            path = Path(str(value))
+            try:
+                self.h5_file_states[str(path.resolve())] = self._h5_state(path)
+            except OSError:
+                continue
+
+    def _upsert_h5_summaries(self, summaries):
+        if not summaries:
+            return []
+        new_df = self._normalize_dataframe_columns(pd.DataFrame(summaries))
+        if self.h5_df is None or self.h5_df.empty or "filepath" not in self.h5_df.columns:
+            self.h5_df = new_df.reset_index(drop=True)
+            return list(range(len(self.h5_df)))
+
+        self.h5_df = self._normalize_dataframe_columns(self.h5_df)
+        changed_rows = []
+        for _idx, row in new_df.iterrows():
+            filepath = str(row.get("filepath", ""))
+            matches = self.h5_df.index[self.h5_df["filepath"].astype(str) == filepath].tolist()
+            if matches:
+                target = matches[0]
+                for key, value in row.items():
+                    self.h5_df.loc[target, self._column_name(key)] = value
+                changed_rows.append(int(target))
+            else:
+                self.h5_df = pd.concat([self.h5_df, pd.DataFrame([row])], ignore_index=True, sort=False)
+                changed_rows.append(len(self.h5_df) - 1)
+        return changed_rows
+
+    def auto_refresh_h5_table(self):
+        if not hasattr(self, "h5_folder") or not hasattr(self, "h5_table"):
+            return
+        if self.h5_auto_loading:
+            return
+        if hasattr(self, "lyse_auto_load") and not self.lyse_auto_load.isChecked():
+            self._update_lyse_auto_load_status()
+            return
+        folder = self.h5_folder.text().strip()
+        if not folder:
+            self._update_lyse_auto_load_status()
+            return
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            self._update_lyse_auto_load_status()
+            return
+        self.h5_auto_loading = True
+        try:
+            recursive = self.h5_recursive.isChecked() if hasattr(self, "h5_recursive") else False
+            summaries = []
+            now = time.time()
+            for path in iter_h5_paths(folder_path, recursive=recursive):
+                try:
+                    state = self._h5_state(path)
+                    if now - path.stat().st_mtime < 0.5:
+                        continue
+                    key = str(path.resolve())
+                    if self.h5_file_states.get(key) == state:
+                        continue
+                    summary = read_shot_summary(path)
+                    if summary.get("error"):
+                        previous = self.h5_read_errors.get(key)
+                        if previous != summary["error"]:
+                            self.h5_read_errors[key] = summary["error"]
+                            self.log(f"Lyse auto load waiting for readable H5: {path.name}: {summary['error']}")
+                        continue
+                    summaries.append(summary)
+                    self.h5_file_states[key] = state
+                    self.h5_read_errors.pop(key, None)
+                except OSError:
+                    continue
+            changed_rows = self._upsert_h5_summaries(summaries)
+            if changed_rows:
+                self._refresh_h5_table_after_analysis()
+                self._run_auto_single_analysis(changed_rows)
+                self._update_lyse_auto_load_status()
+                self.log(f"Lyse auto-loaded/updated {len(changed_rows)} H5 shot(s).")
+        except Exception as exc:
+            self._show_error("Lyse auto load failed", exc, modal=False)
+        finally:
+            self.h5_auto_loading = False
+
     def _normalize_dataframe_columns(self, df):
         if df is None:
             return df
@@ -4251,6 +4442,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.h5_df = self._normalize_dataframe_columns(load_h5_folder(self.h5_folder.text().strip(), recursive=recursive))
             self._fill_dataframe(self.h5_table, self.h5_df)
             self._update_column_combos()
+            self._remember_h5_states()
+            self._update_lyse_auto_load_status()
             self.log(f"loaded h5 files: {len(self.h5_df)}")
         except Exception as exc:
             self._show_error("load h5 failed", exc)
@@ -4263,6 +4456,7 @@ class MainWindow(QtWidgets.QMainWindow):
         new_df = self._normalize_dataframe_columns(pd.DataFrame(rows))
         self.h5_df = pd.concat([self.h5_df, new_df], ignore_index=True, sort=False) if self.h5_df is not None else new_df
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log(f"Added H5 files: {len(paths)}")
 
     def remove_selected_h5_rows(self):
@@ -4279,11 +4473,13 @@ class MainWindow(QtWidgets.QMainWindow):
         index_labels = [self.h5_df.index[row] for row in rows if row < len(self.h5_df)]
         self.h5_df = self.h5_df.drop(index_labels).reset_index(drop=True)
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log(f"Removed {len(index_labels)} H5 row(s) from table only; files were not deleted.")
 
     def clear_h5_table(self):
         self.h5_df = pd.DataFrame()
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log("Cleared H5 table; files were not deleted.")
 
     def reload_selected_h5_rows(self):
@@ -4303,6 +4499,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for key, value in summary.items():
                 self.h5_df.loc[self.h5_df.index[row], self._column_name(key)] = value
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log(f"Reloaded {len(rows)} selected H5 row(s).")
 
     def _fill_dataframe(self, table, df):
@@ -4321,14 +4518,77 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_h5_column_visibility()
 
     def _update_column_combos(self):
-        cols = [str(c) for c in (self.h5_df.columns if self.h5_df is not None else [])]
-        for combo in [self.x_col, self.y_col, self.z_col]:
-            combo.clear()
-            combo.addItems(cols)
-            completer = QtWidgets.QCompleter(cols, combo)
-            completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
-            completer.setFilterMode(QtCore.Qt.MatchContains)
-            combo.setCompleter(completer)
+        self.plot_column_candidates = numeric_varying_columns(self.h5_df)
+        self._sync_plot_controls(preserve=True)
+
+    def _combo_value(self, combo):
+        value = combo.currentData()
+        return str(value) if value is not None else combo.currentText()
+
+    def _current_plot_type(self):
+        return self._combo_value(self.plot_type) if hasattr(self, "plot_type") else "scatter_line"
+
+    def _fill_combo_preserving(self, combo, values, preferred=""):
+        current = preferred or combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(list(values))
+        if current and combo.findText(current) >= 0:
+            combo.setCurrentText(current)
+        elif combo.count():
+            combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        completer = QtWidgets.QCompleter(list(values), combo)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        completer.setFilterMode(QtCore.Qt.MatchContains)
+        combo.setCompleter(completer)
+
+    def _on_plot_type_changed(self):
+        self._sync_plot_controls(preserve=True)
+
+    def _sync_plot_controls(self, preserve=True):
+        if not all(hasattr(self, attr) for attr in ["plot_type", "fit_model", "x_col", "y_col", "z_col"]):
+            return
+        plot_type = self._current_plot_type()
+        cols = list(getattr(self, "plot_column_candidates", []))
+        defaults = default_plot_columns(plot_type, cols)
+        old_values = {
+            "x": self.x_col.currentText(),
+            "y": self.y_col.currentText(),
+            "z": self.z_col.currentText(),
+        } if preserve else {}
+        x_default = old_values.get("x") if old_values.get("x") in cols else defaults.get("x", "")
+        y_default = old_values.get("y") if old_values.get("y") in cols else defaults.get("y", "")
+        z_default = old_values.get("z") if old_values.get("z") in cols else defaults.get("z", "")
+        combo_values = [""] + cols
+        self._fill_combo_preserving(self.x_col, combo_values, x_default)
+        self._fill_combo_preserving(self.y_col, combo_values, y_default)
+        self._fill_combo_preserving(self.z_col, combo_values, z_default)
+        models = valid_fit_models(plot_type)
+        current_model = self.fit_model.currentText()
+        self.fit_model.blockSignals(True)
+        self.fit_model.clear()
+        self.fit_model.addItems(models)
+        self.fit_model.setCurrentText(current_model if current_model in models else models[0])
+        self.fit_model.blockSignals(False)
+        required = set(required_columns(plot_type))
+        self.x_col.setEnabled("x" in required)
+        self.y_col.setEnabled("y" in required or "value" in required)
+        self.z_col.setEnabled("z" in required)
+        if plot_type == "histogram":
+            self.x_col.setCurrentText("")
+            self.z_col.setCurrentText("")
+
+    def _validate_plot_columns(self, plot_type, x, y, z):
+        mapping = {"x": x, "y": y, "z": z, "value": y}
+        missing = [key for key in required_columns(plot_type) if not mapping.get(key)]
+        if missing:
+            raise RuntimeError(f"{plot_type} requires column(s): {', '.join(missing)}")
+        candidates = set(getattr(self, "plot_column_candidates", []))
+        for key in required_columns(plot_type):
+            name = mapping.get(key)
+            if name and candidates and name not in candidates:
+                raise RuntimeError(f"{name!r} is not a numeric varying column. Select a plottable column with at least two distinct values.")
 
     def _apply_h5_column_visibility(self):
         if not hasattr(self, "h5_table") or self.h5_df is None:
@@ -4443,34 +4703,43 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             combo.setEditText(text)
 
+    def _set_plot_type(self, key):
+        index = self.plot_type.findData(key)
+        if index >= 0:
+            self.plot_type.setCurrentIndex(index)
+        else:
+            self.plot_type.setCurrentText(key)
+
     def send_selected_columns_to_plot(self):
-        names = self.selected_h5_column_names()
+        candidates = set(getattr(self, "plot_column_candidates", []) or numeric_varying_columns(self.h5_df))
+        names = [name for name in self.selected_h5_column_names() if name in candidates]
         if not names:
-            self.log("No H5 columns selected.")
+            self.log("No plottable H5 columns selected. Select numeric columns with at least two distinct values.")
             return
         if len(names) == 1:
             self._set_combo_text(self.y_col, names[0])
-            self.plot_type.setCurrentText("histogram")
+            self._set_plot_type("histogram")
         elif len(names) == 2:
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
-            self.plot_type.setCurrentText("scatter_line")
+            self._set_plot_type("scatter_line")
         else:
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
             self._set_combo_text(self.z_col, names[2])
-            self.plot_type.setCurrentText("scatter2d")
+            self._set_plot_type("scatter2d")
         self.log("Selected columns sent to Plot: " + ", ".join(names[:3]))
 
     def send_selected_columns_to_fit(self):
-        names = self.selected_h5_column_names()
+        candidates = set(getattr(self, "plot_column_candidates", []) or numeric_varying_columns(self.h5_df))
+        names = [name for name in self.selected_h5_column_names() if name in candidates]
         if not names:
-            self.log("No H5 columns selected.")
+            self.log("No plottable H5 columns selected. Select numeric columns with at least two distinct values.")
             return
         if len(names) == 1:
             self._set_combo_text(self.y_col, names[0])
             self.fit_model.setCurrentText("gaussian")
-            self.plot_type.setCurrentText("histogram")
+            self._set_plot_type("histogram")
         elif len(names) == 2:
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
@@ -4479,6 +4748,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
             self._set_combo_text(self.z_col, names[2])
+            self._set_plot_type("heatmap2d")
             self.fit_model.setCurrentText("gaussian2d")
         self.log("Selected columns sent to Fit: " + ", ".join(names[:3]))
 
@@ -4507,29 +4777,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log(f"Opened analysis output folder: {path}")
 
     def _fill_module_lists(self):
-        self.single_modules.clear()
-        self.multi_modules.clear()
-        for name, cfg in sorted((self.lyse_registry.get("single_modules", {}) or {}).items(), key=lambda item: item[1].get("order", 1000)):
-            item = QtWidgets.QListWidgetItem(name)
-            item.setCheckState(QtCore.Qt.Checked if cfg.get("enabled_by_default") else QtCore.Qt.Unchecked)
-            self.single_modules.addItem(item)
-        for name, cfg in sorted((self.lyse_registry.get("multi_modules", {}) or {}).items(), key=lambda item: item[1].get("order", 1000)):
-            item = QtWidgets.QListWidgetItem(name)
-            item.setCheckState(QtCore.Qt.Checked if cfg.get("enabled_by_default") else QtCore.Qt.Unchecked)
-            self.multi_modules.addItem(item)
+        self._loading_lyse_modules = True
+        self.single_modules.setRowCount(0)
+        self.multi_modules.setRowCount(0)
+        try:
+            self._fill_module_table("single_modules", self.single_modules)
+            self._fill_module_table("multi_modules", self.multi_modules)
+        finally:
+            self._loading_lyse_modules = False
+
+    def _fill_module_table(self, group, table):
+        modules = sorted(
+            (self.lyse_registry.get(group, {}) or {}).items(),
+            key=lambda item: int((item[1] or {}).get("order", 1000)),
+        )
+        table.setRowCount(len(modules))
+        for row, (name, cfg) in enumerate(modules):
+            cfg = cfg or {}
+            path_text = str(cfg.get("path", ""))
+            candidate = Path(path_text) if path_text else None
+            if candidate and not candidate.is_absolute():
+                candidate = self.settings.project_dir / candidate
+            exists = bool(candidate and candidate.exists())
+            status = "ready" if path_text and exists else ("missing path" if path_text else "no path")
+            items = [
+                self._make_table_item("", editable=False, checkable=True, checked=bool(cfg.get("enabled_by_default")) and status == "ready", user_data=name),
+                self._make_table_item(name, user_data=name),
+                self._make_table_item(cfg.get("mode", "lyse_script"), user_data=name),
+                self._make_table_item(path_text, user_data=name),
+                self._make_table_item(cfg.get("order", row * 10 + 10), user_data=name),
+                self._make_table_item(status, editable=False, user_data=name),
+            ]
+            if status != "ready":
+                for item in items:
+                    item.setBackground(QtGui.QColor("#fff3cd"))
+            for col, item in enumerate(items):
+                table.setItem(row, col, item)
 
     def _active_module_group_and_list(self):
-        if self.multi_modules.hasFocus() or self.multi_modules.currentItem():
-            if self.multi_modules.currentItem() and not self.single_modules.hasFocus():
+        if self.multi_modules.hasFocus() or self.multi_modules.currentRow() >= 0:
+            if self.multi_modules.currentRow() >= 0 and not self.single_modules.hasFocus():
                 return "multi_modules", self.multi_modules
         return "single_modules", self.single_modules
 
-    def _selected_module(self):
-        group, widget = self._active_module_group_and_list()
-        item = widget.currentItem()
-        if not item:
+    def _module_widget_for_group(self, group):
+        if group == "multi_modules":
+            return self.multi_modules
+        return self.single_modules
+
+    def _selected_module(self, group=None):
+        if group:
+            widget = self._module_widget_for_group(group)
+        else:
+            group, widget = self._active_module_group_and_list()
+        row = widget.currentRow()
+        if row < 0:
             return group, widget, None, None
-        return group, widget, item.text(), (self.lyse_registry.get(group, {}) or {}).get(item.text(), {})
+        item = widget.item(row, 1)
+        if item is None:
+            return group, widget, None, None
+        name = str(item.text()).strip()
+        return group, widget, name, (self.lyse_registry.get(group, {}) or {}).get(name, {})
 
     def _safe_module_name(self, path):
         import re
@@ -4551,8 +4859,71 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reload_runtime()
         self.log("Lyse registry saved and runtime refreshed.")
 
-    def add_lyse_module_file(self):
-        group, _, _, _ = self._selected_module()
+    def _on_lyse_module_table_item_changed(self, item):
+        if getattr(self, "_loading_lyse_modules", False) or item is None:
+            return
+        table = item.tableWidget()
+        group = table.property("module_group")
+        row = item.row()
+        old_name = item.data(QtCore.Qt.UserRole) or (table.item(row, 1).text() if table.item(row, 1) else "")
+        if not group or not old_name:
+            return
+        modules = self.lyse_registry.setdefault(group, {})
+        cfg = dict(modules.get(old_name, {}) or {})
+        try:
+            if item.column() == 0:
+                cfg["enabled_by_default"] = item.checkState() == QtCore.Qt.Checked
+                modules[old_name] = cfg
+                self.settings.save_lyse_registry(self.lyse_registry)
+                self.log(f"{group}.{old_name} enabled={cfg['enabled_by_default']}")
+                return
+            if item.column() == 1:
+                new_name = item.text().strip()
+                if not new_name:
+                    raise ValueError("module name cannot be empty")
+                if new_name != old_name and new_name in modules:
+                    raise ValueError(f"module name already exists: {new_name}")
+                if new_name != old_name:
+                    modules[new_name] = modules.pop(old_name, cfg)
+                    self.settings.save_lyse_registry(self.lyse_registry)
+                    self._fill_module_lists()
+                    self._select_module_row(group, new_name)
+                    self.log(f"Renamed lyse routine {group}.{old_name} -> {new_name}")
+                return
+            if item.column() == 2:
+                cfg["mode"] = item.text().strip() or "lyse_script"
+            elif item.column() == 3:
+                cfg["path"] = item.text().strip()
+            elif item.column() == 4:
+                cfg["order"] = int(item.text().strip())
+            else:
+                return
+            modules[old_name] = cfg
+            self.settings.save_lyse_registry(self.lyse_registry)
+            if item.column() in {3, 4}:
+                self._fill_module_lists()
+                self._select_module_row(group, old_name)
+            self.log(f"Updated lyse routine {group}.{old_name}")
+        except Exception as exc:
+            self._show_error("Update lyse routine failed", exc)
+            self._fill_module_lists()
+            self._select_module_row(group, old_name)
+
+    def _select_module_row(self, group, name):
+        table = self._module_widget_for_group(group)
+        for row in range(table.rowCount()):
+            item = table.item(row, 1)
+            if item and item.text() == name:
+                table.selectRow(row)
+                table.setCurrentCell(row, 1)
+                return True
+        return False
+
+    def _update_lyse_module_buttons(self, group):
+        return None
+
+    def add_lyse_module_file(self, group=None):
+        group, _, _, _ = self._selected_module(group)
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add lyse routine .py", "", "Python files (*.py);;All files (*.*)")
         if not path:
             return
@@ -4575,32 +4946,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_lyse_registry_and_refresh()
         self.log(f"Added lyse routine {group}.{name}: {path}")
 
-    def add_lyse_module_folder(self):
-        group, _, _, _ = self._selected_module()
+    def add_lyse_module_folder(self, group=None):
+        group, _, _, _ = self._selected_module(group)
         key = "single_modules_dir" if group == "single_modules" else "multi_modules_dir"
-        self.load_lyse_modules_folder(key)
-        self.auto_scan_lyse_modules_ui()
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose single analysis folder" if group == "single_modules" else "Choose multi analysis folder",
+            str(self.project_settings.get(key, "") or ""),
+        )
+        if not folder:
+            return
+        settings = dict(self.project_settings or {})
+        settings[key] = folder
+        self.project_settings = settings
+        self.settings.save_project_settings(settings)
+        kwargs = {
+            "single_dir": folder if group == "single_modules" else None,
+            "multi_dir": folder if group == "multi_modules" else None,
+            "project_root": self.settings.project_dir,
+        }
+        registry, report = merge_autoscanned_lyse_modules(self.lyse_registry, **kwargs)
+        self.lyse_registry = registry
+        self._save_lyse_registry_and_refresh()
+        self.log(
+            f"Added lyse folder for {group}: {folder}; "
+            f"added={len(report.get('added', []))}, updated={len(report.get('updated', []))}, skipped={len(report.get('skipped', []))}"
+        )
 
-    def remove_selected_lyse_module(self):
-        group, _, name, _ = self._selected_module()
-        if not name:
+    def remove_selected_lyse_module(self, group=None):
+        group, widget, name, _ = self._selected_module(group)
+        names = []
+        if isinstance(widget, QtWidgets.QTableWidget):
+            rows = sorted({index.row() for index in widget.selectedIndexes()})
+            for row in rows:
+                item = widget.item(row, 1)
+                if item and item.text().strip():
+                    names.append(item.text().strip())
+        elif name:
+            names = [name]
+        if not names:
             self.log("No lyse routine selected.")
             return
         answer = QtWidgets.QMessageBox.question(
             self,
             "Remove lyse routine",
-            f"Remove {group}.{name} from the registry? The .py file on disk will not be deleted.",
+            f"Remove {len(names)} routine(s) from {group}? The .py files on disk will not be deleted.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
         if answer != QtWidgets.QMessageBox.Yes:
             return
-        self.lyse_registry.get(group, {}).pop(name, None)
+        for item_name in names:
+            self.lyse_registry.get(group, {}).pop(item_name, None)
         self._save_lyse_registry_and_refresh()
-        self.log(f"Removed lyse routine from registry only: {group}.{name}")
+        self.log(f"Removed lyse routine(s) from registry only: {group}: {', '.join(names)}")
 
-    def toggle_selected_lyse_module(self):
-        group, _, name, cfg = self._selected_module()
+    def toggle_selected_lyse_module(self, group=None):
+        group, _, name, cfg = self._selected_module(group)
         if not name:
             self.log("No lyse routine selected.")
             return
@@ -4609,8 +5011,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_lyse_registry_and_refresh()
         self.log(f"{group}.{name} enabled_by_default={cfg['enabled_by_default']}")
 
-    def move_selected_lyse_module(self, direction):
-        group, widget, name, cfg = self._selected_module()
+    def move_selected_lyse_module(self, direction, group=None):
+        group, widget, name, cfg = self._selected_module(group)
         if not name:
             self.log("No lyse routine selected.")
             return
@@ -4623,14 +5025,11 @@ class MainWindow(QtWidgets.QMainWindow):
         other = ordered[new_index]
         modules[name]["order"], modules[other]["order"] = int(modules[other].get("order", 1000)), int(modules[name].get("order", 1000))
         self._save_lyse_registry_and_refresh()
-        for row in range(widget.count()):
-            if widget.item(row).text() == name:
-                widget.setCurrentRow(row)
-                break
+        self._select_module_row(group, name)
         self.log(f"Moved lyse routine: {group}.{name}")
 
-    def _selected_lyse_module_path(self):
-        _, _, name, cfg = self._selected_module()
+    def _selected_lyse_module_path(self, group=None):
+        _, _, name, cfg = self._selected_module(group)
         if not name:
             raise RuntimeError("No lyse routine selected.")
         path = Path(str(cfg.get("path", "")))
@@ -4638,16 +5037,16 @@ class MainWindow(QtWidgets.QMainWindow):
             path = self.settings.project_dir / path
         return path
 
-    def open_selected_lyse_module_file(self):
+    def open_selected_lyse_module_file(self, group=None):
         try:
-            path = self._selected_lyse_module_path()
+            path = self._selected_lyse_module_path(group)
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.resolve())))
         except Exception as exc:
             self._show_error("Open lyse routine failed", exc)
 
-    def open_selected_lyse_module_folder(self):
+    def open_selected_lyse_module_folder(self, group=None):
         try:
-            path = self._selected_lyse_module_path()
+            path = self._selected_lyse_module_path(group)
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.parent.resolve())))
         except Exception as exc:
             self._show_error("Open lyse routine folder failed", exc)
@@ -4668,17 +5067,67 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _checked_names(self, list_widget):
         names = []
+        if isinstance(list_widget, QtWidgets.QTableWidget):
+            for row in range(list_widget.rowCount()):
+                use = list_widget.item(row, 0)
+                name = list_widget.item(row, 1)
+                if use is not None and name is not None and use.checkState() == QtCore.Qt.Checked:
+                    names.append(name.text())
+            return names
         for row in range(list_widget.count()):
             item = list_widget.item(row)
             if item.checkState() == QtCore.Qt.Checked:
                 names.append(item.text())
         return names
 
+    def _selected_h5_rows(self):
+        if self.h5_df is None or self.h5_df.empty:
+            return []
+        rows = sorted({index.row() for index in self.h5_table.selectedIndexes()})
+        if not rows and self.h5_table.currentRow() >= 0:
+            rows = [self.h5_table.currentRow()]
+        return [row for row in rows if row < len(self.h5_df)]
+
+    def _run_auto_single_analysis(self, rows):
+        if not getattr(self, "lyse_analysis_running", None) or not self.lyse_analysis_running.isChecked():
+            return {}
+        names = self._checked_names(self.single_modules)
+        if not names:
+            return {}
+        results = {}
+        for row in rows:
+            if row >= len(self.h5_df):
+                continue
+            h5_path = self.h5_df.iloc[row]["filepath"]
+            for name in names:
+                try:
+                    results.setdefault(name, []).append(
+                        self.run_single_by_name(name, {}, h5_path=h5_path, row_index=row, refresh_table=False)
+                    )
+                except Exception as exc:
+                    self._show_error(f"lyse single module failed: {name} {h5_path}", exc, modal=False)
+        if results:
+            self._refresh_h5_table_after_analysis()
+            self._remember_h5_states()
+        return results
+
+    def mark_selected_h5_not_done(self):
+        rows = self._selected_h5_rows()
+        if not rows:
+            self.log("No H5 rows selected.")
+            return {}
+        results = self._run_auto_single_analysis(rows)
+        if not results:
+            self.log("Selected H5 row(s) marked not done; no checked singleshot routines to run.")
+        else:
+            self.log(f"Re-ran checked singleshot routines for {len(rows)} selected H5 row(s).")
+        return results
+
     def run_selected_single(self):
-        item = self.single_modules.currentItem()
-        if item:
+        _group, _widget, name, _cfg = self._selected_module("single_modules")
+        if name:
             try:
-                self.run_single_by_name(item.text(), {})
+                self.run_single_by_name(name, {})
             except Exception as exc:
                 self._show_error("lyse single module failed", exc)
 
@@ -4733,10 +5182,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return result
 
     def run_selected_multi(self):
-        item = self.multi_modules.currentItem()
-        if item:
+        _group, _widget, name, _cfg = self._selected_module("multi_modules")
+        if name:
             try:
-                self.run_multi_by_name(item.text(), {})
+                self.run_multi_by_name(name, {})
             except Exception as exc:
                 self._show_error("lyse multi module failed", exc)
 
@@ -4773,13 +5222,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_column_combos()
 
     def draw_plot_from_ui(self):
+        plot_type = self._current_plot_type()
+        x = self.x_col.currentText()
+        y = self.y_col.currentText()
+        z = self.z_col.currentText()
+        self._validate_plot_columns(plot_type, x, y, z)
         action = {
             "type": "plot",
-            "plot_type": self.plot_type.currentText(),
-            "x": self.x_col.currentText(),
-            "y": self.y_col.currentText(),
-            "z": self.z_col.currentText(),
-            "value": self.y_col.currentText(),
+            "plot_type": plot_type,
+            "x": x,
+            "y": y,
+            "z": z,
+            "value": y,
         }
         self.draw_plot_action(action)
 
@@ -4792,6 +5246,7 @@ class MainWindow(QtWidgets.QMainWindow):
         x = action.get("x")
         y = action.get("y") or action.get("value")
         z = action.get("z") or action.get("value")
+        self._validate_plot_columns(plot_type, x, y, z)
         if plot_type == "scatter_line":
             fig = plotting.scatter_line(self.h5_df, x, y, out_path=out_path)
         elif plot_type == "mean_errorbar":
@@ -4828,27 +5283,42 @@ class MainWindow(QtWidgets.QMainWindow):
         plt.close(fig)
 
     def fit_from_ui(self):
+        plot_type = self._current_plot_type()
+        model = self.fit_model.currentText()
+        if model == "none":
+            self.log("Fit model is 'none'; no fit was run.")
+            return None
+        x = self.x_col.currentText()
+        y = self.y_col.currentText()
+        z = self.z_col.currentText()
+        self._validate_plot_columns(plot_type, x, y, z)
         action = {
             "type": "fit",
-            "model": self.fit_model.currentText(),
-            "x": self.x_col.currentText(),
-            "y": self.y_col.currentText(),
-            "z": self.z_col.currentText(),
+            "model": model,
+            "plot_type": plot_type,
+            "x": x,
+            "y": y,
+            "z": z,
         }
-        self.fit_action(action)
+        return self.fit_action(action)
 
     def fit_action(self, action):
         if self.h5_df is None:
             raise RuntimeError("Load an h5 table first.")
         model = action.get("model", "linear")
+        if model == "none":
+            return {"model": "none", "status": "skipped", "params": {}}
         x = action.get("x")
         y = action.get("y") or action.get("value")
         z = action.get("z") or action.get("value")
+        plot_type = action.get("plot_type") or self._current_plot_type()
+        if model not in valid_fit_models(plot_type):
+            raise RuntimeError(f"Fit model {model!r} is not compatible with plot type {plot_type!r}.")
         if model in {"gaussian2d", "double_gaussian2d"}:
             if not (x and y and z):
                 raise RuntimeError("2D fitting requires x, y, and z/value columns.")
             result = fit_xyz(self.h5_df[x], self.h5_df[y], self.h5_df[z], model=model)
-        elif self.plot_type.currentText() == "histogram" or not x:
+        elif plot_type == "histogram" or not x:
             result = fit_histogram(self.h5_df[y], model=model)
         else:
             result = fit_xy(self.h5_df[x], self.h5_df[y], model=model)
@@ -4881,11 +5351,29 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             row = self.result_store.append(kind, name, result, metadata=metadata)
             self.analysis_records.append(row)
+            if kind in {"plot", "fit"}:
+                self._store_lyse_multi_parameter(kind, name, result, metadata or {})
             self._fill_analysis_records()
             return row
         except Exception as exc:
             self.log(f"analysis result store failed: {exc}")
             return None
+
+    def _store_lyse_multi_parameter(self, kind, name, result, metadata):
+        try:
+            bucket = self.lyse_registry.setdefault("multi_parameters", {})
+            safe_name = re.sub(r"[^0-9A-Za-z_]+", "_", str(name or kind)).strip("_") or kind
+            key = f"{time.strftime('%Y%m%d_%H%M%S')}_{kind}_{safe_name}"
+            bucket[key] = {
+                "kind": kind,
+                "name": str(name),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "result": result or {},
+                "metadata": metadata or {},
+            }
+            self.settings.save_lyse_registry(self.lyse_registry)
+        except Exception as exc:
+            self.log(f"Could not store lyse multi parameter record: {exc}")
 
     def _fill_analysis_records(self):
         if not hasattr(self, "analysis_results_table"):

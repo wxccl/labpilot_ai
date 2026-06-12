@@ -35,6 +35,8 @@ knowledge:
   max_context_chars: 4000
 lyse:
   preview_max_rows: 2000
+  auto_load_finished_shots: true
+  auto_load_interval_ms: 1000
 runmanager:
   write_mode: "remote_then_h5"
   direct_h5_write: true

@@ -108,6 +108,26 @@ def _has_file_creation_or_deletion(diff_text):
     return "/dev/null" in lowered or "new file mode" in lowered or "deleted file mode" in lowered
 
 
+def _normalize_ai_escaped_docstring_delimiters(diff_text):
+    """Repair common JSON-escaped docstring delimiters leaked into AI diffs."""
+    repaired = []
+    warnings = []
+    for line in str(diff_text or "").splitlines(keepends=True):
+        if line[:1] not in {" ", "+", "-"}:
+            repaired.append(line)
+            continue
+        prefix = line[:1]
+        body = line[1:]
+        stripped = body.lstrip()
+        indent = body[: len(body) - len(stripped)]
+        if stripped.startswith('\\"""'):
+            repaired.append(prefix + indent + stripped.replace('\\"""', '"""', 1))
+            warnings.append("Repaired JSON-escaped Python docstring delimiter in AI patch.")
+        else:
+            repaired.append(line)
+    return "".join(repaired), warnings
+
+
 def _hunk_header(line):
     match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
     if not match:
@@ -427,6 +447,8 @@ def validate_patch_plan(plan, sequence_path, connection_table_path):
         try:
             target = _target_path(file_item, allowed)
             diff_text = str(file_item.get("unified_diff", ""))
+            diff_text, normalize_warnings = _normalize_ai_escaped_docstring_delimiters(diff_text)
+            warnings.extend(normalize_warnings)
             if not diff_text.strip():
                 errors.append(f"{target.name}: missing unified_diff.")
                 continue

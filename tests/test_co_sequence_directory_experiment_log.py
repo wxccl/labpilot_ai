@@ -91,6 +91,31 @@ def test_co_sequence_repairs_unique_context_insertion(tmp_path):
     assert "static_shutter.go_low()\n\n    t += 10e-3\nstop" in repaired
 
 
+def test_co_sequence_repairs_json_escaped_docstring_delimiters(tmp_path):
+    sequence = tmp_path / "seq.py"
+    connection = tmp_path / "connection_table.py"
+    sequence.write_text("# -*- coding: utf-8 -*-\npass\n", encoding="utf-8")
+    connection.write_text("camera = object()\n", encoding="utf-8")
+    diff_text = (
+        f"--- a/{sequence}\n"
+        f"+++ b/{sequence}\n"
+        "@@ -1,2 +1,5 @@\n"
+        " # -*- coding: utf-8 -*-\n"
+        '+\\"""\n'
+        "+Virtual sequence docstring.\n"
+        '+\\"""\n'
+        " pass\n"
+    )
+    plan = {"summary": "add docstring", "files": [{"path": str(sequence), "unified_diff": diff_text}]}
+
+    result = validate_patch_plan(plan, sequence, connection)
+
+    assert result.ok
+    assert any("docstring delimiter" in warning for warning in result.warnings)
+    assert '\\"""' not in result.previews[0]["new_text"]
+    assert '"""' in result.previews[0]["new_text"]
+
+
 def test_code_change_log_store_records_color_tags(tmp_path):
     store = CodeChangeLogStore(tmp_path / "logs")
     out = store.append({"summary": "changed Rabi timing", "status": "applied", "color_tags": ["red: hardware"]})

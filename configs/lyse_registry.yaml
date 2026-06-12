@@ -1,31 +1,20 @@
 single_modules:
+  lyse_singleshot_molassesFL:
+    path: E:/Labpilot/labai_test/timeseq/single/lyse_singleshot_molassesFL.py
+    mode: lyse_script
+    enabled_by_default: false
+    order: 20
+    description: LabAI test single-shot molasses fluorescence analysis.
+    params: {}
   example_single:
-    path: plugins/single_modules/example_single.py
-    mode: labpilot_module
     enabled_by_default: true
     order: 10
-    description: Minimal single-shot analysis example.
-    params: {}
-  utils:
-    path: E:/Labpilot/labai_test/timeseq/single/utils.py
+  fix_sequence_outputs:
+    path: E:\Labpilot\fix_sequence_outputs.py
     mode: lyse_script
-    enabled_by_default: true
-    order: 20
-    description: Auto registered single-shot lyse analysis script.
-    params: {}
-  utilsfunc:
-    path: E:/Labpilot/labai_test/timeseq/single/utilsfunc.py
-    mode: lyse_script
-    enabled_by_default: true
-    order: 30
-    description: Auto registered single-shot lyse analysis script.
-    params: {}
-  utilsPCA:
-    path: E:/Labpilot/labai_test/timeseq/single/utilsPCA.py
-    mode: lyse_script
-    enabled_by_default: true
-    order: 40
-    description: Auto registered single-shot lyse analysis script.
+    enabled_by_default: false
+    order: 1000
+    description: Added from Lyse page.
     params: {}
 multi_modules:
   example_multi:
@@ -40,14 +29,42 @@ multi_modules:
     mode: lyse_script
     enabled_by_default: true
     order: 20
-    description: Auto registered multi-shot lyse analysis script.
+    description: LabAI test multi-shot absorption imaging BEC analysis.
     params: {}
-  utils:
-    path: E:/Labpilot/labai_test/timeseq/multi/utils.py
-    mode: lyse_script
-    enabled_by_default: true
-    order: 30
-    description: Auto registered multi-shot lyse analysis script.
-    params: {}
-  utilsmulti:
-    enabled_by_default: false
+multi_parameters:
+  20260612_175727_plot_scatter_line:
+    kind: plot
+    name: scatter_line
+    created_at: '2026-06-12 17:57:27'
+    result:
+      status: ok
+      figure_path: E:\Labpilot\labpilot_ai\labpilot_outputs\figures\scatter_line_1.png
+      plot_type: scatter_line
+      x: results.lyse_singleshot_molassesFL.N_total
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: results.lyse_singleshot_molassesFL.N_total
+    metadata:
+      type: plot
+      plot_type: scatter_line
+      x: results.lyse_singleshot_molassesFL.N_total
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: ''
+      value: results.lyse_singleshot_molassesFL.N_total
+  20260612_175734_fit_linear:
+    kind: fit
+    name: linear
+    created_at: '2026-06-12 17:57:34'
+    result:
+      model: linear
+      status: ok
+      params:
+        a: 1.0000000000000002
+        b: 1.0089937790784991e-12
+      r2: 1.0
+    metadata:
+      type: fit
+      model: linear
+      plot_type: scatter_line
+      x: results.lyse_singleshot_molassesFL.N_total
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: ''
