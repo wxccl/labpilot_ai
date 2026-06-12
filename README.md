@@ -7,7 +7,7 @@ The first release is designed to be safe by default: Mock LLM, Mock runmanager/B
 ## Main Features
 
 - Industrial PyQt5 UI: Command, Runmanager, BLACS Manual, Lyse, Optimizer, Co-Sequence, Experiment Log, Protocol, Knowledge, Directory, Diagnostics, Error Center, and Settings.
-- Voice input: manual recording, standby wake mode, Chinese/English transcription, CPU/GPU faster-whisper backends, scientific-term correction, and microphone signal display.
+- Voice input and replies: manual recording, standby wake mode, Chinese/English transcription, CPU/GPU faster-whisper backends, scientific-term correction, microphone signal display, optional offline spoken replies, and local action summaries.
 - AI command schema: strict JSON actions using `type`, including `set_global`, `set_blacs_manual`, `engage`, `load_h5`, `run_single_lyse`, `run_multi_lyse`, `plot`, `fit`, `start_optimization`, and `generate_report`.
 - Safety layer: whitelist validation, type/range/array checks, high-risk confirmations, dry-run previews, diffs, rollback hooks, SQLite audit records, and Error Center reporting.
 - runmanager control: globals read/write, float/int/bool/array scan handling, shot preview, and engage through adapters.
@@ -20,6 +20,8 @@ The first release is designed to be safe by default: Mock LLM, Mock runmanager/B
 - Experiment Log: daily Markdown/LaTeX/DokuWiki logs from natural-language commands, run records, optimizer/analysis records, Co-Sequence changes, errors, and Knowledge snippets.
 - Directory: the primary path console for active sequence, connection table, globals, BLACS context, lyse folders, H5 output, Knowledge sources, manuals, papers, and log folders.
 - Package templates: PyPI installs include default configs, example plugins, `label.png`, and the manual templates.
+
+Directory treats labscript path types explicitly: sequence and connection table source files are `.py`; runmanager globals are `.h5/.hdf5`; H5 output is a folder. `Detect from labscript apps` reads runmanager remote state, runmanager autoload config, and LabConfig, while `Apply to running apps` applies supported live changes back to runmanager.
 
 ## First-Release Limits
 
@@ -45,6 +47,7 @@ Optional extras:
 
 ```powershell
 pip install -e ".[voice]"      # sounddevice + faster-whisper
+pip install -e ".[tts]"        # optional pyttsx3 spoken replies
 pip install -e ".[fit,opt]"    # scipy + scikit-optimize/optuna
 pip install -e ".[docs]"       # pypdf
 pip install -e ".[dev]"        # pytest/black/ruff
@@ -64,7 +67,9 @@ python -m labpilot_ai
 
 ## API Configuration
 
-DeepSeek/OpenAI-compatible settings can be entered in the UI or provided as environment variables:
+DeepSeek/OpenAI-compatible settings can be entered on the Command page or provided as environment variables. On startup, the API key field is populated from the first available source: local `configs/project_settings.yaml` `ai.api_key` if present, then `DEEPSEEK_API_KEY`, then `OPENAI_API_KEY`. The field is password-hidden by default.
+
+Changing the Command page API key, base URL, or model affects runtime LLM calls after clicking `Apply API settings` or leaving the edited field. `Save base/model` writes only non-secret settings to local `configs/project_settings.yaml`; API keys are intentionally not saved by default.
 
 ```powershell
 $env:DEEPSEEK_API_KEY="your key"
@@ -72,7 +77,7 @@ $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
 $env:DEEPSEEK_MODEL="deepseek-v4-pro"
 ```
 
-If no key is available, keep `Mock LLM` enabled to test parsing and safety flows offline.
+If no key is available, LabPilot falls back to a small local mock parser for basic dry-run testing. Serious experiment planning and Co-Sequence patch generation require a real DeepSeek/OpenAI-compatible API key.
 
 ## Project Templates
 
@@ -99,6 +104,21 @@ voice:
   model_size: "small"
   isolated_stt: true
 ```
+
+Spoken replies are disabled by default so the app does not unexpectedly speak in the lab. Enable `Enable spoken replies` in the Command page Voice input panel, or configure:
+
+```yaml
+voice:
+  input_enabled: true
+  reply_enabled: true
+  reply_on_wake: true
+  reply_before_execute: true
+  tts_backend: "system"
+  tts_rate: 180
+  tts_volume: 0.85
+```
+
+On Windows, LabPilot can use the local SAPI speaker through PowerShell without sending text to a remote API. Installing `labpilot-ai[tts]` adds the optional `pyttsx3` backend.
 
 GPU STT on RTX cards can use:
 

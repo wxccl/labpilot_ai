@@ -35,11 +35,26 @@ knowledge:
   max_context_chars: 4000
 lyse:
   preview_max_rows: 2000
+runmanager:
+  write_mode: "remote_then_h5"
+  direct_h5_write: true
+  direct_h5_group: ""
 ai:
   base_url: "https://api.deepseek.com"
   model: "deepseek-v4-flash"
   temperature: 0
 voice:
+  input_enabled: true
+  reply_enabled: false
+  reply_on_wake: true
+  reply_before_parse: true
+  reply_before_execute: true
+  reply_after_execute: true
+  reply_on_error: true
+  tts_backend: "system"
+  tts_rate: 180
+  tts_volume: 0.85
+  tts_max_chars: 240
   model_size: "small"
   profile: "balanced"
   device: "cpu"

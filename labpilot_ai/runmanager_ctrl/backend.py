@@ -9,6 +9,8 @@ class RunmanagerBackend:
         self._mock_globals = {}
         self._run_shots = False
         self._last_snapshot = {}
+        self._labscript_file = ""
+        self._shot_output_folder = ""
 
     def connect(self):
         if self.mock:
@@ -35,6 +37,30 @@ class RunmanagerBackend:
         if self.mock:
             return dict(self._mock_globals)
         return self.client.get_globals()
+
+    def get_labscript_file(self):
+        if self.mock:
+            return self._labscript_file
+        return self.client.get_labscript_file()
+
+    def set_labscript_file(self, value):
+        value = str(value or "")
+        if self.mock:
+            self._labscript_file = value
+            return True
+        return self.client.set_labscript_file(value)
+
+    def get_shot_output_folder(self):
+        if self.mock:
+            return self._shot_output_folder
+        return self.client.get_shot_output_folder()
+
+    def set_shot_output_folder(self, value):
+        value = str(value or "")
+        if self.mock:
+            self._shot_output_folder = value
+            return True
+        return self.client.set_shot_output_folder(value)
 
     def set_globals(self, values: dict):
         self._last_snapshot = self.snapshot_values(values.keys())

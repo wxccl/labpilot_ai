@@ -21,3 +21,29 @@ def test_release_page_backends_import():
     assert validate_patch_plan is not None
     assert DIRECTORY_FIELDS
     assert generate_experiment_log is not None
+
+
+def test_main_window_llm_client_uses_ui_runtime_fields():
+    from labpilot_ai.app.main_window import MainWindow
+
+    class Edit:
+        def __init__(self, value):
+            self.value = value
+
+        def text(self):
+            return self.value
+
+    window = MainWindow.__new__(MainWindow)
+    window.project_settings = {"ai": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash"}}
+    window.runtime_api_key = ""
+    window.runtime_api_key_source = "missing"
+    window.api_key = Edit("sk-ui-test")
+    window.base_url = Edit("https://api.example.test/v1")
+    window.model = Edit("example-model")
+
+    client = MainWindow._make_llm_client(window)
+
+    assert client.api_key == "sk-ui-test"
+    assert client.api_key_source == "UI field"
+    assert client.base_url == "https://api.example.test/v1"
+    assert client.model == "example-model"

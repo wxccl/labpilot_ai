@@ -62,7 +62,7 @@ class LLMClient:
         }
     def parse_command(self, user_text: str, global_registry: dict, blacs_registry=None, lyse_registry=None, project_context=None) -> dict:
         if self.mock or not self.api_key:
-            result = self._mock_parse(user_text, global_registry)
+            result = self._mock_parse(user_text, global_registry, blacs_registry or {})
             if project_context:
                 result["project_context_used"] = True
             return result
@@ -89,15 +89,32 @@ class LLMClient:
         response = client.chat.completions.create(**kwargs)
         return extract_json_object(response.choices[0].message.content)
 
-    def _mock_parse(self, text: str, global_registry: dict) -> dict:
+    def _mock_parse(self, text: str, global_registry: dict, blacs_registry: dict | None = None) -> dict:
         """Small local parser for testing without API. It only handles common cases."""
         actions = []
+        blacs_registry = blacs_registry or {}
+        original = text or ""
         low = (text or "").lower()
         no_run = any(token in low for token in ["do not run", "don't run", "no run", "not run", "dry run"])
-        no_run = no_run or any(token in (text or "") for token in ["不要运行", "不运行", "别运行", "不跑"])
+        no_run = no_run or any(token in original for token in ["不要运行", "不运行", "别运行", "不跑"])
 
-        if any(token in low for token in ["tof", "time of flight"]) or any(token in (text or "") for token in ["飞行时间"]):
-            m = re.search(r"(?:from|从)\s*([\d.]+)\s*(?:ms)?\s*(?:to|到)\s*([\d.]+)\s*(?:ms)?.*?(\d+)\s*(?:points|点)", text or "", re.I)
+        blacs_intent = any(
+            token in low for token in ["blacs", "manual", "channel", "trigger", "switch", "ao", "do", "dds"]
+        )
+        blacs_intent = blacs_intent or any(token in original for token in ["手动", "通道", "触发", "开关", "关闭blacs", "设置blacs"])
+        if blacs_intent:
+            channel = self._match_registry_name(original, blacs_registry)
+            if channel:
+                actions.append(
+                    {
+                        "type": "set_blacs_manual",
+                        "name": channel,
+                        "value": self._mock_value_for_text(original, blacs_registry.get(channel, {})),
+                    }
+                )
+
+        if any(token in low for token in ["tof", "time of flight"]) or any(token in original for token in ["飞行时间"]):
+            m = re.search(r"(?:from|从)\s*([\d.]+)\s*(?:ms)?\s*(?:to|到)\s*([\d.]+)\s*(?:ms)?.*?(\d+)\s*(?:points|点)", original, re.I)
             if m and "duration_tof_ms" in global_registry:
                 actions.append(
                     {
@@ -107,7 +124,7 @@ class LLMClient:
                     }
                 )
             else:
-                m = re.search(r"(?:tof|time of flight|飞行时间).*?(?:to|set to|设为|设置为|改成|=)\s*([\d.]+)", text or "", re.I)
+                m = re.search(r"(?:tof|time of flight|飞行时间).*?(?:to|set to|设为|设置为|改成|=)\s*([\d.]+)", original, re.I)
                 if m and "duration_tof_ms" in global_registry:
                     actions.append({"type": "set_global", "name": "duration_tof_ms", "value": float(m.group(1))})
 
@@ -117,19 +134,70 @@ class LLMClient:
             "do_Rabi": ["rabi", "拉比"],
             "do_pure": ["pure", "清除"],
             "do_Ramsey": ["ramsey"],
+            "do_camera": ["camera", "相机"],
         }
         for name, keys in bool_map.items():
-            if name in global_registry and any(key.lower() in low or key in (text or "") for key in keys):
+            if name in global_registry and any(key.lower() in low or key in original for key in keys):
                 val = not any(token in low for token in ["disable", "off", "turn off"]) and not any(
-                    token in (text or "") for token in ["关闭", "关掉", "不要打开"]
+                    token in original for token in ["关闭", "关掉", "不要打开", "禁用"]
                 )
                 actions.append({"type": "set_global", "name": name, "value": val})
 
-        if not no_run and (any(token in low for token in ["run", "submit", "engage"]) or any(token in (text or "") for token in ["运行", "跑一次", "提交"])):
+        global_name = self._match_registry_name(original, global_registry)
+        if global_name and not any(action.get("type") == "set_global" and action.get("name") == global_name for action in actions):
+            actions.append(
+                {
+                    "type": "set_global",
+                    "name": global_name,
+                    "value": self._mock_value_for_text(original, global_registry.get(global_name, {})),
+                }
+            )
+
+        if not no_run and (any(token in low for token in ["run", "submit", "engage"]) or any(token in original for token in ["运行", "跑一次", "提交"])):
             actions.append({"type": "engage"})
-        if any(token in low for token in ["read", "current", "globals"]) or any(token in (text or "") for token in ["读取", "查看", "当前参数"]):
+        if any(token in low for token in ["read", "current", "globals"]) or any(token in original for token in ["读取", "查看", "当前参数"]):
             actions.append({"type": "get_globals"})
         return {"actions": actions, "comment": "Mock LLM parser result. For serious use, enable API."}
+
+    @staticmethod
+    def _norm_name(value: str) -> str:
+        return "".join(ch for ch in str(value).lower().replace("_", " ") if ch.isalnum())
+
+    @classmethod
+    def _match_registry_name(cls, text: str, registry: dict) -> str | None:
+        norm_text = cls._norm_name(text)
+        ordered = sorted((registry or {}).items(), key=lambda item: len(str(item[0])), reverse=True)
+        for name, rule in ordered:
+            candidates = [name, str(name).replace("_", " ")]
+            candidates.extend(rule.get("aliases", []) or [])
+            device = str(rule.get("device", "")).strip()
+            channel = str(rule.get("channel", "")).strip()
+            if device and channel:
+                candidates.append(f"{device}.{channel}")
+            for candidate in candidates:
+                if candidate and cls._norm_name(candidate) in norm_text:
+                    return name
+        return None
+
+    @staticmethod
+    def _mock_value_for_text(text: str, rule: dict):
+        low = (text or "").lower()
+        if any(token in low for token in ["off", "false", "disable", "close"]) or any(
+            token in (text or "") for token in ["关闭", "关掉", "禁用", "否"]
+        ):
+            return False
+        if any(token in low for token in ["on", "true", "enable", "open"]) or any(
+            token in (text or "") for token in ["打开", "开启", "启用", "是"]
+        ):
+            if rule.get("type") == "bool":
+                return True
+        m = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text or "")
+        if m:
+            value = float(m.group(0))
+            return int(value) if str(rule.get("type")) == "int" else value
+        if rule.get("type") == "bool":
+            return True
+        return ""
 
     def propose_co_sequence_patch(
         self,

@@ -20,6 +20,10 @@ from labpilot_ai.analysis.report_generator import generate_markdown_report
 from labpilot_ai.app.error_center import ErrorCenter
 from labpilot_ai.app.theme import APP_STYLE
 from labpilot_ai.blacs_ctrl.manual_client import BlacsManualClient
+from labpilot_ai.blacs_ctrl.connection_table_discovery import (
+    discover_blacs_channels_from_connection_table,
+    merge_blacs_registry_from_connection_table,
+)
 from labpilot_ai.co_sequence import CodeChangeLogStore, apply_patch_plan, validate_patch_plan
 from labpilot_ai.config.registry_editor import (
     BLACS_FIELDS,
@@ -35,7 +39,7 @@ from labpilot_ai.config.registry_editor import (
     validate_lyse_registry,
 )
 from labpilot_ai.config.settings_manager import SettingsManager
-from labpilot_ai.directory import DIRECTORY_FIELDS, default_directory_settings, validate_directory_settings
+from labpilot_ai.directory import DIRECTORY_FIELDS, default_directory_settings, detect_labscript_paths, field_file_filter, validate_directory_settings
 from labpilot_ai.experiment_log import generate_experiment_log, save_experiment_log
 from labpilot_ai.knowledge.context_builder import build_project_context
 from labpilot_ai.knowledge.indexer import KnowledgeIndexer, discover_source_files, project_db_path, source_counts
@@ -50,6 +54,8 @@ from labpilot_ai.optimizer.experiment_loop import OptimizerLoop
 from labpilot_ai.optimizer.history import save_optimization_history
 from labpilot_ai.optimizer.lyse_feedback import latest_row_position, objective_values_from_row, tell_optimizer_from_dataframe
 from labpilot_ai.runmanager_ctrl.backend import RunmanagerBackend
+from labpilot_ai.runmanager_ctrl.globals_h5 import read_runmanager_globals_h5, registry_from_globals_h5
+from labpilot_ai.runmanager_ctrl.write_router import preview_runmanager_write_targets, write_runmanager_globals
 from labpilot_ai.runmanager_ctrl.sequence_variable_discovery import discover_sequence_globals
 from labpilot_ai.safety.validator import SafetyValidator
 from labpilot_ai.storage.database import LabPilotDatabase
@@ -58,6 +64,7 @@ from labpilot_ai.utils.paths import app_icon_path, default_config_dir
 from labpilot_ai.voice.recorder import AudioRecorder, write_wav
 from labpilot_ai.voice.diagnostics import run_voice_diagnostics
 from labpilot_ai.voice.stt_backend import SpeechToTextBackend
+from labpilot_ai.voice.tts_backend import TextToSpeechBackend, summarize_safe_actions
 from labpilot_ai.voice.vad import SilenceDetector, rms
 from labpilot_ai.voice.wake_agent import WakeAgentConfig, contains_wake_name, strip_wake_name
 from labpilot_ai.voice.lexicon import VoiceLexicon
@@ -83,6 +90,61 @@ class TranscriptionWorker(QtCore.QObject):
             self.finished.emit(text, self.audio_path)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class SpeechWorker(QtCore.QObject):
+    status = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, tts):
+        super().__init__()
+        self.tts = tts
+        self._queue = queue.Queue()
+        self._running = False
+
+    def enqueue(self, text, priority=False):
+        if priority:
+            self.clear()
+        self._queue.put(str(text or ""))
+
+    def clear(self):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def stop(self):
+        self._running = False
+        try:
+            self.tts.stop()
+        except Exception:
+            pass
+        self._queue.put(None)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        self._running = True
+        try:
+            while self._running:
+                try:
+                    text = self._queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if text is None:
+                    break
+                if not text:
+                    continue
+                try:
+                    result = self.tts.speak(text)
+                    if result.get("spoken"):
+                        self.status.emit("Speaker ready")
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+        finally:
+            self._running = False
+            self.stopped.emit()
 
 
 class WakeStandbyWorker(QtCore.QObject):
@@ -630,7 +692,7 @@ class ProjectPathsWidget(QtWidgets.QWidget):
 
     def browse(self, field):
         if field in {"connection_table", "active_connection_table", "active_sequence_file", "runmanager_globals_path", "blacs_connection_context_path"}:
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field}", "", "Python files (*.py);;YAML files (*.yaml *.yml);;All files (*.*)")
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field}", "", field_file_filter(field, field))
         elif field == "knowledge_db_path":
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Choose knowledge database", "", "SQLite database (*.sqlite *.db);;All files (*.*)")
         else:
@@ -671,6 +733,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blacs_registry = self.settings.load_blacs_registry()
         self.lyse_registry = self.settings.load_lyse_registry()
         self.project_settings = self.settings.load_project_settings()
+        self.runtime_api_key = ""
+        self.runtime_api_key_source = "missing"
         self.error_records = []
         self.database = database or LabPilotDatabase(Path.cwd() / "labpilot_outputs" / "labpilot_state.sqlite")
         self.error_center = error_center or ErrorCenter(database=self.database, parent=self)
@@ -702,6 +766,17 @@ class MainWindow(QtWidgets.QMainWindow):
             samplerate=voice_cfg.get("samplerate", 16000),
             channels=1,
         )
+        self.tts = TextToSpeechBackend(
+            enabled=voice_cfg.get("reply_enabled", False),
+            backend=voice_cfg.get("tts_backend", "system"),
+            rate=voice_cfg.get("tts_rate", 180),
+            volume=voice_cfg.get("tts_volume", 0.85),
+            voice_name=voice_cfg.get("tts_voice_name", ""),
+            language=voice_cfg.get("language", "zh,en"),
+            max_chars=voice_cfg.get("tts_max_chars", 240),
+        )
+        self.speech_thread = None
+        self.speech_worker = None
         self.voice_recording = False
         self.transcription_thread = None
         self.transcription_worker = None
@@ -746,7 +821,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _llm_api_status_text(self):
         client = getattr(self, "llm", None)
         if client is None:
-            client = LLMClient(mock=False)
+            client = self._make_llm_client()
             self.llm = client
         status = client.status() if hasattr(client, "status") else {
             "mock": getattr(client, "mock", False),
@@ -760,7 +835,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return "LLM real requested, but API key missing. Set DEEPSEEK_API_KEY or OPENAI_API_KEY and restart."
 
     def refresh_llm_status(self):
-        self.llm = LLMClient(mock=False)
+        self.llm = self._make_llm_client()
+        self.update_llm_api_status()
         text = self._llm_api_status_text()
         try:
             if not hasattr(self, "llm_status_label"):
@@ -786,7 +862,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 widget.blockSignals(False)
             except Exception:
                 pass
-        self.llm = LLMClient(mock=False)
+        self.llm = self._make_llm_client()
         self.rm = RunmanagerBackend(mock=False)
         self.blacs = BlacsManualClient(mock=False)
         self.refresh_llm_status()
@@ -809,7 +885,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _llm_runtime_status(self):
         """Return sanitized LLM runtime status without exposing the full API key."""
-        client = LLMClient(mock=False)
+        client = self._make_llm_client()
+        self.llm = client
         if hasattr(client, "status"):
             status = dict(client.status())
         else:
@@ -828,7 +905,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 source = "OPENAI_API_KEY"
             else:
                 source = "missing"
-        raw_key = os.getenv(source, "") if source.endswith("_API_KEY") else ""
+        raw_key = getattr(client, "api_key", "") or (os.getenv(source, "") if source.endswith("_API_KEY") else "")
         if raw_key:
             masked = raw_key[:8] + "..." + raw_key[-4:] if len(raw_key) > 12 else "***"
         else:
@@ -1000,6 +1077,135 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         self.inspector_text.setPlainText(dumps(payload, indent=2))
 
+    def _ai_config(self):
+        settings = dict(self.project_settings or {})
+        ai = dict(settings.get("ai", {}) or {})
+        settings["ai"] = ai
+        return settings, ai
+
+    def _environment_api_key(self):
+        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            value = os.getenv(name)
+            if value:
+                return value, name
+        return "", "missing"
+
+    def _configured_api_key(self):
+        _settings, ai = self._ai_config()
+        value = str(ai.get("api_key", "") or "").strip()
+        if value:
+            return value, "local project_settings.yaml"
+        return self._environment_api_key()
+
+    def _current_api_key(self):
+        if hasattr(self, "api_key"):
+            value = self.api_key.text().strip()
+            return value, "UI field" if value else "UI field empty"
+        if getattr(self, "runtime_api_key", ""):
+            return self.runtime_api_key, getattr(self, "runtime_api_key_source", "runtime")
+        return self._configured_api_key()
+
+    def _current_ai_base_url(self):
+        if hasattr(self, "base_url") and self.base_url.text().strip():
+            return self.base_url.text().strip()
+        return str((self.project_settings.get("ai", {}) or {}).get("base_url", "https://api.deepseek.com"))
+
+    def _current_ai_model(self):
+        if hasattr(self, "model") and self.model.text().strip():
+            return self.model.text().strip()
+        return str((self.project_settings.get("ai", {}) or {}).get("model", "deepseek-v4-flash"))
+
+    def _make_llm_client(self):
+        key, source = self._current_api_key()
+        client = LLMClient(
+            api_key=key or None,
+            base_url=self._current_ai_base_url(),
+            model=self._current_ai_model(),
+            mock=False,
+        )
+        if key:
+            client.api_key_source = source
+        return client
+
+    def _populate_ai_fields_from_runtime(self):
+        if not hasattr(self, "api_key"):
+            return
+        key, source = self._configured_api_key()
+        self.runtime_api_key = key
+        self.runtime_api_key_source = source
+        if key and not self.api_key.text().strip():
+            self.api_key.blockSignals(True)
+            self.api_key.setText(key)
+            self.api_key.blockSignals(False)
+        self.api_key.setPlaceholderText("Paste DeepSeek/OpenAI-compatible API key")
+        self.api_key.setToolTip(f"Current key source: {source}; key is hidden in the field.")
+        if hasattr(self, "api_key_source_label"):
+            preview = self._mask_api_key_for_ui(key) if key else "missing"
+            self.api_key_source_label.setText(f"{source}: {preview}")
+
+    def on_show_api_key_toggled(self, checked):
+        if not hasattr(self, "api_key"):
+            return
+        self.api_key.setEchoMode(QtWidgets.QLineEdit.Normal if checked else QtWidgets.QLineEdit.Password)
+
+    def apply_ai_settings(self, *, save=False, log=True):
+        try:
+            key, source = self._current_api_key()
+            self.runtime_api_key = key
+            self.runtime_api_key_source = source
+            base_url = self._current_ai_base_url()
+            model = self._current_ai_model()
+            if key:
+                env_name = "OPENAI_API_KEY" if "openai" in base_url.lower() else "DEEPSEEK_API_KEY"
+                os.environ[env_name] = key
+                self.runtime_api_key_source = f"UI/{env_name}" if source == "UI field" else source
+            self.llm = self._make_llm_client()
+            if save:
+                settings, ai = self._ai_config()
+                ai["base_url"] = base_url
+                ai["model"] = model
+                ai["temperature"] = ai.get("temperature", 0)
+                # Do not save api_key by default: local runtime/env controls secrets.
+                ai.pop("api_key", None)
+                self.project_settings = settings
+                path = self.settings.save_project_settings(settings)
+                if log:
+                    self.log(f"AI settings saved without API key: {path}")
+            if hasattr(self, "api_key_source_label"):
+                preview = self._mask_api_key_for_ui(key) if key else "missing"
+                self.api_key_source_label.setText(f"{self.runtime_api_key_source}: {preview}")
+            status = self.update_llm_api_status()
+            if log:
+                self.log(
+                    f"AI runtime applied: source={self.runtime_api_key_source}, "
+                    f"base_url={base_url}, model={model}, key={self._mask_api_key_for_ui(key) or 'missing'}"
+                )
+            return status
+        except Exception as exc:
+            self._show_error("Apply AI settings failed", exc)
+            return {"error": str(exc)}
+
+    def save_ai_settings(self):
+        self.apply_ai_settings(save=True)
+
+    def clear_api_key_field(self):
+        if hasattr(self, "api_key"):
+            self.api_key.clear()
+        self.runtime_api_key = ""
+        self.runtime_api_key_source = "missing"
+        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            if name in os.environ:
+                os.environ.pop(name, None)
+        settings, ai = self._ai_config()
+        if "api_key" in ai:
+            ai.pop("api_key", None)
+            self.project_settings = settings
+            try:
+                self.settings.save_project_settings(settings)
+            except Exception as exc:
+                self.log(f"Could not remove saved API key: {exc}")
+        self.apply_ai_settings(log=True)
+
     def _command_page(self):
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
@@ -1011,6 +1217,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.api_key.setEchoMode(QtWidgets.QLineEdit.Password)
         self.base_url = QtWidgets.QLineEdit(ai_cfg.get("base_url", "https://api.deepseek.com"))
         self.model = QtWidgets.QLineEdit(ai_cfg.get("model", "deepseek-v4-flash"))
+        self.show_api_key = QtWidgets.QCheckBox("Show")
+        self.show_api_key.toggled.connect(self.on_show_api_key_toggled)
+        self.api_key_source_label = QtWidgets.QLabel("key: checking...")
+        self.api_key_source_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.apply_ai_button = QtWidgets.QPushButton("Apply API settings")
+        self.apply_ai_button.clicked.connect(lambda: self.apply_ai_settings(save=False))
+        self.save_ai_button = QtWidgets.QPushButton("Save base/model")
+        self.save_ai_button.clicked.connect(self.save_ai_settings)
+        self.clear_api_button = QtWidgets.QPushButton("Clear runtime key")
+        self.clear_api_button.clicked.connect(self.clear_api_key_field)
         self.mock_llm = QtWidgets.QCheckBox("Mock LLM")
         self.mock_llm.setVisible(False)
         self.mock_llm.setEnabled(False)
@@ -1037,13 +1253,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_run = QtWidgets.QCheckBox("Auto write and run")
         self.clear_after_parse = QtWidgets.QCheckBox("Clear command after Parse")
         grid.addWidget(QtWidgets.QLabel("API key"), 0, 0)
-        grid.addWidget(self.api_key, 0, 1, 1, 3)
+        grid.addWidget(self.api_key, 0, 1, 1, 2)
+        grid.addWidget(self.show_api_key, 0, 3)
+        grid.addWidget(self.api_key_source_label, 0, 4)
         grid.addWidget(QtWidgets.QLabel("Base URL"), 1, 0)
         grid.addWidget(self.base_url, 1, 1)
         grid.addWidget(QtWidgets.QLabel("Model"), 1, 2)
         grid.addWidget(self.model, 1, 3)
+        grid.addWidget(self.apply_ai_button, 1, 4)
+        grid.addWidget(self.save_ai_button, 2, 3)
+        grid.addWidget(self.clear_api_button, 2, 4)
         for col, widget in enumerate([self.mock_llm, self.mock_rm, self.mock_blacs, self.dry_run, self.auto_write, self.auto_run, self.clear_after_parse]):
-            grid.addWidget(widget, 2 + col // 3, col % 3)
+            grid.addWidget(widget, 3 + col // 3, col % 3)
+        self._populate_ai_fields_from_runtime()
+        self.api_key.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
+        self.base_url.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
+        self.model.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
         layout.addWidget(top)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -1061,10 +1286,17 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(QtWidgets.QLabel("Natural language command"))
         left_layout.addWidget(self.command_text, 1)
         command_buttons = QtWidgets.QHBoxLayout()
-        b_voice = QtWidgets.QPushButton("Transcribe audio file")
-        b_voice.clicked.connect(self.transcribe_audio_file)
+        self.transcribe_audio_button = QtWidgets.QPushButton("Transcribe audio file")
+        self.transcribe_audio_button.clicked.connect(self.transcribe_audio_file)
         voice_box = QtWidgets.QGroupBox("Voice input")
         voice_layout = QtWidgets.QGridLayout(voice_box)
+        voice_cfg = self.project_settings.get("voice", {})
+        self.voice_input_enabled = QtWidgets.QCheckBox("Enable voice input")
+        self.voice_input_enabled.setChecked(bool(voice_cfg.get("input_enabled", True)))
+        self.voice_input_enabled.toggled.connect(self.on_voice_input_enabled_changed)
+        self.voice_reply_enabled = QtWidgets.QCheckBox("Enable spoken replies")
+        self.voice_reply_enabled.setChecked(bool(voice_cfg.get("reply_enabled", False)))
+        self.voice_reply_enabled.toggled.connect(self.on_voice_reply_enabled_changed)
         self.voice_toggle_button = QtWidgets.QPushButton("Start voice recording")
         self.voice_toggle_button.setCheckable(True)
         self.voice_toggle_button.clicked.connect(self.toggle_voice_recording)
@@ -1097,6 +1329,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.voice_lifetime.currentIndexChanged.connect(self.apply_voice_profile)
         release_model = QtWidgets.QPushButton("Release STT model")
         release_model.clicked.connect(self.release_stt_model)
+        self.tts_rate = QtWidgets.QSpinBox()
+        self.tts_rate.setRange(80, 260)
+        self.tts_rate.setValue(int(voice_cfg.get("tts_rate", 180)))
+        self.tts_rate.valueChanged.connect(self.apply_tts_settings)
+        self.tts_volume = QtWidgets.QSpinBox()
+        self.tts_volume.setRange(0, 100)
+        self.tts_volume.setSuffix("%")
+        self.tts_volume.setValue(int(float(voice_cfg.get("tts_volume", 0.85)) * 100))
+        self.tts_volume.valueChanged.connect(self.apply_tts_settings)
+        self.speaker_status_label = QtWidgets.QLabel("Speaker off")
+        self.speaker_status_label.setObjectName("StatusLightWarn")
+        test_speaker = QtWidgets.QPushButton("Test speaker")
+        test_speaker.clicked.connect(self.test_speaker)
+        stop_speaker = QtWidgets.QPushButton("Stop speaking")
+        stop_speaker.clicked.connect(self.stop_speaking)
         self.voice_language = QtWidgets.QComboBox()
         self.voice_language.addItem("Chinese + English auto", "zh,en")
         self.voice_language.addItem("Auto detect", "auto")
@@ -1120,6 +1367,7 @@ class MainWindow(QtWidgets.QMainWindow):
         voice_layout.addWidget(self.voice_toggle_button, 0, 0)
         voice_layout.addWidget(QtWidgets.QLabel("After transcription"), 0, 1)
         voice_layout.addWidget(self.voice_after_transcribe, 0, 2)
+        voice_layout.addWidget(self.voice_input_enabled, 0, 3)
         voice_layout.addWidget(QtWidgets.QLabel("Backend"), 1, 0)
         voice_layout.addWidget(self.voice_backend, 1, 1)
         voice_layout.addWidget(QtWidgets.QLabel("Profile"), 1, 2)
@@ -1137,7 +1385,16 @@ class MainWindow(QtWidgets.QMainWindow):
         voice_layout.addWidget(QtWidgets.QLabel("Model lifetime"), 5, 0)
         voice_layout.addWidget(self.voice_lifetime, 5, 1, 1, 2)
         voice_layout.addWidget(release_model, 5, 3)
-        voice_layout.addWidget(self.voice_status, 6, 0, 1, 4)
+        voice_layout.addWidget(self.voice_reply_enabled, 6, 0)
+        voice_layout.addWidget(QtWidgets.QLabel("TTS rate"), 6, 1)
+        voice_layout.addWidget(self.tts_rate, 6, 2)
+        voice_layout.addWidget(self.tts_volume, 6, 3)
+        voice_layout.addWidget(test_speaker, 7, 0)
+        voice_layout.addWidget(stop_speaker, 7, 1)
+        voice_layout.addWidget(self.speaker_status_label, 7, 2, 1, 2)
+        voice_layout.addWidget(self.voice_status, 8, 0, 1, 4)
+        self.apply_voice_input_enabled()
+        self.update_speaker_status()
         left_layout.addWidget(voice_box)
 
         b_parse = QtWidgets.QPushButton("Parse only")
@@ -1150,7 +1407,7 @@ class MainWindow(QtWidgets.QMainWindow):
         b_context.clicked.connect(self.show_retrieved_context)
         b_clear = QtWidgets.QPushButton("Clear")
         b_clear.clicked.connect(lambda: self.command_text.setPlainText(""))
-        for button in [b_voice, b_parse, b_preview, b_exec, b_context, b_clear]:
+        for button in [self.transcribe_audio_button, b_parse, b_preview, b_exec, b_context, b_clear]:
             command_buttons.addWidget(button)
         left_layout.addLayout(command_buttons)
         split.addWidget(left)
@@ -1179,19 +1436,30 @@ class MainWindow(QtWidgets.QMainWindow):
         test.clicked.connect(self.test_rm)
         refresh = QtWidgets.QPushButton("Refresh globals")
         refresh.clicked.connect(self.refresh_globals)
-        engage = QtWidgets.QPushButton("Engage from last action")
-        engage.clicked.connect(lambda: self.execute_last(force_run=True))
+        check_active = QtWidgets.QPushButton("Check active globals")
+        check_active.clicked.connect(self.check_runmanager_active_globals)
         build_array = QtWidgets.QPushButton("Build array scan")
         build_array.clicked.connect(self.build_array_scan_from_selected)
-        load_sequence = QtWidgets.QPushButton("Load sequence folder")
-        load_sequence.clicked.connect(self.load_sequence_folder)
+        detect_paths = QtWidgets.QPushButton("Detect RM paths")
+        detect_paths.clicked.connect(self.detect_directory_from_labscript_apps)
+        apply_paths = QtWidgets.QPushButton("Apply RM paths")
+        apply_paths.clicked.connect(self.apply_directory_paths_to_running_apps)
         ai_parse = QtWidgets.QPushButton("AI parse sequence variables")
         ai_parse.setToolTip("Parse active sequence code and auto-complete the runmanager global registry")
         ai_parse.clicked.connect(self.ai_parse_sequence_variables)
         index_sequence = QtWidgets.QPushButton("Index sequence code")
         index_sequence.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
 
-        for button in [test, refresh, engage, build_array, load_sequence, ai_parse, index_sequence]:
+        for button in [
+            test,
+            refresh,
+            check_active,
+            build_array,
+            detect_paths,
+            apply_paths,
+            ai_parse,
+            index_sequence,
+        ]:
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -1199,10 +1467,20 @@ class MainWindow(QtWidgets.QMainWindow):
         status_row = QtWidgets.QHBoxLayout()
         self.rm_shots_label = QtWidgets.QLabel("n_shots: --")
         self.rm_shots_label.setObjectName("StatusLightOk")
-        self.rm_autowrite_label = QtWidgets.QLabel("Editing a registered value cell auto-uploads it through SafetyValidator")
+        self.rm_active_globals_label = QtWidgets.QLabel("remote active globals: --")
+        self.rm_active_globals_label.setObjectName("StatusLightWarn")
+        self.rm_h5_globals_label = QtWidgets.QLabel("H5 globals: --")
+        self.rm_h5_globals_label.setObjectName("StatusLightWarn")
+        direct_enabled = bool((self.project_settings.get("runmanager", {}) or {}).get("direct_h5_write", True))
+        self.rm_h5_write_label = QtWidgets.QLabel(f"direct H5 write: {'on' if direct_enabled else 'off'}")
+        self.rm_h5_write_label.setObjectName("StatusLightOk" if direct_enabled else "StatusLightWarn")
+        self.rm_autowrite_label = QtWidgets.QLabel("Editing a value cell writes immediately: remote first, H5 fallback")
         self.rm_autowrite_label.setObjectName("StatusLightWarn")
         status_row.addWidget(QtWidgets.QLabel("Runmanager"))
         status_row.addWidget(self.rm_shots_label)
+        status_row.addWidget(self.rm_active_globals_label)
+        status_row.addWidget(self.rm_h5_globals_label)
+        status_row.addWidget(self.rm_h5_write_label)
         status_row.addWidget(self.rm_autowrite_label, 1)
         layout.addLayout(status_row)
 
@@ -1231,28 +1509,29 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons = QtWidgets.QHBoxLayout()
         test = QtWidgets.QPushButton("Test BLACS bridge")
         test.clicked.connect(self.test_blacs)
-        set_selected = QtWidgets.QPushButton("Set selected manual value")
-        set_selected.clicked.connect(self.set_selected_blacs)
-        refresh_bridge = QtWidgets.QPushButton("Refresh bridge status")
-        refresh_bridge.clicked.connect(self.test_blacs)
-        discover_channels = QtWidgets.QPushButton("Discover channels")
-        discover_channels.clicked.connect(self.discover_blacs_channels)
         read_values = QtWidgets.QPushButton("Read current values")
         read_values.clicked.connect(self.read_blacs_values)
-        import_channels = QtWidgets.QPushButton("Import selected channels")
-        import_channels.clicked.connect(self.import_selected_blacs_channels)
-        apply_checked = QtWidgets.QPushButton("Apply checked channels")
-        apply_checked.clicked.connect(self.apply_checked_blacs)
-        load_connection = QtWidgets.QPushButton("Load connection table context")
-        load_connection.clicked.connect(self.load_connection_table)
-        self.blacs_program = QtWidgets.QCheckBox("Program hardware")
-        for widget in [test, refresh_bridge, discover_channels, read_values, import_channels, set_selected, apply_checked, load_connection, self.blacs_program]:
+        parse_connection = QtWidgets.QPushButton("AI parse usable actions")
+        parse_connection.clicked.connect(self.parse_and_import_blacs_actions)
+        index_h5 = QtWidgets.QPushButton("Index H5/BLACS to Knowledge")
+        index_h5.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
+        self.blacs_program = QtWidgets.QCheckBox("Program hardware on write")
+        self.blacs_program.setChecked(True)
+        for widget in [
+            test,
+            read_values,
+            parse_connection,
+            index_h5,
+            self.blacs_program,
+        ]:
             buttons.addWidget(widget)
         buttons.addStretch()
         layout.addLayout(buttons)
         self.blacs_table = QtWidgets.QTableWidget(0, 8)
         self.blacs_table.setHorizontalHeaderLabels(["name", "kind", "device", "channel", "range", "current value", "target value", "risk"])
         self.blacs_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self._loading_blacs_table = False
+        self.blacs_table.itemChanged.connect(self._on_blacs_table_item_changed)
         layout.addWidget(self.blacs_table, 1)
         self._fill_blacs_registry()
         return w
@@ -1631,11 +1910,15 @@ class MainWindow(QtWidgets.QMainWindow):
         validate.clicked.connect(self.validate_directory_paths_ui)
         detect = QtWidgets.QPushButton("Detect active files")
         detect.clicked.connect(self.detect_directory_active_files)
+        detect_labscript = QtWidgets.QPushButton("Detect from labscript apps")
+        detect_labscript.clicked.connect(self.detect_directory_from_labscript_apps)
+        apply_apps = QtWidgets.QPushButton("Apply to running apps")
+        apply_apps.clicked.connect(self.apply_directory_paths_to_running_apps)
         index = QtWidgets.QPushButton("Index to Knowledge")
         index.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
         open_folder = QtWidgets.QPushButton("Open selected folder")
         open_folder.clicked.connect(self.open_selected_directory_path)
-        for button in [save, validate, detect, index, open_folder]:
+        for button in [save, validate, detect, detect_labscript, apply_apps, index, open_folder]:
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -1730,8 +2013,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.diag_faster_whisper = QtWidgets.QLabel("not checked")
         self.diag_microphones = QtWidgets.QLabel("not checked")
         self.diag_lexicon = QtWidgets.QLabel(f"{len(self.voice_lexicon.terms)} terms")
+        self.diag_tts = QtWidgets.QLabel("not checked")
         run_diag = QtWidgets.QPushButton("Run voice diagnostics")
         run_diag.clicked.connect(self.run_voice_diagnostics_ui)
+        test_tts = QtWidgets.QPushButton("Test speaker")
+        test_tts.clicked.connect(self.test_speaker)
         grid.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
         grid.addWidget(self.diag_cpu_mode, 0, 1)
         grid.addWidget(QtWidgets.QLabel("NVIDIA GPU"), 1, 0)
@@ -1744,7 +2030,10 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.diag_microphones, 4, 1)
         grid.addWidget(QtWidgets.QLabel("Lexicon"), 5, 0)
         grid.addWidget(self.diag_lexicon, 5, 1)
-        grid.addWidget(run_diag, 6, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Text-to-speech"), 6, 0)
+        grid.addWidget(self.diag_tts, 6, 1)
+        grid.addWidget(run_diag, 7, 0)
+        grid.addWidget(test_tts, 7, 1)
         layout.addWidget(top)
         self.diag_report = QtWidgets.QPlainTextEdit()
         self.diag_report.setReadOnly(True)
@@ -1997,6 +2286,12 @@ class MainWindow(QtWidgets.QMainWindow):
         voice_cfg = self.project_settings.get("voice", {})
         self.stt.model_lifetime = voice_cfg.get("model_lifetime", getattr(self.stt, "model_lifetime", "isolated_release"))
         self.stt.isolated = self._voice_isolated_from_config(voice_cfg)
+        self.tts.enabled = bool(voice_cfg.get("reply_enabled", getattr(self.tts, "enabled", False)))
+        self.tts.backend = voice_cfg.get("tts_backend", getattr(self.tts, "backend", "system"))
+        self.tts.rate = int(voice_cfg.get("tts_rate", getattr(self.tts, "rate", 180)))
+        self.tts.volume = float(voice_cfg.get("tts_volume", getattr(self.tts, "volume", 0.85)))
+        self.tts.voice_name = voice_cfg.get("tts_voice_name", getattr(self.tts, "voice_name", ""))
+        self.tts.max_chars = int(voice_cfg.get("tts_max_chars", getattr(self.tts, "max_chars", 240)))
         if hasattr(self, "global_editor"):
             self.global_editor.set_rows(self._global_registry_rows())
         if hasattr(self, "blacs_editor"):
@@ -2028,8 +2323,22 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled = bool(self.project_settings.get("knowledge_context_enabled", True))
             self.knowledge_command_enabled.setChecked(enabled)
             self.knowledge_protocol_enabled.setChecked(enabled)
+        if hasattr(self, "base_url") and hasattr(self, "model"):
+            ai_cfg = self.project_settings.get("ai", {}) or {}
+            self.base_url.setText(str(ai_cfg.get("base_url", "https://api.deepseek.com")))
+            self.model.setText(str(ai_cfg.get("model", "deepseek-v4-flash")))
+            self._populate_ai_fields_from_runtime()
+            self.apply_ai_settings(log=False)
         if hasattr(self, "voice_lifetime"):
             self.voice_lifetime.setCurrentIndex(max(0, self.voice_lifetime.findData(self.stt.model_lifetime)))
+        if hasattr(self, "voice_input_enabled"):
+            self.voice_input_enabled.setChecked(bool(voice_cfg.get("input_enabled", True)))
+            self.apply_voice_input_enabled()
+        if hasattr(self, "voice_reply_enabled"):
+            self.voice_reply_enabled.setChecked(bool(voice_cfg.get("reply_enabled", False)))
+            self.tts_rate.setValue(int(voice_cfg.get("tts_rate", 180)))
+            self.tts_volume.setValue(int(float(voice_cfg.get("tts_volume", 0.85)) * 100))
+            self.update_speaker_status()
         self.log("Runtime configuration reloaded.")
         self._update_inspector()
 
@@ -2206,16 +2515,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _llm_status_dict_for_ui(self):
         """Return current LLM status without exposing the full key."""
-        client = getattr(self, "llm", None)
-        if client is None:
-            client = LLMClient(mock=False)
-            self.llm = client
-        else:
-            try:
-                # After the no-mock patch, force any stale UI-created client into real mode.
-                client.mock = False
-            except Exception:
-                pass
+        client = self._make_llm_client()
+        self.llm = client
 
         if hasattr(client, "status"):
             status = dict(client.status())
@@ -2267,8 +2568,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     "border-radius: 5px; background: #fff3e0; color: #e65100; font-weight: 700; }"
                 )
             else:
-                one_line = "LLM API: MISSING KEY | set DEEPSEEK_API_KEY or OPENAI_API_KEY"
-                detail = "Missing API key. Set DEEPSEEK_API_KEY or OPENAI_API_KEY, then restart PowerShell / VS Code / LabPilot AI."
+                one_line = "LLM API: MISSING KEY | paste key in UI or set env"
+                detail = (
+                    "Missing API key. Paste a DeepSeek/OpenAI-compatible key in the Command page "
+                    "and click Apply API settings, or set DEEPSEEK_API_KEY / OPENAI_API_KEY."
+                )
                 style = (
                     "QLabel { padding: 5px 10px; border: 1px solid #b71c1c; "
                     "border-radius: 5px; background: #ffebee; color: #b71c1c; font-weight: 700; }"
@@ -2307,6 +2611,153 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "log_text"):
             self.log_text.appendPlainText(str(msg))
         print(msg)
+
+    def _voice_config(self):
+        settings = dict(self.project_settings or {})
+        voice = dict(settings.get("voice", {}) or {})
+        settings["voice"] = voice
+        return settings, voice
+
+    def _save_voice_config(self, **values):
+        settings, voice = self._voice_config()
+        voice.update(values)
+        self.project_settings = settings
+        try:
+            self.settings.save_project_settings(settings)
+        except Exception as exc:
+            self.log(f"Could not save voice settings: {exc}")
+
+    def _start_speech_worker(self):
+        if self.speech_thread and self.speech_thread.isRunning():
+            return
+        self.speech_thread = QtCore.QThread(self)
+        self.speech_worker = SpeechWorker(self.tts)
+        self.speech_worker.moveToThread(self.speech_thread)
+        self.speech_thread.started.connect(self.speech_worker.run)
+        self.speech_worker.failed.connect(self.on_speech_failed)
+        self.speech_worker.status.connect(self.on_speech_status)
+        self.speech_worker.stopped.connect(self.speech_thread.quit)
+        self.speech_worker.stopped.connect(self.speech_worker.deleteLater)
+        self.speech_thread.finished.connect(self.speech_thread.deleteLater)
+        self.speech_thread.finished.connect(self._clear_speech_worker)
+        self.speech_thread.start()
+
+    def _clear_speech_worker(self):
+        self.speech_thread = None
+        self.speech_worker = None
+
+    def on_speech_status(self, message):
+        if hasattr(self, "speaker_status_label"):
+            self.speaker_status_label.setText(str(message or "Speaker ready"))
+            self.speaker_status_label.setObjectName("StatusLightOk")
+            self.speaker_status_label.style().unpolish(self.speaker_status_label)
+            self.speaker_status_label.style().polish(self.speaker_status_label)
+
+    def on_speech_failed(self, message):
+        if hasattr(self, "speaker_status_label"):
+            self.speaker_status_label.setText("Speaker unavailable")
+            self.speaker_status_label.setObjectName("StatusLightBad")
+            self.speaker_status_label.style().unpolish(self.speaker_status_label)
+            self.speaker_status_label.style().polish(self.speaker_status_label)
+        self._show_error("Text-to-speech failed", RuntimeError(message), modal=False)
+
+    def voice_input_is_enabled(self):
+        if hasattr(self, "voice_input_enabled"):
+            return self.voice_input_enabled.isChecked()
+        return bool(self.project_settings.get("voice", {}).get("input_enabled", True))
+
+    def apply_voice_input_enabled(self):
+        enabled = self.voice_input_is_enabled()
+        for attr in ("voice_toggle_button", "voice_standby", "transcribe_audio_button"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+        if not enabled and self.voice_recording:
+            self.stop_voice_recording()
+        if not enabled and self.wake_worker:
+            self.stop_wake_standby()
+        if hasattr(self, "voice_status") and not enabled:
+            self.voice_status.setText("Voice input disabled.")
+
+    def on_voice_input_enabled_changed(self, checked):
+        self._save_voice_config(input_enabled=bool(checked))
+        self.apply_voice_input_enabled()
+        self.log(f"voice input enabled: {bool(checked)}")
+
+    def apply_tts_settings(self, *args):
+        enabled = bool(self.voice_reply_enabled.isChecked()) if hasattr(self, "voice_reply_enabled") else bool(self.project_settings.get("voice", {}).get("reply_enabled", False))
+        rate = int(self.tts_rate.value()) if hasattr(self, "tts_rate") else int(self.project_settings.get("voice", {}).get("tts_rate", 180))
+        volume = (float(self.tts_volume.value()) / 100.0) if hasattr(self, "tts_volume") else float(self.project_settings.get("voice", {}).get("tts_volume", 0.85))
+        self.tts.enabled = enabled
+        self.tts.rate = rate
+        self.tts.volume = volume
+        self.tts.max_chars = int(self.project_settings.get("voice", {}).get("tts_max_chars", getattr(self.tts, "max_chars", 240)))
+        self._save_voice_config(reply_enabled=enabled, tts_rate=rate, tts_volume=volume)
+        self.update_speaker_status()
+
+    def on_voice_reply_enabled_changed(self, checked):
+        self.apply_tts_settings()
+        if checked:
+            self.speak_event("reply_enabled", "语音回复已开启。", priority=True)
+        else:
+            self.stop_speaking()
+        self.log(f"spoken replies enabled: {bool(checked)}")
+
+    def update_speaker_status(self):
+        if not hasattr(self, "speaker_status_label"):
+            return
+        if not self.tts.enabled:
+            text, obj = "Speaker off", "StatusLightWarn"
+        elif self.tts.available():
+            text, obj = "Speaker ready", "StatusLightOk"
+        else:
+            text, obj = "Speaker unavailable", "StatusLightBad"
+        self.speaker_status_label.setText(text)
+        self.speaker_status_label.setObjectName(obj)
+        self.speaker_status_label.style().unpolish(self.speaker_status_label)
+        self.speaker_status_label.style().polish(self.speaker_status_label)
+
+    def speak_event(self, event, text, priority=False):
+        voice_cfg = self.project_settings.get("voice", {}) or {}
+        event_flags = {
+            "wake": "reply_on_wake",
+            "before_parse": "reply_before_parse",
+            "before_execute": "reply_before_execute",
+            "after_execute": "reply_after_execute",
+            "error": "reply_on_error",
+        }
+        flag = event_flags.get(str(event or ""))
+        if flag and not bool(voice_cfg.get(flag, True)):
+            return False
+        if not self.tts.enabled:
+            return False
+        if self.voice_recording and event not in {"recording_start", "recording_stop"}:
+            self.log(f"Skipped spoken reply during active recording: {event}")
+            return False
+        if not self.tts.available():
+            self.update_speaker_status()
+            return False
+        if self.speech_worker is None:
+            self._start_speech_worker()
+        if self.speech_worker is not None:
+            self.speech_worker.enqueue(text, priority=priority)
+            return True
+        return False
+
+    def test_speaker(self):
+        self.apply_tts_settings()
+        if not self.tts.enabled:
+            self.voice_reply_enabled.setChecked(True)
+            self.apply_tts_settings()
+        if not self.speak_event("test", "LabPilot AI 语音回复测试。", priority=True):
+            self._show_error("Text-to-speech unavailable", RuntimeError("Speaker is disabled or unavailable."), modal=False)
+
+    def stop_speaking(self):
+        if self.speech_worker is not None:
+            self.speech_worker.clear()
+        self.tts.stop()
+        self.update_speaker_status()
+        self.log("Speech output stopped.")
 
     def apply_voice_profile(self, *args):
         profile = self.voice_profile.currentData() if hasattr(self, "voice_profile") else "balanced"
@@ -2367,6 +2818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         report = run_voice_diagnostics(voice_cfg)
         self.voice_diagnostic_report = report
         payload = report.to_dict()
+        payload["text_to_speech"] = self.tts.status()
         if hasattr(self, "diag_report"):
             self.diag_report.setPlainText(dumps(payload, indent=2))
             self.diag_sounddevice.setText("OK" if report.sounddevice else "missing")
@@ -2376,7 +2828,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.diag_microphones.setText(str(report.microphone_count))
             self.diag_gpu.setText(report.gpu_name if report.gpu_available else "not detected")
             self.diag_gpu.setObjectName("StatusLightOk" if report.gpu_available else "StatusLightWarn")
-            for label in [self.diag_sounddevice, self.diag_faster_whisper, self.diag_gpu]:
+            self.diag_tts.setText("OK" if self.tts.available() else "missing")
+            self.diag_tts.setObjectName("StatusLightOk" if self.tts.available() else "StatusLightWarn")
+            for label in [self.diag_sounddevice, self.diag_faster_whisper, self.diag_gpu, self.diag_tts]:
                 label.style().unpolish(label)
                 label.style().polish(label)
         if hasattr(self, "voice_status"):
@@ -2394,12 +2848,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blacs = BlacsManualClient(mock=False)
         self.log("BLACS mode: localhost bridge")
     def transcribe_audio_file(self):
+        if not self.voice_input_is_enabled():
+            self.voice_status.setText("Voice input is disabled.")
+            return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose audio file", "", "Audio files (*.wav *.mp3 *.m4a *.flac);;All files (*.*)")
         if not path:
             return
+        self.speak_event("recording_stop", "正在转写音频文件。")
         self.start_transcription(path)
 
     def toggle_voice_recording(self, checked=False):
+        if not self.voice_input_is_enabled():
+            self.voice_toggle_button.setChecked(False)
+            self.voice_status.setText("Voice input is disabled.")
+            return
         if self.voice_recording:
             self.stop_voice_recording()
         else:
@@ -2407,6 +2869,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def start_voice_recording(self):
         try:
+            self.speak_event("recording_start", "开始录音。", priority=True)
             self.voice_recorder.start()
             self.voice_recording = True
             self.voice_toggle_button.setChecked(True)
@@ -2433,6 +2896,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.voice_status.setText(f"Recorded audio: {path}")
                 self.log(f"Voice recording saved: {path}, stats={stats}")
+            self.speak_event("recording_stop", "录音结束，正在转写。", priority=True)
             self.start_transcription(path)
         except Exception as exc:
             self.voice_recording = False
@@ -2464,6 +2928,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mic_signal_label.style().polish(self.mic_signal_label)
 
     def start_transcription(self, audio_path, strip_wake_name_value=None):
+        if not self.voice_input_is_enabled():
+            self.voice_status.setText("Voice input is disabled.")
+            return
         if not self.stt.available():
             self._show_error(
                 "Speech-to-text unavailable",
@@ -2500,6 +2967,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.command_text.setPlainText((current + "\n" + corrected).strip())
         self.voice_status.setText("Transcription corrected and added to command box.")
         self.log(f"Audio transcription added from {audio_path}: raw={text} corrected={corrected}")
+        self.speak_event("transcription_finished", "已识别指令。")
         action = self.voice_after_transcribe.currentData()
         if action == "parse":
             self.parse_command(allow_auto=False)
@@ -2510,6 +2978,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_transcription_failed(self, message):
         self.voice_status.setText("Transcription failed.")
+        self.speak_event("error", "语音识别失败。", priority=True)
         self._show_error("Speech-to-text failed", RuntimeError(message))
 
     def toggle_wake_standby(self):
@@ -2519,6 +2988,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_wake_standby()
 
     def start_wake_standby(self):
+        if not self.voice_input_is_enabled():
+            self.voice_standby.blockSignals(True)
+            self.voice_standby.setChecked(False)
+            self.voice_standby.blockSignals(False)
+            self.voice_status.setText("Voice input is disabled.")
+            return
         if self.wake_thread and self.wake_thread.isRunning():
             return
         if not self.stt.available():
@@ -2554,7 +3029,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wake_worker = WakeStandbyWorker(self.stt, config)
         self.wake_worker.moveToThread(self.wake_thread)
         self.wake_thread.started.connect(self.wake_worker.run)
-        self.wake_worker.status.connect(self.voice_status.setText)
+        self.wake_worker.status.connect(self.on_wake_status)
         self.wake_worker.level.connect(self.set_mic_level)
         self.wake_worker.command_audio_ready.connect(
             lambda path, wake_name: self.start_transcription(path, strip_wake_name_value=wake_name)
@@ -2572,6 +3047,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.wake_worker:
             self.wake_worker.stop()
         self.voice_status.setText("Wake standby stopping...")
+
+    def on_wake_status(self, message):
+        text = str(message or "")
+        self.voice_status.setText(text)
+        if "Wake word accepted" in text:
+            self.speak_event("wake", "你好，我在听，请说实验指令。", priority=True)
 
     def _on_wake_standby_stopped(self):
         self.voice_standby.blockSignals(True)
@@ -2595,13 +3076,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def parse_command(self, allow_auto=True):
         user_text = ""
         try:
-            client = LLMClient(
-                api_key=self.api_key.text().strip(),
-                base_url=self.base_url.text().strip(),
-                model=self.model.text().strip(),
-                mock=False,
-            )
+            client = self._make_llm_client()
             user_text = self.command_text.toPlainText()
+            self.speak_event("before_parse", "正在解析指令并进行安全检查。")
             project_context = self.project_context_for_query(user_text, purpose="command")
             command = client.parse_command(
                 user_text,
@@ -2610,12 +3087,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.lyse_registry,
                 project_context=project_context,
             )
+            command = self._correct_blacs_actions_from_user_text(command, user_text)
             safe = self.validator.validate_command(command)
             self.last_command, self.last_safe = command, safe
             self.json_view.setPlainText("AI JSON:\n" + dumps(command, indent=2) + "\n\nSAFE:\n" + dumps(safe, indent=2))
             self._fill_actions(safe)
             self.record_command_event("parse_ok", user_text, {"command": command, "safe": safe, "project_context": self.last_project_context})
             self.log("Parse OK")
+            self.speak_event("parse_ok", summarize_safe_actions(safe, max_chars=self.tts.max_chars))
             if hasattr(self, "clear_after_parse") and self.clear_after_parse.isChecked():
                 self.command_text.clear()
             if allow_auto and self.auto_run.isChecked():
@@ -2624,13 +3103,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.execute_last(force_run=False)
         except Exception as exc:
             self.record_command_event("parse_failed", user_text, {"error": str(exc)})
+            self.speak_event("error", "指令解析或安全检查失败。", priority=True)
             self._show_error("Parse/safety failed", exc)
+
+    def _correct_blacs_actions_from_user_text(self, command, user_text):
+        """Prefer explicit channel names from the user's text over a wrong LLM channel guess."""
+        actions = list((command or {}).get("actions", []) or [])
+        if not actions or not self.blacs_registry:
+            return command
+        text = str(user_text or "").lower()
+        norm_text = SafetyValidator._norm_name(user_text or "")
+        matches = []
+        for registered, rule in self.blacs_registry.items():
+            candidates = [registered, rule.get("bridge_name", ""), rule.get("channel", "")]
+            if rule.get("device") and rule.get("channel"):
+                candidates.append(f"{rule.get('device')}.{rule.get('channel')}")
+            candidates.extend(rule.get("aliases", []) or [])
+            for candidate in candidates:
+                candidate_text = str(candidate or "").strip()
+                if len(candidate_text) < 3:
+                    continue
+                candidate_norm = SafetyValidator._norm_name(candidate_text)
+                if not candidate_norm:
+                    continue
+                if candidate_text.lower() in text or candidate_norm in norm_text:
+                    matches.append((len(candidate_norm), registered, candidate_text))
+        if not matches:
+            return command
+        matches.sort(reverse=True)
+        best_name = matches[0][1]
+        blacs_actions = [action for action in actions if isinstance(action, dict) and action.get("type") == "set_blacs_manual"]
+        if len(blacs_actions) == 1 and blacs_actions[0].get("name") != best_name:
+            old_name = blacs_actions[0].get("name")
+            blacs_actions[0]["name"] = best_name
+            self.log(f"Corrected BLACS action name from user text: {old_name!r} -> {best_name!r}")
+        return command
 
     def dry_run_preview(self):
         self.parse_command(allow_auto=False)
         if self.last_safe:
             self.json_view.appendPlainText("\n\nDRY-RUN PREVIEW:\n" + dumps(self.last_safe, indent=2))
             self.log("Dry-run preview generated; no hardware action was executed.")
+            self.speak_event("dry_run", "这是 dry-run 预览，不会控制硬件。")
 
     def show_retrieved_context(self):
         context = self.last_project_context or self.project_context_for_query(self.command_text.toPlainText(), purpose="command")
@@ -2666,18 +3180,35 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.dry_run.isChecked():
                 self.log("Dry run: not executing. " + dumps(safe))
                 self.record_command_event("dry_run", payload={"safe": safe, "force_run": force_run})
+                self.speak_event("dry_run", "这是 dry-run 模式，不会控制硬件。")
                 return
+            self.speak_event("before_execute", summarize_safe_actions(safe, max_chars=self.tts.max_chars), priority=True)
             if safe.get("confirmations") and not self._confirm_high_risk(safe["confirmations"]):
                 self.log("Execution cancelled by user.")
                 self.record_command_event("cancelled", payload={"safe": safe, "force_run": force_run})
+                self.speak_event("after_execute", "执行已取消。", priority=True)
                 return
             if safe.get("globals"):
-                diff = self.rm.preview_diff(safe["globals"])
-                self.log("runmanager diff: " + dumps(diff))
-                self.rm.set_globals(safe["globals"])
-                self.log("set_globals OK: " + dumps(safe["globals"]))
+                report = self.write_runmanager_safe_globals(safe["globals"])
+                self.log(report.summary())
+                if report.missing:
+                    raise RuntimeError(
+                        "Some runmanager globals were not found in active remote globals or the configured H5: "
+                        + ", ".join(sorted(report.missing))
+                    )
             for name, value in safe.get("blacs_manual", {}).items():
-                result = self.blacs.set_manual(name, value, program=self.blacs_program.isChecked())
+                rule = self.blacs_registry.get(name, {})
+                result = self.blacs.set_manual(
+                    name,
+                    value,
+                    program=self.blacs_program.isChecked(),
+                    bridge_name=rule.get("bridge_name", ""),
+                    device=rule.get("device", ""),
+                    channel=rule.get("channel", ""),
+                    unit=rule.get("unit", ""),
+                    aliases=rule.get("aliases", []),
+                )
+                self._update_blacs_table_value(name, value, result=result)
                 self.log("BLACS set_manual OK: " + dumps(result))
             for item in safe.get("load_h5", []):
                 self.h5_folder.setText(item["path"])
@@ -2726,8 +3257,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.log("engage OK")
             self.refresh_globals()
             self.record_command_event("execute_ok", payload={"safe": safe, "force_run": force_run, "engage": engage})
+            self.speak_event("after_execute", "已提交 shot。" if engage else "执行完成。", priority=True)
         except Exception as exc:
             self.record_command_event("execute_failed", payload={"safe": safe, "force_run": force_run, "error": str(exc)})
+            self.speak_event("error", "执行失败，已记录错误。", priority=True)
             self._show_error("Execute failed", exc)
 
     def _confirm_high_risk(self, confirmations):
@@ -2746,17 +3279,188 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = self.rm.connect()
             self.log(msg)
             self.statusBar().showMessage(str(msg))
+            self.detect_directory_from_labscript_apps(silent=True)
         except Exception as exc:
             self._show_error("runmanager failed", exc)
 
     def refresh_globals(self):
+        remote_error = None
+        fallback_error = None
+        source = "runmanager remote"
         try:
-            g = self.rm.get_globals()
+            try:
+                g = self.rm.get_globals() or {}
+            except Exception as exc:
+                remote_error = exc
+                g = {}
+
+            if not g:
+                try:
+                    snapshot = self._read_runmanager_globals_h5_snapshot()
+                except Exception as exc:
+                    fallback_error = exc
+                    snapshot = None
+                if snapshot and snapshot.values:
+                    g = snapshot.values
+                    source = f"H5 fallback: {snapshot.path}"
+                    self._merge_global_registry_from_h5(snapshot)
+                elif remote_error is not None:
+                    details = f"runmanager remote failed: {remote_error}"
+                    if fallback_error is not None:
+                        details += f"\nH5 fallback failed: {fallback_error}"
+                    raise RuntimeError(details) from remote_error
+                elif fallback_error is not None:
+                    raise RuntimeError(f"runmanager returned 0 globals and H5 fallback failed: {fallback_error}") from fallback_error
+
             self._fill_globals(g)
             self.update_runmanager_shot_preview(silent=True)
-            self.log(f"globals loaded: {len(g)}")
+            self.log(f"globals loaded from {source}: {len(g)}")
         except Exception as exc:
             self._show_error("refresh globals failed", exc, modal=False)
+
+    def write_runmanager_safe_globals(self, values):
+        cfg = (self.project_settings.get("runmanager", {}) or {}) if hasattr(self, "project_settings") else {}
+        direct_h5 = bool(cfg.get("direct_h5_write", True))
+        group = str(cfg.get("direct_h5_group", "") or "")
+        h5_path = self._configured_runmanager_globals_h5_path()
+        report = write_runmanager_globals(
+            self.rm,
+            values,
+            globals_h5_path=h5_path if h5_path else None,
+            direct_h5_write=direct_h5,
+            h5_group=group,
+        )
+        if report.remote_written:
+            self.log("runmanager remote write OK: " + dumps(report.remote_written))
+        if report.h5_written:
+            self.log("runmanager H5 direct-write OK: " + dumps(report.h5_written))
+            self.refresh_globals_from_h5(silent=True)
+        if report.remote_error:
+            self.log(f"runmanager remote write/read warning: {report.remote_error}")
+        self.update_runmanager_write_status()
+        return report
+
+    def _configured_runmanager_globals_h5_path(self):
+        path_text = (self.project_settings or {}).get("runmanager_globals_path", "")
+        if not path_text:
+            return None
+        path = self._project_path(path_text)
+        return path if path.exists() else None
+
+    def check_runmanager_active_globals(self):
+        remote_count = None
+        h5_count = None
+        messages = []
+        try:
+            remote = self.rm.get_globals() or {}
+            remote_count = len(remote)
+            messages.append(f"remote active globals: {remote_count}")
+        except Exception as exc:
+            messages.append(f"remote active globals unavailable: {exc}")
+        try:
+            snapshot = self._read_runmanager_globals_h5_snapshot()
+            h5_count = len(snapshot.values)
+            messages.append(f"H5 globals: {h5_count} ({snapshot.path})")
+        except Exception as exc:
+            messages.append(f"H5 globals unavailable: {exc}")
+        self.update_runmanager_write_status(remote_count=remote_count, h5_count=h5_count)
+        detail = "\n".join(messages)
+        self.log(detail)
+        self.statusBar().showMessage(detail.replace("\n", " | "), 8000)
+
+    def refresh_globals_from_h5(self, silent=False):
+        try:
+            snapshot = self._read_runmanager_globals_h5_snapshot()
+            self._merge_global_registry_from_h5(snapshot)
+            self._fill_globals(snapshot.values)
+            self.update_runmanager_write_status(h5_count=len(snapshot.values))
+            self.log(f"globals loaded from H5 direct snapshot: {len(snapshot.values)}")
+            if not silent:
+                self.statusBar().showMessage(f"Loaded {len(snapshot.values)} globals from H5.", 8000)
+            return snapshot
+        except Exception as exc:
+            if silent:
+                self.log(f"Refresh globals from H5 failed: {exc}")
+                return None
+            self._show_error("Refresh globals from H5 failed", exc)
+            return None
+
+    def preview_selected_global_write_target(self):
+        row = self.globals_table.currentRow() if hasattr(self, "globals_table") else -1
+        if row < 0:
+            self.log("Select a global row before write-target dry-run.")
+            return
+        name_item = self.globals_table.item(row, 0)
+        value_item = self.globals_table.item(row, 1)
+        if not name_item:
+            return
+        name = name_item.text().strip()
+        value = value_item.text().strip() if value_item else ""
+        h5_path = self._configured_runmanager_globals_h5_path()
+        targets = preview_runmanager_write_targets(self.rm, {name: value}, globals_h5_path=h5_path)
+        self.log("runmanager write dry-run target: " + dumps(targets))
+
+    def update_runmanager_write_status(self, remote_count=None, h5_count=None, direct_on=None):
+        if direct_on is None:
+            direct_on = bool((self.project_settings.get("runmanager", {}) or {}).get("direct_h5_write", True))
+        if remote_count is None:
+            try:
+                remote_count = len(self.rm.get_globals() or {})
+            except Exception:
+                remote_count = None
+        if h5_count is None:
+            try:
+                h5_count = len(self._read_runmanager_globals_h5_snapshot().values)
+            except Exception:
+                h5_count = None
+        if hasattr(self, "rm_active_globals_label"):
+            self.rm_active_globals_label.setText(f"remote active globals: {remote_count if remote_count is not None else '--'}")
+            self.rm_active_globals_label.setObjectName("StatusLightOk" if remote_count else "StatusLightWarn")
+            self.rm_active_globals_label.style().unpolish(self.rm_active_globals_label)
+            self.rm_active_globals_label.style().polish(self.rm_active_globals_label)
+        if hasattr(self, "rm_h5_globals_label"):
+            self.rm_h5_globals_label.setText(f"H5 globals: {h5_count if h5_count is not None else '--'}")
+            self.rm_h5_globals_label.setObjectName("StatusLightOk" if h5_count else "StatusLightWarn")
+            self.rm_h5_globals_label.style().unpolish(self.rm_h5_globals_label)
+            self.rm_h5_globals_label.style().polish(self.rm_h5_globals_label)
+        if hasattr(self, "rm_h5_write_label"):
+            self.rm_h5_write_label.setText(f"direct H5 write: {'on' if direct_on else 'off'}")
+            self.rm_h5_write_label.setObjectName("StatusLightOk" if direct_on else "StatusLightWarn")
+            self.rm_h5_write_label.style().unpolish(self.rm_h5_write_label)
+            self.rm_h5_write_label.style().polish(self.rm_h5_write_label)
+
+    def _read_runmanager_globals_h5_snapshot(self):
+        path_text = (self.project_settings or {}).get("runmanager_globals_path", "")
+        if not path_text:
+            raise FileNotFoundError("runmanager_globals_path is not configured")
+        return read_runmanager_globals_h5(self._project_path(path_text))
+
+    def _merge_global_registry_from_h5(self, snapshot):
+        merged = registry_from_globals_h5(snapshot, self.global_registry)
+        if merged == self.global_registry:
+            return False
+        before = set(self.global_registry)
+        self.global_registry = merged
+        self.settings.save_global_registry(self.global_registry)
+        self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+        self.voice_lexicon = VoiceLexicon.from_registries(
+            self.global_registry,
+            self.blacs_registry,
+            self.lyse_registry,
+            extra_path=self.settings.path("voice_lexicon.yaml"),
+        )
+        self.stt.initial_prompt = self.voice_lexicon.prompt()
+        if hasattr(self, "global_editor"):
+            self.global_editor.set_rows(self._global_registry_rows())
+        if hasattr(self, "opt_params_table"):
+            self._fill_optimizer_params()
+        if hasattr(self, "project_tree"):
+            self._fill_project_tree()
+        if hasattr(self, "diag_lexicon"):
+            self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+        added = len(set(self.global_registry) - before)
+        self.log(f"Global registry updated from H5 fallback: added {added}, total {len(self.global_registry)}")
+        return True
 
     def update_runmanager_shot_preview(self, silent=True):
         try:
@@ -2810,10 +3514,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def auto_upload_global_from_table_value(self, name, value):
         try:
             action = {"type": "set_global", "name": name, "value": str(value).strip().strip("'\"")}
-            self.last_safe = self.validator.validate_command({"actions": [action]})
-            self._fill_actions(self.last_safe)
-            self.log(f"Auto uploading global: {name} = {action['value']}")
-            self.execute_last(force_run=False)
+            safe = self.validator.validate_command({"actions": [action]})
+            converted = safe["globals"][name]
+            report = self.write_runmanager_safe_globals({name: converted})
+            self.last_safe = safe
+            self._fill_actions(safe)
+            if report.missing:
+                raise RuntimeError(
+                    "Runmanager global was not found in active remote globals or configured H5: "
+                    + ", ".join(sorted(report.missing))
+                )
+            self.log(f"Auto uploaded runmanager global: {name} = {converted!r}; {report.summary()}")
             self.update_runmanager_shot_preview(silent=True)
         except Exception as exc:
             self._show_error(f"Auto upload global failed: {name}", exc)
@@ -2942,6 +3653,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def test_blacs(self):
         try:
             self.log(str(self.blacs.test()))
+            self.detect_directory_from_labscript_apps(silent=True)
         except Exception as exc:
             self._show_error("BLACS bridge failed", exc)
 
@@ -2951,11 +3663,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         name = self.blacs_table.item(row, 0).text()
         value_item = self.blacs_table.item(row, 6)
-        value = value_item.text() if value_item else ""
+        value = value_item.text().strip() if value_item else ""
+        if not value:
+            self.log(f"BLACS write skipped for {name}: target value is empty.")
+            return
         try:
-            safe = self.validator.validate_command({"actions": [{"type": "set_blacs_manual", "name": name, "value": value}]})
-            self.last_safe = safe
-            self.execute_last()
+            self.auto_upload_blacs_from_table_value(name, value, row=row)
         except Exception as exc:
             self._show_error("BLACS validation failed", exc)
 
@@ -2966,10 +3679,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if not name_item or name_item.checkState() != QtCore.Qt.Checked:
                 continue
             value_item = self.blacs_table.item(row, 6)
-            value = value_item.text() if value_item else ""
+            value = value_item.text().strip() if value_item else ""
+            if not value:
+                continue
             actions.append({"type": "set_blacs_manual", "name": name_item.text(), "value": value})
         if not actions:
-            self.log("No checked BLACS channels to apply.")
+            self.log("No checked BLACS channels with non-empty target values to apply.")
             return
         try:
             self.last_safe = self.validator.validate_command({"actions": actions})
@@ -2980,31 +3695,63 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _fill_blacs_registry(self):
         names = sorted(self.blacs_registry.keys())
-        self.blacs_table.setRowCount(len(names))
-        for row, name in enumerate(names):
-            rule = self.blacs_registry[name]
-            vals = [
-                name,
-                rule.get("kind", ""),
-                rule.get("device", ""),
-                rule.get("channel", ""),
-                f"{rule.get('min', '')}..{rule.get('max', '')} {rule.get('unit', '')}",
-                "",
-                "",
-                rule.get("risk", ""),
-            ]
-            for col, val in enumerate(vals):
-                item = QtWidgets.QTableWidgetItem(str(val))
-                if col == 0:
-                    item.setCheckState(QtCore.Qt.Unchecked)
-                self.blacs_table.setItem(row, col, item)
+        self._loading_blacs_table = True
+        self.blacs_table.blockSignals(True)
+        try:
+            self.blacs_table.setRowCount(len(names))
+            for row, name in enumerate(names):
+                rule = self.blacs_registry[name]
+                vals = [
+                    name,
+                    rule.get("kind", ""),
+                    rule.get("device", ""),
+                    rule.get("channel", ""),
+                    f"{rule.get('min', '')}..{rule.get('max', '')} {rule.get('unit', '')}",
+                    rule.get("current_value", rule.get("default", "")),
+                    "",
+                    rule.get("risk", ""),
+                ]
+                for col, val in enumerate(vals):
+                    item = QtWidgets.QTableWidgetItem(str(val))
+                    if col != 6:
+                        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.blacs_table.setItem(row, col, item)
+        finally:
+            self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
 
     def _find_blacs_row(self, name):
+        target = self._resolve_blacs_table_name(name)
         for row in range(self.blacs_table.rowCount()):
             item = self.blacs_table.item(row, 0)
-            if item and item.text() == name:
+            if item and item.text() == target:
                 return row
         return -1
+
+    def _resolve_blacs_table_name(self, name):
+        try:
+            resolved = self.validator.resolve_registry_name(name, self.blacs_registry)
+            if resolved in self.blacs_registry:
+                return resolved
+        except Exception:
+            pass
+        text = str(name or "").strip()
+        norm = SafetyValidator._norm_name(text)
+        for registered, rule in (self.blacs_registry or {}).items():
+            candidates = [
+                registered,
+                rule.get("bridge_name", ""),
+                rule.get("channel", ""),
+                f"{rule.get('device', '')}.{rule.get('channel', '')}" if rule.get("device") and rule.get("channel") else "",
+            ]
+            candidates.extend(rule.get("aliases", []) or [])
+            if any(SafetyValidator._norm_name(candidate) == norm for candidate in candidates if candidate):
+                return registered
+        return text
+
+    def _blacs_rule_for_name(self, name):
+        resolved = self._resolve_blacs_table_name(name)
+        return resolved, dict(self.blacs_registry.get(resolved, {}))
 
     def _format_blacs_range(self, channel):
         unit = channel.get("unit", "")
@@ -3018,28 +3765,93 @@ class MainWindow(QtWidgets.QMainWindow):
         name = str(channel.get("name") or channel.get("channel") or "").strip()
         if not name:
             return
+        name = self._resolve_blacs_table_name(name)
         row = self._find_blacs_row(name)
+        self._loading_blacs_table = True
+        self.blacs_table.blockSignals(True)
         if row < 0:
             row = self.blacs_table.rowCount()
             self.blacs_table.insertRow(row)
-        values = [
-            name,
-            channel.get("kind", "manual"),
-            channel.get("device", ""),
-            channel.get("channel", name),
-            self._format_blacs_range(channel),
-            channel.get("current_value", channel.get("value", "")),
-            channel.get("target_value", ""),
-            channel.get("risk", "unknown"),
-        ]
-        for col, value in enumerate(values):
-            item = self.blacs_table.item(row, col)
-            if item is None:
-                item = QtWidgets.QTableWidgetItem()
-                self.blacs_table.setItem(row, col, item)
-            item.setText(str(value))
-            if col == 0 and item.checkState() == QtCore.Qt.Unchecked:
-                item.setCheckState(QtCore.Qt.Unchecked)
+        try:
+            values = [
+                name,
+                channel.get("kind", "manual"),
+                channel.get("device", ""),
+                channel.get("channel", name),
+                self._format_blacs_range(channel),
+                channel.get("current_value", channel.get("value", "")),
+                channel.get("target_value", ""),
+                channel.get("risk", "unknown"),
+            ]
+            for col, value in enumerate(values):
+                item = self.blacs_table.item(row, col)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem()
+                    self.blacs_table.setItem(row, col, item)
+                item.setText(str(value))
+                if col != 6:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+        finally:
+            self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
+
+    def _on_blacs_table_item_changed(self, item):
+        if getattr(self, "_loading_blacs_table", False):
+            return
+        if item is None or item.column() != 6:
+            return
+        value = item.text().strip()
+        if not value:
+            return
+        row = item.row()
+        name_item = self.blacs_table.item(row, 0)
+        if not name_item:
+            return
+        self.auto_upload_blacs_from_table_value(name_item.text().strip(), value, row=row)
+
+    def auto_upload_blacs_from_table_value(self, name, value, row=None):
+        try:
+            canonical, rule = self._blacs_rule_for_name(name)
+            action = {"type": "set_blacs_manual", "name": canonical, "value": str(value).strip().strip("'\"")}
+            safe = self.validator.validate_command({"actions": [action]})
+            converted = safe["blacs_manual"][canonical]
+            result = self.blacs.set_manual(
+                canonical,
+                converted,
+                program=self.blacs_program.isChecked(),
+                bridge_name=rule.get("bridge_name", ""),
+                device=rule.get("device", ""),
+                channel=rule.get("channel", ""),
+                unit=rule.get("unit", ""),
+                aliases=rule.get("aliases", []),
+            )
+            self.last_safe = safe
+            self._fill_actions(safe)
+            self._update_blacs_table_value(canonical, converted, result=result, row=row)
+            self.log(f"Auto uploaded BLACS manual channel: {canonical} = {converted!r}; result={dumps(result)}")
+        except Exception as exc:
+            self._show_error(f"Auto upload BLACS channel failed: {name}", exc)
+
+    def _update_blacs_table_value(self, name, value, result=None, row=None):
+        if row is None or row < 0:
+            row = self._find_blacs_row(name)
+        if row < 0:
+            return
+        readback = value
+        if isinstance(result, dict):
+            readback = result.get("front_panel_value", result.get("value", value))
+        self._loading_blacs_table = True
+        self.blacs_table.blockSignals(True)
+        try:
+            self.blacs_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(readback)))
+            self.blacs_table.setItem(row, 6, QtWidgets.QTableWidgetItem(""))
+            for col in (5, 6):
+                item = self.blacs_table.item(row, col)
+                if item is not None and col != 6:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+        finally:
+            self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
 
     def discover_blacs_channels(self):
         try:
@@ -3053,6 +3865,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def read_blacs_values(self):
         try:
             values = self.blacs.get_values()
+            self._loading_blacs_table = True
+            self.blacs_table.blockSignals(True)
             for name, payload in values.items():
                 row = self._find_blacs_row(str(name))
                 if row < 0:
@@ -3063,10 +3877,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     value = payload
                 if row >= 0:
-                    self.blacs_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(value)))
+                    item = QtWidgets.QTableWidgetItem(str(value))
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.blacs_table.setItem(row, 5, item)
             self.log(f"BLACS readonly values refreshed for {len(values)} channel(s).")
         except Exception as exc:
             self._show_error("BLACS value readback failed", exc)
+        finally:
+            if hasattr(self, "blacs_table"):
+                self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
 
     def import_selected_blacs_channels(self):
         rows = sorted({index.row() for index in self.blacs_table.selectedIndexes()})
@@ -3105,6 +3925,102 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"Imported {imported} BLACS channel(s) into the local registry draft.")
         else:
             self.log("No valid BLACS channel rows were imported.")
+
+    def parse_connection_table_blacs_actions(self):
+        try:
+            path = self._active_connection_table_text()
+            if not path:
+                raise FileNotFoundError("No active connection_table.py is configured in Directory.")
+            registry, report = discover_blacs_channels_from_connection_table(self._project_path(path))
+            self.last_parsed_blacs_registry = registry
+            for name, rule in registry.items():
+                self._upsert_blacs_channel_row(
+                    {
+                        "name": name,
+                        "kind": rule.get("kind", "manual"),
+                        "device": rule.get("device", ""),
+                        "channel": rule.get("channel", name),
+                        "unit": rule.get("unit", ""),
+                        "min": rule.get("min", ""),
+                        "max": rule.get("max", ""),
+                        "current_value": rule.get("default", ""),
+                        "risk": rule.get("risk", "medium"),
+                    }
+                )
+            self.log(f"Parsed {report.get('count', 0)} BLACS action channel(s) from connection table: {report.get('path')}")
+        except Exception as exc:
+            self._show_error("Parse connection table BLACS actions failed", exc)
+
+    def parse_and_import_blacs_actions(self):
+        """Parse connection_table.py and immediately make the channels AI-addressable."""
+        try:
+            path = self._active_connection_table_text()
+            if not path:
+                raise FileNotFoundError("No active connection_table.py is configured in Directory.")
+            registry, report = discover_blacs_channels_from_connection_table(self._project_path(path))
+            self.last_parsed_blacs_registry = registry
+            self.blacs_registry = merge_blacs_registry_from_connection_table(registry, self.blacs_registry)
+            saved = self.settings.save_blacs_registry(self.blacs_registry)
+            self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_lexicon = VoiceLexicon.from_registries(
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                extra_path=self.settings.path("voice_lexicon.yaml"),
+            )
+            self.stt.initial_prompt = self.voice_lexicon.prompt()
+            self._fill_blacs_registry()
+            if hasattr(self, "diag_lexicon"):
+                self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+            self.log(
+                f"AI parse usable BLACS actions: imported {report.get('count', 0)} channel(s) "
+                f"from {report.get('path')}; registry={saved}"
+            )
+        except Exception as exc:
+            self._show_error("AI parse usable BLACS actions failed", exc)
+
+    def import_parsed_connection_table_blacs_channels(self):
+        try:
+            registry = getattr(self, "last_parsed_blacs_registry", None)
+            if not registry:
+                path = self._active_connection_table_text()
+                if not path:
+                    raise FileNotFoundError("No active connection_table.py is configured in Directory.")
+                registry, _ = discover_blacs_channels_from_connection_table(self._project_path(path))
+            self.blacs_registry = merge_blacs_registry_from_connection_table(registry, self.blacs_registry)
+            saved = self.settings.save_blacs_registry(self.blacs_registry)
+            self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_lexicon = VoiceLexicon.from_registries(
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                extra_path=self.settings.path("voice_lexicon.yaml"),
+            )
+            self.stt.initial_prompt = self.voice_lexicon.prompt()
+            self._fill_blacs_registry()
+            if hasattr(self, "diag_lexicon"):
+                self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+            self.log(f"Imported {len(registry)} parsed BLACS channel(s) into registry: {saved}")
+        except Exception as exc:
+            self._show_error("Import parsed BLACS channels failed", exc)
+
+    def refresh_blacs_registry_from_disk(self):
+        try:
+            self.blacs_registry = self.settings.load_blacs_registry()
+            self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_lexicon = VoiceLexicon.from_registries(
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                extra_path=self.settings.path("voice_lexicon.yaml"),
+            )
+            self.stt.initial_prompt = self.voice_lexicon.prompt()
+            self._fill_blacs_registry()
+            if hasattr(self, "diag_lexicon"):
+                self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+            self.log(f"BLACS registry refreshed: {len(self.blacs_registry)} channel(s).")
+        except Exception as exc:
+            self._show_error("Refresh BLACS registry failed", exc)
 
     def _save_project_setting_value(self, key, value):
         settings = dict(self.project_settings or {})
@@ -4448,12 +5364,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError("Selected sequence or connection table file does not exist.")
             context = self.project_context_for_query(instruction, purpose="co_sequence")
             self.co_sequence_context.setPlainText(context or "No Knowledge snippets retrieved.")
-            client = LLMClient(
-                api_key=self.api_key.text().strip(),
-                base_url=self.base_url.text().strip(),
-                model=self.model.text().strip(),
-                mock=False,
-            )
+            client = self._make_llm_client()
             max_chars = int(self.project_settings.get("co_sequence", {}).get("max_file_chars_for_ai", 60000))
             self.co_sequence_plan = client.propose_co_sequence_patch(
                 instruction,
@@ -4641,7 +5552,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if field["kind"] == "sqlite":
                 path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f"Choose {field['label']}", "", "SQLite database (*.sqlite *.db);;All files (*.*)")
             else:
-                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", "Python files (*.py);;YAML files (*.yaml *.yml);;All files (*.*)")
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", field_file_filter(key, field["label"]))
+        elif field["kind"] == "hdf5":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", field_file_filter(key, field["label"]))
         else:
             path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Choose {field['label']}")
         if path:
@@ -4704,6 +5617,100 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("Directory active files detected.")
         except Exception as exc:
             self._show_error("Directory active file detection failed", exc)
+
+    def detect_directory_from_labscript_apps(self, silent=False):
+        try:
+            values = self.directory_values_from_table() if hasattr(self, "directory_table") else dict(self.project_settings)
+            values, messages = detect_labscript_paths(values, runmanager_backend=getattr(self, "rm", None), project_dir=self.settings.project_dir)
+            self.project_settings.update(values)
+            if hasattr(self, "directory_table"):
+                self._fill_directory_table()
+            if hasattr(self, "h5_folder"):
+                self.h5_folder.setText(str(values.get("h5_output_dir", "")))
+            if hasattr(self, "co_sequence_sequence_path"):
+                self.co_sequence_sequence_path.setText(str(values.get("active_sequence_file", "")))
+            if hasattr(self, "co_sequence_connection_path"):
+                self.co_sequence_connection_path.setText(str(values.get("active_connection_table", "")))
+            detail = "\n".join(messages + ["Detected labscript/runmanager paths and updated the UI."])
+            if hasattr(self, "directory_detail"):
+                self.directory_detail.setPlainText(detail)
+            self.log(detail)
+            if not silent:
+                self.statusBar().showMessage("Detected labscript/runmanager paths.", 8000)
+            return values, messages
+        except Exception as exc:
+            if silent:
+                self.log(f"Labscript path detection failed: {exc}")
+                return {}, [str(exc)]
+            self._show_error("Detect labscript paths failed", exc)
+            return {}, [str(exc)]
+
+    def apply_directory_paths_to_running_apps(self):
+        try:
+            values = default_directory_settings(self.directory_values_from_table(), project_dir=self.settings.project_dir)
+            messages = []
+            sequence = values.get("active_sequence_file") or ""
+            output_dir = values.get("h5_output_dir") or ""
+            globals_h5 = values.get("runmanager_globals_path") or ""
+            connection_table = values.get("active_connection_table") or values.get("connection_table") or ""
+
+            if sequence:
+                seq_path = self._project_path(sequence)
+                if seq_path.suffix.lower() != ".py":
+                    messages.append(f"Skipped runmanager sequence: expected .py, got {seq_path}")
+                elif not seq_path.exists():
+                    messages.append(f"Skipped runmanager sequence: file does not exist: {seq_path}")
+                else:
+                    self.rm.set_labscript_file(str(seq_path))
+                    values["active_sequence_file"] = str(seq_path)
+                    values["sequence_dir"] = str(seq_path.parent)
+                    messages.append(f"Applied runmanager active sequence: {seq_path}")
+
+            if output_dir:
+                out_path = self._project_path(output_dir)
+                out_path.mkdir(parents=True, exist_ok=True)
+                self.rm.set_shot_output_folder(str(out_path))
+                values["h5_output_dir"] = str(out_path)
+                if hasattr(self, "h5_folder"):
+                    self.h5_folder.setText(str(out_path))
+                messages.append(f"Applied runmanager H5 output folder: {out_path}")
+
+            if globals_h5:
+                g_path = self._project_path(globals_h5)
+                if g_path.suffix.lower() not in {".h5", ".hdf5"}:
+                    messages.append(f"Runmanager globals path is not HDF5 and was not applied: {g_path}")
+                else:
+                    messages.append(
+                        "Runmanager globals H5 path saved for display/context. "
+                        "runmanager.remote has no public method to switch the open globals H5; "
+                        "LabPilot changes values through set_globals()."
+                    )
+
+            if connection_table:
+                c_path = self._project_path(connection_table)
+                if c_path.suffix.lower() != ".py":
+                    messages.append(f"Connection table should normally be .py for Co-Sequence: {c_path}")
+                else:
+                    values["active_connection_table"] = str(c_path)
+                    values["connection_table"] = str(c_path)
+                    messages.append(
+                        "Connection table path saved for LabPilot/BLACS context. "
+                        "Changing the live BLACS connection table may require BLACS/labscript reload."
+                    )
+
+            self.project_settings.update(values)
+            saved = self.settings.save_project_settings(self.project_settings)
+            self._fill_directory_table()
+            if hasattr(self, "project_paths_editor"):
+                self.project_paths_editor.set_settings(self.project_settings)
+            self.refresh_co_sequence_paths()
+            detail = "\n".join(messages + [f"Saved Directory settings: {saved}"])
+            if hasattr(self, "directory_detail"):
+                self.directory_detail.setPlainText(detail)
+            self.log(detail)
+            self.statusBar().showMessage("Directory paths applied to supported running apps.", 8000)
+        except Exception as exc:
+            self._show_error("Apply Directory paths failed", exc)
 
     def open_selected_directory_path(self):
         row = self.directory_table.currentRow()
@@ -4840,6 +5847,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if context:
             advice += "\n\nRelated project context:\n" + context[:1400]
         self.log(msg + "\n" + advice)
+        if title != "Text-to-speech failed":
+            self.speak_event("error", f"{title}。请查看 Error Center。", priority=True)
         popups = self.project_settings.get("ui", {}).get("error_popups", True)
         if modal and popups:
             QtWidgets.QMessageBox.critical(self, title, f"{exc}\n\nSuggestions:\n{advice}")
@@ -4878,6 +5887,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         if self.wake_worker:
             self.wake_worker.stop()
+        if self.speech_worker:
+            self.speech_worker.stop()
+        if self.tts:
+            self.tts.release()
         if self.auto_loop_worker:
             self.auto_loop_worker.request_stop()
         event.accept()

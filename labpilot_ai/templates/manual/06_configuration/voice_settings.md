@@ -1,17 +1,27 @@
-# 语音配置
+# Voice Settings
 
-语音配置在 `configs/project_settings.yaml` 的 `voice` 部分。
+Voice settings live in `configs/project_settings.yaml` under the `voice` section. LabPilot separates voice input from spoken replies so an experiment computer never starts speaking unexpectedly.
 
-## 字段说明
+## Recommended Defaults
 
 ```yaml
 voice:
+  input_enabled: true
+  reply_enabled: false
+  reply_on_wake: true
+  reply_before_parse: true
+  reply_before_execute: true
+  reply_after_execute: true
+  reply_on_error: true
+  tts_backend: "system"
+  tts_rate: 180
+  tts_volume: 0.85
+  tts_max_chars: 240
   model_size: "small"
   profile: "balanced"
   device: "cpu"
   compute_type: "int8"
   gpu_compute_type: "float16"
-  gpu_enabled: false
   language: "zh,en"
   isolated_stt: true
   wake_name: "labscript"
@@ -20,54 +30,37 @@ voice:
   silence_seconds: 1.2
 ```
 
-字段含义：
+## Voice Input
 
-- `model_size`：faster-whisper 模型大小。
-- `profile`：UI 预设档位。
-- `device`：`cpu` 或 `cuda`。
-- `compute_type`：CPU 计算类型，推荐 `int8`。
-- `gpu_compute_type`：GPU 计算类型，RTX 3090 推荐 `float16`。
-- `gpu_enabled`：默认是否启用 GPU。
-- `language`：默认 `zh,en`。
-- `isolated_stt`：是否使用独立子进程，推荐开启。
-- `wake_name`：唤醒词。
-- `samplerate`：录音采样率。
-- `silence_threshold`：静音阈值。
-- `silence_seconds`：自动停止前需要持续静音的秒数。
+- `input_enabled`: master switch for recording, audio-file transcription, and wake standby.
+- `wake_name`: standby wake name, default `labscript`.
+- `language`: `zh,en` keeps Chinese and English terms available.
+- `model_lifetime`: use `isolated_release` when stability and GPU memory release are more important than latency.
 
-## CPU 推荐配置
+When voice input is disabled, the UI disables `Start voice recording`, `Transcribe audio file`, and `Standby wake mode`.
 
-```yaml
-voice:
-  model_size: "small"
-  device: "cpu"
-  compute_type: "int8"
-  isolated_stt: true
-```
+## Spoken Replies
 
-## GPU 推荐配置
+- `reply_enabled`: master switch for text-to-speech replies.
+- `reply_on_wake`: greet after standby wake detection.
+- `reply_before_parse`: announce parsing and safety validation.
+- `reply_before_execute`: summarize validated safe actions before execution.
+- `reply_after_execute`: announce completion or shot submission.
+- `reply_on_error`: announce short error categories.
+- `tts_backend`: `system` uses local Windows SAPI through PowerShell; `pyttsx3` can be installed with `labpilot-ai[tts]`.
+- `tts_rate`, `tts_volume`, `tts_max_chars`: control speed, loudness, and maximum spoken text length.
 
-```yaml
-voice:
-  model_size: "small"
-  device: "cuda"
-  gpu_compute_type: "float16"
-  isolated_stt: true
-```
+Spoken replies summarize only local `SafetyValidator` output. They do not read API keys, full tracebacks, long paths, or raw Knowledge snippets.
 
-## 空转写排查
+## UI Controls
 
-如果日志显示：
+The Command page Voice input panel includes:
 
-```text
-raw= corrected=
-```
+- `Enable voice input`
+- `Enable spoken replies`
+- `Test speaker`
+- `Stop speaking`
+- `TTS rate`
+- `TTS volume`
 
-说明 STT 成功返回但没有识别到文字。检查：
-
-- 麦克风 input signal 是否有声音。
-- wav 文件是否真的录到人声。
-- 录音是否太短。
-- 模型是否过小。
-- 环境噪声是否太大。
-- 语言是否选择 Chinese + English auto。
+The Diagnostics page reports whether the speaker backend is available and can run a short speaker test.

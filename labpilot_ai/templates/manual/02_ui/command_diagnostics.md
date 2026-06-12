@@ -42,3 +42,12 @@ Diagnostics 用于定位环境问题，尤其是语音：
 - `STT_EMPTY_TEXT`：录音成功但转写为空，通常是音频太短、音量太低或模型加载失败。
 
 错误建议由 `ai/error_advisor.py` 和 `voice/diagnostics.py` 共同提供。
+
+## Voice input and spoken replies
+
+The Command page Voice input panel has two separate master switches:
+
+- `Enable voice input`: enables manual recording, audio-file transcription, and standby wake mode.
+- `Enable spoken replies`: enables local text-to-speech status replies.
+
+When spoken replies are enabled, LabPilot announces wake greetings, parsing, dry-run status, validated action summaries, execution completion, and short error messages. Spoken replies are generated from local safe action summaries and do not read API keys, full tracebacks, or long Knowledge snippets.

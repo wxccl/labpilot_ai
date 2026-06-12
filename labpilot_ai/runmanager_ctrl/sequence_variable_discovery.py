@@ -9,6 +9,7 @@ sequence file.
 from __future__ import annotations
 
 import ast
+import os
 import builtins
 import keyword
 from dataclasses import dataclass
@@ -186,7 +187,17 @@ def discover_sequence_files(
     candidates: List[Path] = []
 
     def add_path(value: Any) -> None:
-        if value in {None, ""}:
+        if value is None:
+            return
+        if isinstance(value, str):
+            if not value.strip():
+                return
+            value = value.strip()
+        elif not isinstance(value, (Path, os.PathLike)):
+            # Project settings also contain nested sections such as
+            # co_sequence/voice/experiment_log. They are not paths and must not
+            # be tested for set membership, otherwise dict values can raise
+            # "unhashable type: 'dict'".
             return
         path = Path(str(value)).expanduser()
         if not path.is_absolute():

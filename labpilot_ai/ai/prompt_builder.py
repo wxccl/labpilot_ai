@@ -84,6 +84,9 @@ Hard rules:
 - Return strict JSON only. Do not use Markdown or code fences.
 - Every action must use the field name "type"; never use the old field name "action".
 - Only use names that appear in the whitelists above.
+- Route actions by intent: if the user explicitly says BLACS/manual/channel/trigger/switch/AO/DO/DDS, prefer set_blacs_manual with a registered BLACS channel name or alias.
+- If the user says runmanager/global/sequence parameter/scan/shot parameter, prefer set_global with a registered runmanager global.
+- If the same plain-language name could refer to both whitelists, explicit BLACS wording wins over runmanager; explicit global/runmanager wording wins over BLACS.
 - If the user asks for a parameter that is not registered, do not create a set_global/set_blacs_manual action for it; explain in comment that it must be added to the registry first.
 - bool values must be true or false. Accepted user wording includes on/off, enable/disable, 打开/关闭, 是/否, 启用/禁用.
 - Float and int values must be JSON numbers.

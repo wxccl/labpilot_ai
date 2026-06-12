@@ -120,10 +120,59 @@ class BlacsManualClient:
     def set_manual(self, name, value, program=False, **extra):
         if self.mock:
             self.values[name] = value
+            for alias in _manual_name_candidates(name, extra):
+                self.values.setdefault(alias, value)
             return {"mock": True, "ok": True, "name": name, "value": value, "program": program}
+
+        last_error = None
+        attempted = []
+        for candidate in _manual_name_candidates(name, extra):
+            payload = {"name": candidate, "value": value, "program": bool(program)}
+            payload.update(extra)
+            payload["name"] = candidate
+            attempted.append(candidate)
+            try:
+                result = self._post_json("/set_manual", payload, timeout=10)
+            except RuntimeError as exc:
+                last_error = exc
+                if "not found" in str(exc).lower():
+                    continue
+                raise
+            if isinstance(result, dict) and result.get("ok") is False:
+                message = result.get("error") or "BLACS bridge manual write failed"
+                last_error = RuntimeError(message)
+                if "not found" in message.lower():
+                    continue
+                raise last_error
+            if isinstance(result, dict):
+                result.setdefault("attempted_names", attempted)
+                result.setdefault("requested_name", name)
+            return result
+        if last_error is not None:
+            raise RuntimeError(f"{last_error}; attempted BLACS names: {attempted}") from last_error
         payload = {"name": name, "value": value, "program": bool(program)}
         payload.update(extra)
         result = self._post_json("/set_manual", payload, timeout=10)
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(result.get("error") or "BLACS bridge manual write failed")
         return result
+
+
+def _manual_name_candidates(name, extra):
+    candidates = []
+
+    def add(value):
+        text = str(value or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+
+    add(name)
+    add(extra.get("bridge_name"))
+    device = extra.get("device")
+    channel = extra.get("channel")
+    if device and channel:
+        add(f"{device}.{channel}")
+    add(channel)
+    for alias in extra.get("aliases", []) or []:
+        add(alias)
+    return candidates or [str(name)]

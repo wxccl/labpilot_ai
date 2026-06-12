@@ -111,10 +111,13 @@ class SafetyValidator:
                 safe["actions"].append(normalized)
                 self._maybe_require_confirmation(name, self.global_registry, safe)
             elif typ == "set_blacs_manual":
-                name = action.get("name")
+                requested_name = action.get("name")
+                name = self.resolve_registry_name(requested_name, self.blacs_registry)
                 value = action.get("value")
                 safe["blacs_manual"][name] = self.validate_value(name, value, self.blacs_registry)
                 normalized = {"type": typ, "name": name, "value": safe["blacs_manual"][name]}
+                if requested_name != name:
+                    normalized["requested_name"] = requested_name
                 safe["actions"].append(normalized)
                 self._maybe_require_confirmation(name, self.blacs_registry, safe)
             elif typ == "engage":
@@ -198,6 +201,28 @@ class SafetyValidator:
         if typ == "str":
             return str(value)
         raise SafetyError(f"Unknown parameter type {typ!r} for {name!r}")
+
+    def resolve_registry_name(self, name, registry: dict) -> str:
+        text = str(name or "").strip()
+        if text in registry:
+            return text
+        norm = self._norm_name(text)
+        aliases: dict[str, str] = {}
+        for registered, rule in (registry or {}).items():
+            aliases[self._norm_name(registered)] = registered
+            aliases[self._norm_name(str(rule.get("bridge_name", "")))] = registered
+            aliases[self._norm_name(str(rule.get("channel", "")))] = registered
+            device = str(rule.get("device", "")).strip()
+            channel = str(rule.get("channel", "")).strip()
+            if device and channel:
+                aliases[self._norm_name(f"{device}.{channel}")] = registered
+            for alias in rule.get("aliases", []) or []:
+                aliases[self._norm_name(str(alias))] = registered
+        return aliases.get(norm, text)
+
+    @staticmethod
+    def _norm_name(value: str) -> str:
+        return "".join(ch for ch in str(value).lower().replace("_", " ") if ch.isalnum())
 
     def validate_load_h5(self, action: dict) -> dict:
         path = action.get("path") or action.get("folder")

@@ -5,8 +5,10 @@ from labpilot_ai.co_sequence.patch_validator import (
     make_unified_diff,
     validate_patch_plan,
 )
-from labpilot_ai.directory.path_registry import default_directory_settings, validate_directory_settings
+from labpilot_ai.directory.labscript_paths import field_file_filter, read_runmanager_autoload_paths
+from labpilot_ai.directory.path_registry import DIRECTORY_FIELDS, default_directory_settings, validate_directory_settings
 from labpilot_ai.experiment_log.generator import generate_experiment_log, save_experiment_log
+from labpilot_ai.runmanager_ctrl.backend import RunmanagerBackend
 from labpilot_ai.storage.database import LabPilotDatabase
 
 
@@ -70,6 +72,44 @@ def test_directory_defaults_and_validation(tmp_path):
     assert settings["active_sequence_file"].endswith("rabi.py")
     messages = validate_directory_settings(settings, project_dir=tmp_path)
     assert not any(message["level"] == "error" for message in messages)
+
+
+def test_runmanager_globals_path_is_hdf5_and_ini_detection(tmp_path):
+    sequence = tmp_path / "sequence.py"
+    sequence.write_text("start()\nstop(1)\n", encoding="utf-8")
+    globals_h5 = tmp_path / "globals.h5"
+    globals_h5.write_bytes(b"fake")
+    bad_globals = tmp_path / "globals.py"
+    bad_globals.write_text("x = 1\n", encoding="utf-8")
+    ini = tmp_path / "runmanager.ini"
+    ini.write_text(
+        "[runmanager_state]\n"
+        f"h5_files_open = [{str(globals_h5)!r}]\n"
+        "active_groups = []\n"
+        f"groups_open = [({str(globals_h5)!r}, 'default')]\n"
+        f"current_labscript_file = {str(sequence)!r}\n"
+        "shot_output_folder = ''\n",
+        encoding="utf-8",
+    )
+
+    paths, messages = read_runmanager_autoload_paths(ini)
+
+    assert paths["active_sequence_file"] == str(sequence)
+    assert paths["runmanager_globals_path"] == str(globals_h5)
+    assert any("runmanager autoload" in message for message in messages)
+    assert any(item["key"] == "runmanager_globals_path" and item["kind"] == "hdf5" for item in DIRECTORY_FIELDS)
+    assert "*.h5" in field_file_filter("runmanager_globals_path")
+
+    errors = validate_directory_settings({"runmanager_globals_path": str(bad_globals)}, project_dir=tmp_path)
+    assert any(message["level"] == "error" and "Expected extension" in message["message"] for message in errors)
+
+
+def test_runmanager_backend_mock_path_methods():
+    backend = RunmanagerBackend(mock=True)
+    backend.set_labscript_file("E:/lab/sequence.py")
+    backend.set_shot_output_folder("E:/lab/data")
+    assert backend.get_labscript_file() == "E:/lab/sequence.py"
+    assert backend.get_shot_output_folder() == "E:/lab/data"
 
 
 def test_experiment_log_formats_and_database_records(tmp_path):

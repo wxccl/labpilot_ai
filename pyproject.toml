@@ -23,6 +23,7 @@ dependencies = [
 dev = ["pytest", "black", "ruff"]
 fit = ["scipy>=1.9"]
 voice = ["sounddevice", "faster-whisper"]
+tts = ["pyttsx3"]
 opt = ["scikit-optimize", "optuna"]
 docs = ["pypdf"]
 
