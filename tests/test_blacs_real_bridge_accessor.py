@@ -20,6 +20,12 @@ class FakeOutput:
         self._current_value = value
 
 
+class FakeDigitalOutput(FakeOutput):
+    def set_value(self, value, program=True):
+        self.calls.append((value, None, program))
+        self._current_value = bool(value)
+
+
 class FakeTab:
     device_name = "FakeDevice"
     mode = 1
@@ -27,7 +33,7 @@ class FakeTab:
 
     def __init__(self):
         self._AO = {"ao0": FakeOutput(0.1, "BiasAO")}
-        self._DO = {"port0/line0": FakeOutput(False, "ShutterDO", "")}
+        self._DO = {"port0/line0": FakeDigitalOutput(False, "ShutterDO", "")}
         self._DDS = {}
         self._EO = {}
         self._image = {}
@@ -75,3 +81,27 @@ def test_write_manual_enabled():
     result = accessor.set_manual({"name": "FakeDevice.ao0", "value": 0.2, "program": True}, allow_write=True)
     assert result["ok"] is True
     assert result["front_panel_value"] == 0.2
+
+
+def test_write_manual_by_bare_channel():
+    accessor = BLACSAccessor({"experiment_queue": FakeQueue()})
+    result = accessor.set_manual({"name": "port0/line0", "value": True, "unit": "", "program": True}, allow_write=True)
+    assert result["ok"] is True
+    assert result["name"] == "FakeDevice.port0/line0"
+    assert result["front_panel_value"] is True
+
+
+def test_write_manual_name_takes_precedence_over_wrong_device():
+    accessor = BLACSAccessor({"experiment_queue": FakeQueue()})
+    result = accessor.set_manual(
+        {
+            "name": "port0/line0",
+            "device": "WrongDevice",
+            "channel": "port0/line0",
+            "value": True,
+            "program": True,
+        },
+        allow_write=True,
+    )
+    assert result["ok"] is True
+    assert result["name"] == "FakeDevice.port0/line0"

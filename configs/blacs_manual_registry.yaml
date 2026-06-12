@@ -1,1 +1,300 @@
-{}
+bias_voltage:
+  kind: AO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: ao0
+  type: float
+  unit: V
+  risk: low
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.ao0
+  - ao0
+  - bias voltage
+  - bias_voltage
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: -10.0
+  max: 10.0
+  default: 0.0
+camera_trigger:
+  kind: DO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: port0/line2
+  type: bool
+  unit: ''
+  risk: low
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.port0/line2
+  - camera trigger
+  - camera_trigger
+  - port0/line2
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false
+coil_current:
+  kind: AO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: ao1
+  type: float
+  unit: A
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.ao1
+  - ao1
+  - coil current
+  - coil_current
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: -5.0
+  max: 5.0
+  default: 0.0
+gradient_voltage:
+  kind: AO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: ao3
+  type: float
+  unit: V
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.ao3
+  - ao3
+  - gradient voltage
+  - gradient_voltage
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0.0
+  max: 5.0
+  default: 0.0
+mw_power_voltage:
+  kind: AO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: ao2
+  type: float
+  unit: V
+  risk: high
+  require_confirm: true
+  ai_control: false
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.ao2
+  - ao2
+  - mw power voltage
+  - mw_power_voltage
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0.0
+  max: 2.0
+  default: 0.0
+mw_switch:
+  kind: DO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: port0/line1
+  type: bool
+  unit: ''
+  risk: high
+  require_confirm: true
+  ai_control: false
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.port0/line1
+  - mw switch
+  - mw_switch
+  - port0/line1
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false
+probe_intensity_voltage:
+  kind: AO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: ao4
+  type: float
+  unit: V
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.ao4
+  - ao4
+  - probe intensity voltage
+  - probe_intensity_voltage
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0.0
+  max: 5.0
+  default: 0.0
+probe_shutter:
+  kind: DO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: port0/line3
+  type: bool
+  unit: ''
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.port0/line3
+  - port0/line3
+  - probe shutter
+  - probe_shutter
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false
+repump_shutter:
+  kind: DO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: port0/line4
+  type: bool
+  unit: ''
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.port0/line4
+  - port0/line4
+  - repump shutter
+  - repump_shutter
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false
+rf_switch:
+  kind: DO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: port0/line0
+  type: bool
+  unit: ''
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.port0/line0
+  - port0/line0
+  - rf switch
+  - rf_switch
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false
+sg_enable:
+  kind: DO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: port0/line5
+  type: bool
+  unit: ''
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.port0/line5
+  - port0/line5
+  - sg enable
+  - sg_enable
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false
+static_bias:
+  kind: StaticAO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: static_ao0
+  type: float
+  unit: V
+  risk: low
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.static_ao0
+  - static bias
+  - static_ao0
+  - static_bias
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: -10.0
+  max: 10.0
+  default: 0.0
+static_interlock:
+  kind: StaticDO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: static_line1
+  type: bool
+  unit: ''
+  risk: high
+  require_confirm: true
+  ai_control: false
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.static_line1
+  - static interlock
+  - static_interlock
+  - static_line1
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: true
+static_mw_atten:
+  kind: StaticAO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: static_ao1
+  type: float
+  unit: V
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.static_ao1
+  - static mw atten
+  - static_ao1
+  - static_mw_atten
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0.0
+  max: 5.0
+  default: 0.0
+static_shutter:
+  kind: StaticDO
+  backend: blacs_manual
+  device: LabPilotVirtualDevice
+  channel: static_line0
+  type: bool
+  unit: ''
+  risk: medium
+  require_confirm: false
+  ai_control: true
+  description: 'Parsed from connection table: connection_table.py:34'
+  aliases:
+  - LabPilotVirtualDevice.static_line0
+  - static shutter
+  - static_line0
+  - static_shutter
+  source: E:\Labpilot\virtual_real_labscript_project\connection_table.py
+  min: 0
+  max: 1
+  default: false

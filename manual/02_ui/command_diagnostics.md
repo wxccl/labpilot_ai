@@ -51,3 +51,12 @@ The Command page Voice input panel has two separate master switches:
 - `Enable spoken replies`: enables local text-to-speech status replies.
 
 When spoken replies are enabled, LabPilot announces wake greetings, parsing, dry-run status, validated action summaries, execution completion, and short error messages. Spoken replies are generated from local safe action summaries and do not read API keys, full tracebacks, or long Knowledge snippets.
+
+## Auto Write And Shot Submission
+
+LabPilot separates value writes from shot submission:
+
+- `Auto write`: after Parse, execute safe write actions automatically. If the user text explicitly asks to run, submit, engage, or run a shot, LabPilot shows the normal shot confirmation dialog before engaging runmanager.
+- `Auto write and run if requested`: after Parse, execute safe write actions automatically. If the user text explicitly asks to run, submit, engage, or run a shot, LabPilot submits the shot without the extra engage confirmation dialog.
+- If the instruction only sets runmanager globals or BLACS manual/static values, LabPilot writes those values and does not run a shot.
+- If the LLM returns an `engage` action but the original user text did not explicitly request a shot, LabPilot removes that engage action before validation.

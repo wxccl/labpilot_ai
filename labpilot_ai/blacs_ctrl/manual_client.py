@@ -127,9 +127,7 @@ class BlacsManualClient:
         last_error = None
         attempted = []
         for candidate in _manual_name_candidates(name, extra):
-            payload = {"name": candidate, "value": value, "program": bool(program)}
-            payload.update(extra)
-            payload["name"] = candidate
+            payload = _manual_payload_for_candidate(candidate, value, program, extra)
             attempted.append(candidate)
             try:
                 result = self._post_json("/set_manual", payload, timeout=10)
@@ -149,13 +147,29 @@ class BlacsManualClient:
                 result.setdefault("requested_name", name)
             return result
         if last_error is not None:
-            raise RuntimeError(f"{last_error}; attempted BLACS names: {attempted}") from last_error
+            available = self._available_channel_names_for_error()
+            raise RuntimeError(f"{last_error}; attempted BLACS names: {attempted}; available BLACS names: {available}") from last_error
         payload = {"name": name, "value": value, "program": bool(program)}
         payload.update(extra)
         result = self._post_json("/set_manual", payload, timeout=10)
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(result.get("error") or "BLACS bridge manual write failed")
         return result
+
+
+    def _available_channel_names_for_error(self):
+        try:
+            channels = self.discover_channels()
+        except Exception as exc:
+            return f"unavailable ({exc})"
+        names = []
+        for channel in channels:
+            if isinstance(channel, dict):
+                for key in ("name", "labscript_name", "channel"):
+                    value = channel.get(key)
+                    if value and str(value) not in names:
+                        names.append(str(value))
+        return names[:50]
 
 
 def _manual_name_candidates(name, extra):
@@ -167,12 +181,39 @@ def _manual_name_candidates(name, extra):
             candidates.append(text)
 
     add(name)
-    add(extra.get("bridge_name"))
     device = extra.get("device")
     channel = extra.get("channel")
+    if device and name and "." not in str(name):
+        add(f"{device}.{name}")
+    add(extra.get("bridge_name"))
     if device and channel:
         add(f"{device}.{channel}")
     add(channel)
     for alias in extra.get("aliases", []) or []:
         add(alias)
+        if device and alias and "." not in str(alias):
+            add(f"{device}.{alias}")
     return candidates or [str(name)]
+
+
+def _manual_payload_for_candidate(candidate, value, program, extra):
+    payload = {"name": candidate, "value": value, "program": bool(program)}
+    payload.update(extra)
+    payload["name"] = candidate
+    if payload.get("unit") in {None, ""}:
+        payload.pop("unit", None)
+
+    device = str(extra.get("device", "") or "").strip()
+    channel = str(extra.get("channel", "") or "").strip()
+    device_channel = f"{device}.{channel}" if device and channel else ""
+
+    # Older bridge versions prioritise device/channel over name. When trying a
+    # labscript object name such as rf_switch or LabPilotVirtualDevice.rf_switch,
+    # remove the stale connection-string fields so the candidate name is used.
+    if candidate != device_channel:
+        payload.pop("device", None)
+        payload.pop("channel", None)
+        payload.pop("subchannel", None)
+    elif candidate == channel:
+        payload.pop("device", None)
+    return payload

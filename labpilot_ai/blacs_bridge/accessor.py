@@ -354,24 +354,38 @@ class BLACSAccessor:
 
     def _find_ref(self, name: str | None = None, device: str | None = None, channel: str | None = None, subchannel: str | None = None) -> ChannelRef:
         refs = self._channel_refs()
-        norm = str(name or "").strip()
+        norms: list[str] = []
+
+        def add_norm(value: str | None):
+            text = str(value or "").strip()
+            if text and text not in norms:
+                norms.append(text)
+
+        add_norm(name)
         if device and channel:
-            norm = f"{device}.{channel}" + (f".{subchannel}" if subchannel else "")
+            add_norm(f"{device}.{channel}" + (f".{subchannel}" if subchannel else ""))
+        if channel:
+            add_norm(str(channel) + (f".{subchannel}" if subchannel else ""))
+
         aliases: dict[str, ChannelRef] = {}
         for ref in refs:
             aliases[ref.name] = ref
             aliases[ref.name.lower()] = ref
             aliases[f"{ref.device}.{ref.channel}".lower()] = ref
+            aliases[str(ref.channel)] = ref
+            aliases[str(ref.channel).lower()] = ref
             if ref.subchannel:
                 aliases[f"{ref.device}.{ref.channel}.{ref.subchannel}".lower()] = ref
+                aliases[f"{ref.channel}.{ref.subchannel}".lower()] = ref
             if ref.labscript_name:
                 aliases[ref.labscript_name] = ref
                 aliases[ref.labscript_name.lower()] = ref
-        if norm in aliases:
-            return aliases[norm]
-        if norm.lower() in aliases:
-            return aliases[norm.lower()]
-        raise KeyError(f"BLACS manual channel not found: {norm!r}")
+        for norm in norms:
+            if norm in aliases:
+                return aliases[norm]
+            if norm.lower() in aliases:
+                return aliases[norm.lower()]
+        raise KeyError(f"BLACS manual channel not found: {norms[0] if norms else name!r}; available={sorted(aliases)[:30]}")
 
     def set_manual(self, payload: dict[str, Any], *, allow_write: bool = False) -> dict[str, Any]:
         if not allow_write:
@@ -400,27 +414,23 @@ class BLACSAccessor:
 
             value = payload.get("value")
             unit = payload.get("unit")
+            if unit == "":
+                unit = None
             program = bool(payload.get("program", True))
 
             if ref.subchannel:
                 # Prefer editing a DDS sub-output directly if it exists.
                 sub_output = getattr(output, ref.subchannel, None)
                 if sub_output is not None and callable(getattr(sub_output, "set_value", None)):
-                    if unit is not None:
-                        sub_output.set_value(value, unit=unit, program=False)
-                    else:
-                        sub_output.set_value(value, program=False)
+                    self._set_output_value(sub_output, value, unit=unit, program=False)
                     if program:
                         tab.program_device()
                 else:
                     current = dict(getattr(output, "value", {}) or {})
                     current[ref.subchannel] = value
-                    output.set_value(current, program=program)
+                    self._set_output_value(output, current, unit=None, program=program)
             else:
-                if unit is not None:
-                    output.set_value(value, unit=unit, program=program)
-                else:
-                    output.set_value(value, program=program)
+                self._set_output_value(output, value, unit=unit, program=program)
 
             new_values = tab.get_front_panel_values()
             return {
@@ -439,3 +449,25 @@ class BLACSAccessor:
             return self._call_main(write)
         except Exception as exc:
             return {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}
+
+    @staticmethod
+    def _set_output_value(output: Any, value: Any, *, unit: str | None = None, program: bool = True) -> None:
+        """Set a BLACS output value across AO/DO/DDS widget API variants."""
+        try:
+            if unit is not None:
+                output.set_value(value, unit=unit, program=program)
+            else:
+                output.set_value(value, program=program)
+            return
+        except TypeError as exc:
+            text = str(exc)
+            if "unit" not in text and "program" not in text:
+                raise
+
+        try:
+            output.set_value(value, program=program)
+            return
+        except TypeError as exc:
+            if "program" not in str(exc):
+                raise
+        output.set_value(value)

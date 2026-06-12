@@ -1,6 +1,7 @@
 import os
 import json
 import queue
+import re
 import time
 from datetime import date
 from pathlib import Path
@@ -68,6 +69,55 @@ from labpilot_ai.voice.tts_backend import TextToSpeechBackend, summarize_safe_ac
 from labpilot_ai.voice.vad import SilenceDetector, rms
 from labpilot_ai.voice.wake_agent import WakeAgentConfig, contains_wake_name, strip_wake_name
 from labpilot_ai.voice.lexicon import VoiceLexicon
+
+
+NO_SHOT_TOKENS = (
+    "do not run",
+    "don't run",
+    "no run",
+    "not run",
+    "dry run",
+    "preview only",
+    "不运行",
+    "不要运行",
+    "别运行",
+    "不跑",
+    "不要跑",
+    "别跑",
+    "不提交",
+    "不要提交",
+)
+
+
+SHOT_REQUEST_RE = re.compile(
+    r"\b(run|submit|engage)\b|"
+    r"\b(run|submit|engage)\s+(a\s+)?(shot|sequence|experiment)\b|"
+    r"\b(start|execute)\s+(a\s+)?(shot|sequence|experiment)\b",
+    re.IGNORECASE,
+)
+
+
+SHOT_REQUEST_TOKENS = (
+    "运行",
+    "跑一次",
+    "跑实验",
+    "跑时序",
+    "开始实验",
+    "提交shot",
+    "提交 shot",
+    "提交时序",
+    "提交实验",
+    "engage",
+)
+
+
+def user_text_requests_shot(text) -> bool:
+    """Return True only when the user explicitly asks to submit/run a shot."""
+    raw = str(text or "")
+    low = raw.lower()
+    if any(token in low or token in raw for token in NO_SHOT_TOKENS):
+        return False
+    return bool(SHOT_REQUEST_RE.search(raw)) or any(token in raw for token in SHOT_REQUEST_TOKENS)
 
 
 class TranscriptionWorker(QtCore.QObject):
@@ -788,6 +838,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.last_command = None
         self.last_safe = None
+        self.last_user_requested_run = False
         self.h5_df = None
         self.visible_h5_columns = None
         self.fit_results = []
@@ -1250,7 +1301,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dry_run = QtWidgets.QCheckBox("Dry run")
         self.dry_run.setChecked(True)
         self.auto_write = QtWidgets.QCheckBox("Auto write")
-        self.auto_run = QtWidgets.QCheckBox("Auto write and run")
+        self.auto_write.setToolTip(
+            "After Parse, execute safe write actions automatically. If the text explicitly asks to run a shot, show the engage confirmation dialog."
+        )
+        self.auto_run = QtWidgets.QCheckBox("Auto write and run if requested")
+        self.auto_run.setToolTip(
+            "After Parse, execute safe write actions automatically. If the text explicitly asks to run a shot, submit it without the extra engage confirmation dialog."
+        )
         self.clear_after_parse = QtWidgets.QCheckBox("Clear command after Parse")
         grid.addWidget(QtWidgets.QLabel("API key"), 0, 0)
         grid.addWidget(self.api_key, 0, 1, 1, 2)
@@ -2974,7 +3031,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif action == "execute":
             self.parse_command(allow_auto=False)
             if self.last_safe:
-                self.execute_last(force_run=True)
+                self.execute_last(force_run=self.last_user_requested_run, confirm_engage=True)
 
     def on_transcription_failed(self, message):
         self.voice_status.setText("Transcription failed.")
@@ -3088,6 +3145,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 project_context=project_context,
             )
             command = self._correct_blacs_actions_from_user_text(command, user_text)
+            command, run_requested = self._strip_unrequested_engage(command, user_text)
+            self.last_user_requested_run = run_requested
             safe = self.validator.validate_command(command)
             self.last_command, self.last_safe = command, safe
             self.json_view.setPlainText("AI JSON:\n" + dumps(command, indent=2) + "\n\nSAFE:\n" + dumps(safe, indent=2))
@@ -3098,13 +3157,29 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "clear_after_parse") and self.clear_after_parse.isChecked():
                 self.command_text.clear()
             if allow_auto and self.auto_run.isChecked():
-                self.execute_last(force_run=True)
+                self.execute_last(force_run=run_requested, confirm_engage=False)
             elif allow_auto and self.auto_write.isChecked():
-                self.execute_last(force_run=False)
+                self.execute_last(force_run=run_requested, confirm_engage=True)
         except Exception as exc:
             self.record_command_event("parse_failed", user_text, {"error": str(exc)})
             self.speak_event("error", "指令解析或安全检查失败。", priority=True)
             self._show_error("Parse/safety failed", exc)
+
+    def _strip_unrequested_engage(self, command, user_text):
+        run_requested = user_text_requests_shot(user_text)
+        actions = list((command or {}).get("actions", []) or [])
+        if run_requested or not actions:
+            return command, run_requested
+        filtered = [action for action in actions if not (isinstance(action, dict) and action.get("type") == "engage")]
+        if len(filtered) != len(actions):
+            command = dict(command or {})
+            command["actions"] = filtered
+            command["comment"] = (
+                str(command.get("comment", "") or "")
+                + " Engage removed because the user did not explicitly ask to run a shot."
+            ).strip()
+            self.log("Removed unrequested engage action; parameter/static writes will not submit a shot.")
+        return command, run_requested
 
     def _correct_blacs_actions_from_user_text(self, command, user_text):
         """Prefer explicit channel names from the user's text over a wrong LLM channel guess."""
@@ -3170,7 +3245,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setBackground(QtGui.QColor(225, 255, 225))
                 self.actions_table.setItem(row, col, item)
 
-    def execute_last(self, force_run=False):
+    def execute_last(self, force_run=False, confirm_engage=True):
         if not self.last_safe:
             QtWidgets.QMessageBox.warning(self, "No safe command", "Parse a command first.")
             return
@@ -3244,19 +3319,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             if engage:
                 n = self.rm.n_shots()
-                ans = QtWidgets.QMessageBox.question(
-                    self,
-                    "Confirm engage",
-                    f"About to submit shot(s). Estimated n_shots={n}. Continue?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No,
-                )
-                if ans == QtWidgets.QMessageBox.Yes:
+                if confirm_engage:
+                    ans = QtWidgets.QMessageBox.question(
+                        self,
+                        "Confirm engage",
+                        f"About to submit shot(s). Estimated n_shots={n}. Continue?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if ans != QtWidgets.QMessageBox.Yes:
+                        self.log("Engage cancelled by user; write actions were already applied.")
+                        engage = False
+                    else:
+                        self.rm.set_run_shots(True)
+                        self.rm.engage()
+                        self.log("engage OK")
+                else:
                     self.rm.set_run_shots(True)
                     self.rm.engage()
-                    self.log("engage OK")
+                    self.log("engage OK without extra confirmation")
             self.refresh_globals()
-            self.record_command_event("execute_ok", payload={"safe": safe, "force_run": force_run, "engage": engage})
+            self.record_command_event(
+                "execute_ok",
+                payload={"safe": safe, "force_run": force_run, "engage": engage, "confirm_engage": confirm_engage},
+            )
             self.speak_event("after_execute", "已提交 shot。" if engage else "执行完成。", priority=True)
         except Exception as exc:
             self.record_command_event("execute_failed", payload={"safe": safe, "force_run": force_run, "error": str(exc)})

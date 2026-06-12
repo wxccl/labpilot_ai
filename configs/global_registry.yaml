@@ -1,6 +1,3 @@
-# runmanager globals whitelist.
-# Human operators should add variables here before AI can control them.
-
 duration_tof_ms:
   backend: runmanager
   type: float
@@ -10,9 +7,18 @@ duration_tof_ms:
   max_points: 100
   unit: ms
   risk: low
-  aliases: [TOF, tof, 飞行时间, duration tof]
-  description: Time of flight before imaging. User phrases like TOF or 飞行时间 should map here.
-
+  aliases:
+  - TOF
+  - tof
+  - 飞行时间
+  - duration tof
+  description: Time of flight before imaging. User phrases like TOF or 飞行时间 should
+    map here.
+  default: 17.0
+  require_confirm: false
+  ai_control: true
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
 duration_probe_us:
   backend: runmanager
   type: float
@@ -22,9 +28,16 @@ duration_probe_us:
   max_points: 100
   unit: us
   risk: low
-  aliases: [probe time, 探测光时间, 成像光时间]
+  aliases:
+  - probe time
+  - 探测光时间
+  - 成像光时间
   description: Probe pulse duration.
-
+  default: 50.0
+  require_confirm: false
+  ai_control: true
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
 lyse_do_SG_F1_masked:
   backend: runmanager
   type: int
@@ -32,38 +45,693 @@ lyse_do_SG_F1_masked:
   max: 1
   unit: ''
   risk: low
-  aliases: [SG mask, sg mask, masked SG, SG遮罩]
+  aliases:
+  - SG mask
+  - sg mask
+  - masked SG
+  - SG遮罩
   description: Whether lyse uses masked SG F=1 analysis.
-
 lyse_update_centers_json:
   backend: runmanager
   type: bool
   risk: low
-  aliases: [更新中心, update centers, centers json]
+  aliases:
+  - 更新中心
+  - update centers
+  - centers json
   description: Whether lyse updates centers_json.
-
 do_Rabi:
   backend: runmanager
   type: bool
   risk: low
-  aliases: [Rabi, 拉比, Rabi时序]
+  aliases:
+  - Rabi
+  - 拉比
+  - Rabi时序
   description: Enable Rabi sequence branch in labscript.
-
+  unit: Bool
+  default: false
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
 do_pure:
   backend: runmanager
   type: bool
   risk: medium
-  aliases: [pure, pure 0, 清除0态]
+  aliases:
+  - pure
+  - pure 0
+  - 清除0态
   description: Enable pure/cleaning sequence branch in labscript.
-
 MW_power_W:
   backend: runmanager
   type: float
   allow_array: false
   min: 0.0
-  max: 0.20
+  max: 0.2
   unit: W
   risk: high
   require_confirm: true
-  aliases: [微波功率, microwave power, MW power]
+  aliases:
+  - 微波功率
+  - microwave power
+  - MW power
   description: Microwave power. Conservative limit for AI control.
+  default: 0.05
+  ai_control: false
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+MW_idle_power_W:
+  type: float
+  unit: W
+  default: 0.001
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual microwave idle power.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+bias_voltage_V:
+  type: float
+  unit: V
+  default: 0.3
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Initial virtual bias voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+bias_voltage_final_V:
+  type: float
+  unit: V
+  default: 0.5
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Final virtual bias voltage after ramp.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+coil_current_A:
+  type: float
+  unit: A
+  default: 0.1
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual coil current.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+coil_current_sg_A:
+  type: float
+  unit: A
+  default: 0.8
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual SG coil current.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_bias_voltage_connection:
+  type: str
+  unit: ''
+  default: ao0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for bias_voltage AnalogOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_bias_voltage_max_V:
+  type: float
+  unit: V
+  default: 10.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual bias AO upper software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_bias_voltage_min_V:
+  type: float
+  unit: V
+  default: -10.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual bias AO lower software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_camera_trigger_connection:
+  type: str
+  unit: ''
+  default: port0/line2
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Connection string for camera trigger DigitalOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_clockline_connection:
+  type: str
+  unit: ''
+  default: flag 0
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Dummy pseudoclock clockline connection string.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_clockline_name:
+  type: str
+  unit: ''
+  default: dummy_clockline
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: ClockLine name used in the virtual connection table.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_coil_current_connection:
+  type: str
+  unit: ''
+  default: ao1
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for coil_current AnalogOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_coil_current_max_A:
+  type: float
+  unit: A
+  default: 5.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual coil AO upper software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_coil_current_min_A:
+  type: float
+  unit: A
+  default: -5.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual coil AO lower software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_gradient_voltage_connection:
+  type: str
+  unit: ''
+  default: ao4
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for gradient AnalogOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_gradient_voltage_max_V:
+  type: float
+  unit: V
+  default: 10.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual gradient voltage upper software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_gradient_voltage_min_V:
+  type: float
+  unit: V
+  default: -10.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual gradient voltage lower software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_mw_power_voltage_connection:
+  type: str
+  unit: ''
+  default: ao2
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for mw_power_voltage AnalogOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_mw_switch_connection:
+  type: str
+  unit: ''
+  default: port0/line1
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for microwave switch DigitalOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_mw_voltage_max_V:
+  type: float
+  unit: V
+  default: 2.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual microwave voltage upper software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_mw_voltage_min_V:
+  type: float
+  unit: V
+  default: 0.0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual microwave voltage lower software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_probe_intensity_connection:
+  type: str
+  unit: ''
+  default: ao3
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Connection string for probe intensity AnalogOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_probe_shutter_connection:
+  type: str
+  unit: ''
+  default: port0/line3
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for probe shutter DigitalOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_probe_voltage_max_V:
+  type: float
+  unit: V
+  default: 5.0
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual probe voltage upper software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_probe_voltage_min_V:
+  type: float
+  unit: V
+  default: 0.0
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual probe voltage lower software limit.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_pseudoclock_name:
+  type: str
+  unit: ''
+  default: dummy_clock
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Pseudoclock device name used in the virtual connection table.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_repump_shutter_connection:
+  type: str
+  unit: ''
+  default: port0/line4
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for repump shutter DigitalOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_rf_switch_connection:
+  type: str
+  unit: ''
+  default: port0/line0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for RF switch DigitalOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_sg_enable_connection:
+  type: str
+  unit: ''
+  default: port0/line5
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Connection string for SG enable DigitalOut.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_static_bias_connection:
+  type: str
+  unit: ''
+  default: static_ao0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for static bias AO.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_static_interlock_connection:
+  type: str
+  unit: ''
+  default: static_do1
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Connection string for static safety interlock DO.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_static_mw_atten_connection:
+  type: str
+  unit: ''
+  default: static_ao1
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for static microwave attenuator AO.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_static_shutter_connection:
+  type: str
+  unit: ''
+  default: static_do0
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Connection string for static shutter DO.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+ct_virtual_device_name:
+  type: str
+  unit: ''
+  default: virtual_device
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual intermediate device name.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_SG:
+  type: bool
+  unit: Bool
+  default: true
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Enable virtual Stern-Gerlach pulse.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_bias_ramp:
+  type: bool
+  unit: Bool
+  default: true
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Enable virtual bias ramp.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_camera:
+  type: bool
+  unit: Bool
+  default: true
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Enable virtual camera trigger.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_cleanup:
+  type: bool
+  unit: Bool
+  default: true
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Enable cleanup block.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_gradient_pulse:
+  type: bool
+  unit: Bool
+  default: true
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Enable virtual gradient voltage pulse.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_probe_shutter:
+  type: bool
+  unit: Bool
+  default: true
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Enable virtual probe shutter.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+do_repump:
+  type: bool
+  unit: Bool
+  default: true
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Enable virtual repump shutter.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+duration_cleanup_ms:
+  type: float
+  unit: ms
+  default: 1.0
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Cleanup duration at the end of the sequence.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+duration_hold_ms:
+  type: float
+  unit: ms
+  default: 5.0
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual bias hold/ramp duration.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+duration_load_ms:
+  type: float
+  unit: ms
+  default: 2.0
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Initial virtual loading duration.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+duration_rabi_us:
+  type: float
+  unit: us
+  default: 14.0
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual microwave Rabi pulse duration.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+duration_sg_ms:
+  type: float
+  unit: ms
+  default: 3.0
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual Stern-Gerlach pulse duration.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+gradient_voltage_V:
+  type: float
+  unit: V
+  default: 1.2
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual SG gradient voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+probe_intensity_V:
+  type: float
+  unit: V
+  default: 1.0
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual probe intensity control voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+probe_intensity_low_V:
+  type: float
+  unit: V
+  default: 0.15
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Virtual low probe intensity baseline voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+scan_bias_voltage_V:
+  type: str
+  unit: V
+  default: np.linspace(-0.5, 0.5, 5)
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Scan array for bias voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+  expansion: outer
+scan_coil_current_A:
+  type: str
+  unit: A
+  default: np.linspace(0.0, 1.0, 6)
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Scan array for coil current.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+  expansion: outer
+scan_mw_power_W:
+  type: str
+  unit: W
+  default: np.array([0.001, 0.003, 0.010, 0.030])
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Scan array for microwave power.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+  expansion: outer
+scan_probe_intensity_V:
+  type: str
+  unit: V
+  default: np.array([0.2, 0.5, 1.0, 1.5])
+  risk: low
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Scan array for probe intensity voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+  expansion: outer
+scan_tof_ms:
+  type: str
+  unit: ms
+  default: np.linspace(5.0, 25.0, 5)
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Scan array for time of flight.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+  expansion: outer
+static_bias_V:
+  type: float
+  unit: V
+  default: 0.2
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual static bias value for BLACS manual testing.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+static_mw_atten_V:
+  type: float
+  unit: V
+  default: 0.5
+  risk: high
+  require_confirm: true
+  allow_array: false
+  ai_control: false
+  description: Virtual static microwave attenuation/control voltage.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
+trigger_delay_us:
+  type: float
+  unit: us
+  default: 10.0
+  risk: medium
+  require_confirm: false
+  allow_array: false
+  ai_control: true
+  description: Lead time for shutter before camera trigger.
+  source: E:\Labpilot\virtual_real_labscript_project\globals_virtual_lab.h5
+  confidence: high
