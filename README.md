@@ -35,13 +35,23 @@ Directory treats labscript path types explicitly: sequence and connection table 
 
 ## Install
 
-Use the labscript conda environment or another environment that can import the labscript suite:
+Use the existing labscript-suite conda environment, or another environment that can already import the labscript suite:
 
 ```powershell
 conda activate labscript
 cd E:\Labpilot\labpilot_ai
 pip install -e .
 ```
+
+LabPilot AI intentionally does not install or upgrade `labscript-suite`, `runmanager`, `blacs`, or `lyse` by default. This avoids pip changing a working labscript-suite environment. The core dependency ranges are deliberately broad and capped (`PyQt5<6`, `numpy<3`, `pandas<3`, `h5py<4`, `matplotlib<4`) so an existing labscript-suite install can keep its tested versions.
+
+For a brand-new environment only, install labscript-suite first using the labscript-suite documentation, then install LabPilot AI. If you explicitly want pip to install/check the labscript-suite packages as part of LabPilot installation, use the optional extra:
+
+```powershell
+pip install -e ".[labscript]"
+```
+
+Do not use `pip install --upgrade labpilot-ai` on a hardware-control computer unless you have first reviewed the resolver plan. Prefer installing LabPilot into the active labscript environment without upgrading already-working labscript-suite packages.
 
 Optional extras:
 

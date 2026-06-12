@@ -5,6 +5,27 @@ from labpilot_ai.experiment_log.generator import generate_experiment_log
 from labpilot_ai.safety.validator import normalize_bool
 
 
+def test_core_dependencies_do_not_claim_labscript_suite_packages():
+    import sys
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib
+
+    with open("pyproject.toml", "rb") as stream:
+        pyproject = tomllib.load(stream)
+    dependencies = pyproject["project"]["dependencies"]
+    normalized = [item.lower().replace("_", "-") for item in dependencies]
+    blocked_defaults = ["labscript-suite", "labscript ", "runmanager", "blacs", "lyse", "labscript-utils"]
+
+    assert not any(any(dep.startswith(name) for name in blocked_defaults) for dep in normalized)
+    assert any(dep.startswith("numpy") and "<3" in dep for dep in normalized)
+    assert any(dep.startswith("pandas") and "<3" in dep for dep in normalized)
+    assert any(dep.startswith("pyqt5") and "<6" in dep for dep in normalized)
+    assert "labscript" in pyproject["project"]["optional-dependencies"]
+
+
 def test_bool_parsing_supports_clear_english_and_chinese_terms():
     for value in ["true", "on", "enable", "打开", "开启", "启用", "是"]:
         assert normalize_bool(value) is True

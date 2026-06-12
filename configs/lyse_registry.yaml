@@ -3,34 +3,19 @@ single_modules:
     path: E:/Labpilot/labai_test/timeseq/single/lyse_singleshot_molassesFL.py
     mode: lyse_script
     enabled_by_default: false
-    order: 20
+    order: 30
     description: LabAI test single-shot molasses fluorescence analysis.
     params: {}
   example_single:
+    path: E:\Labpilot\labpilot_ai\plugins\single_modules\example_single.py
+    mode: labpilot_module
     enabled_by_default: true
-    order: 10
-  fix_sequence_outputs:
-    path: E:\Labpilot\fix_sequence_outputs.py
-    mode: lyse_script
-    enabled_by_default: false
-    order: 1000
+    order: 40
     description: Added from Lyse page.
     params: {}
 multi_modules:
-  example_multi:
-    path: plugins/multi_modules/example_multi.py
-    mode: labpilot_module
-    enabled_by_default: false
-    order: 10
-    description: Minimal multi-shot analysis example.
-    params: {}
   lyse_multishot_absorbimaging_BEC_analyse:
-    path: E:/Labpilot/labai_test/timeseq/multi/lyse_multishot_absorbimaging_BEC_analyse.py
-    mode: lyse_script
-    enabled_by_default: true
-    order: 20
-    description: LabAI test multi-shot absorption imaging BEC analysis.
-    params: {}
+    enabled_by_default: false
 multi_parameters:
   20260612_175727_plot_scatter_line:
     kind: plot
@@ -68,3 +53,58 @@ multi_parameters:
       x: results.lyse_singleshot_molassesFL.N_total
       y: results.lyse_singleshot_molassesFL.N_total
       z: ''
+  20260612_222932_plot_scatter_line:
+    kind: plot
+    name: scatter_line
+    created_at: '2026-06-12 22:29:32'
+    result:
+      status: ok
+      figure_path: E:\Labpilot\labpilot_ai\labpilot_outputs\figures\scatter_line_1.png
+      plot_type: scatter_line
+      x: results.lyse_singleshot_molassesFL.N_var_1
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: results.lyse_singleshot_molassesFL.N_total
+    metadata:
+      type: plot
+      plot_type: scatter_line
+      x: results.lyse_singleshot_molassesFL.N_var_1
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: ''
+      value: results.lyse_singleshot_molassesFL.N_total
+  20260612_222940_fit_linear:
+    kind: fit
+    name: linear
+    created_at: '2026-06-12 22:29:40'
+    result:
+      model: linear
+      status: ok
+      params:
+        a: -6.650230565905352e-09
+        b: 13703.29089409299
+      r2: 0.00628126142711205
+      figure_path: E:\Labpilot\labpilot_ai\labpilot_outputs\figures\fit_linear_2.png
+    metadata:
+      type: fit
+      model: linear
+      plot_type: scatter_line
+      x: results.lyse_singleshot_molassesFL.N_var_1
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: ''
+  20260612_223006_plot_scatter2d:
+    kind: plot
+    name: scatter2d
+    created_at: '2026-06-12 22:30:06'
+    result:
+      status: ok
+      figure_path: E:\Labpilot\labpilot_ai\labpilot_outputs\figures\scatter2d_3.png
+      plot_type: scatter2d
+      x: results.lyse_singleshot_molassesFL.N_var_1
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: results.lyse_singleshot_molassesFL.N_atom_-1
+    metadata:
+      type: plot
+      plot_type: scatter2d
+      x: results.lyse_singleshot_molassesFL.N_var_1
+      y: results.lyse_singleshot_molassesFL.N_total
+      z: results.lyse_singleshot_molassesFL.N_atom_-1
+      value: results.lyse_singleshot_molassesFL.N_total

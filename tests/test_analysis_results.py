@@ -88,3 +88,25 @@ def test_plotting_functions_coerce_numeric_columns(tmp_path):
     for figure in figures:
         assert figure is not None
     assert (tmp_path / "surface.png").exists()
+
+
+def test_main_window_fit_result_draws_figure(monkeypatch, tmp_path):
+    from matplotlib import pyplot as plt
+
+    from labpilot_ai.app.main_window import MainWindow
+
+    monkeypatch.chdir(tmp_path)
+    window = MainWindow.__new__(MainWindow)
+    window.h5_df = pd.DataFrame({"x": [0, 1, 2, 3], "y": [1, 3, 5, 7]})
+    window.figure_paths = []
+    window.log = lambda *_args, **_kwargs: None
+    window._show_figure = lambda fig, title="", image_path=None: plt.close(fig)
+
+    out_path = MainWindow._draw_fit_result(
+        window,
+        {"model": "linear", "plot_type": "scatter_line", "x": "x", "y": "y"},
+        {"status": "ok", "model": "linear", "params": {"a": 2.0, "b": 1.0}, "r2": 1.0},
+    )
+
+    assert out_path.exists()
+    assert out_path.name.startswith("fit_linear")

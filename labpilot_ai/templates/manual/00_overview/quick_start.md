@@ -1,8 +1,8 @@
-# 快速上手
+# Quick Start
 
-## 安装
+## Recommended Install
 
-在实验用 conda 环境中安装：
+Use the labscript-suite environment that already runs your experiment:
 
 ```powershell
 conda activate labscript
@@ -10,51 +10,58 @@ cd E:\Labpilot\labpilot_ai
 pip install -e .
 ```
 
-启用语音：
+LabPilot AI does not install or upgrade `labscript-suite`, `runmanager`, `blacs`, or `lyse` by default. This is intentional: the experiment-control environment should keep the labscript-suite versions that were already tested with the apparatus.
+
+Optional features can be installed separately:
 
 ```powershell
-pip install -e ".[voice]"
+pip install -e ".[voice]"      # voice input / faster-whisper
+pip install -e ".[tts]"        # local spoken replies
+pip install -e ".[fit,opt]"    # fitting and optimization extras
+pip install -e ".[docs]"       # PDF text import
 ```
 
-启用拟合和优化可选依赖：
+For a brand-new environment only, install labscript-suite first following the official labscript-suite documentation. The optional `.[labscript]` extra is available for explicit dependency checking, but should not be used casually on a working hardware-control computer:
 
 ```powershell
-pip install -e ".[fit,opt]"
+pip install -e ".[labscript]"
 ```
 
-## 启动
+## Launch
 
 ```powershell
 labpilot-ai
 ```
 
-或：
+or:
 
 ```powershell
 python -m labpilot_ai
 ```
 
-## 第一次运行建议
+## First Run
 
-1. 打开软件后进入 `Command` 页面。
-2. 勾选 `Mock LLM`、`Mock runmanager`、`Dry run`。
-3. 输入自然语言命令：
+1. Open `Settings`.
+2. Click `Init/repair project templates`.
+3. Open `Directory` and confirm the active sequence file, connection table, runmanager globals H5, H5 output folder, single lyse folder, and multi lyse folder.
+4. Open `Command`.
+5. Keep `Dry run` enabled for the first parser test.
+6. Enter a safe command, for example:
 
 ```text
-把 TOF 改成 17 ms，不运行
+Set duration_tof_ms to 17 ms, do not run.
 ```
 
-4. 点击 `Parse`，确认动作表里出现 `set_global`。
-5. 检查 diff、风险等级和错误提示。
-6. 取消 `Dry run`，保留 `Mock runmanager`，点击 `Execute`。
-7. 进入真实硬件前，先在 `Runmanager` 页面测试连接和读取 globals。
+7. Click `Parse`.
+8. Confirm the validated action is `set_global`.
+9. Use `Dry-run preview` before executing real hardware changes.
 
-## 最小安全闭环
+## Minimum Safe Hardware Loop
 
-一个真实实验动作至少要满足：
+Before real hardware execution:
 
-- 变量已经登记在 `configs/global_registry.yaml`。
-- 类型、范围、array 点数通过安全层。
-- UI 上能看到旧值和新值 diff。
-- 高风险动作已经人工确认。
-- 第一轮使用低风险变量和小 shot 数。
+- The global or BLACS channel must be registered in the corresponding registry.
+- Type, range, array length, and risk checks must pass.
+- The UI must show a clear old/new value diff.
+- High-risk actions still require human confirmation.
+- Start with a low-risk variable, then one shot, then a small grid scan, then a single BLACS channel.

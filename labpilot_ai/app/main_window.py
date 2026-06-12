@@ -6,6 +6,7 @@ import time
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import yaml
 import pandas as pd
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -16,7 +17,7 @@ from labpilot_ai.ai.llm_client import LLMClient
 from labpilot_ai.ai.protocol_importer import build_protocol_prompt, describe_image_attachment, import_protocol_file
 from labpilot_ai.ai.protocol_designer import draft_protocol_suggestion
 from labpilot_ai.analysis import plotting
-from labpilot_ai.analysis.fit_models import fit_histogram, fit_xy, fit_xyz
+from labpilot_ai.analysis.fit_models import MODEL_FUNCS, double_gaussian2d, fit_histogram, fit_xy, fit_xyz, gaussian2d
 from labpilot_ai.analysis.plot_specs import (
     PLOT_SPECS,
     default_plot_columns,
@@ -76,6 +77,16 @@ from labpilot_ai.voice.tts_backend import TextToSpeechBackend, summarize_safe_ac
 from labpilot_ai.voice.vad import SilenceDetector, rms
 from labpilot_ai.voice.wake_agent import WakeAgentConfig, contains_wake_name, strip_wake_name
 from labpilot_ai.voice.lexicon import VoiceLexicon
+
+
+def configure_table_columns(table, *, stretch_last=True, movable=False):
+    """Use manually resizable table columns across the industrial UI."""
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+    header.setStretchLastSection(bool(stretch_last))
+    header.setSectionsMovable(bool(movable))
+    table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+    table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
 
 
 NO_SHOT_TOKENS = (
@@ -525,7 +536,7 @@ class RegistryEditorWidget(QtWidgets.QWidget):
         split.setHandleWidth(8)
         self.table = QtWidgets.QTableWidget(0, len(self.fields))
         self.table.setHorizontalHeaderLabels(self.fields)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.table)
         self.table.itemSelectionChanged.connect(self.load_selected_row_to_form)
         split.addWidget(self.table)
 
@@ -855,6 +866,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visible_h5_columns = None
         self.fit_results = []
         self.figure_paths = []
+        self.figure_windows = []
         self.analysis_records = []
         self.plot_column_candidates = []
         self.result_store = JsonlResultStore(default_result_store_path())
@@ -1498,7 +1510,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(right)
         self.actions_table = QtWidgets.QTableWidget(0, 4)
         self.actions_table.setHorizontalHeaderLabels(["action", "name/path", "value", "status"])
-        self.actions_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.actions_table)
         self.json_view = QtWidgets.QPlainTextEdit()
         self.json_view.setReadOnly(True)
         right_layout.addWidget(QtWidgets.QLabel("Validated actions"))
@@ -1568,7 +1580,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.globals_table = QtWidgets.QTableWidget(0, 6)
         self.globals_table.setHorizontalHeaderLabels(["name", "value", "type", "unit", "risk", "description"])
-        self.globals_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.globals_table)
         self._loading_globals_table = False
         self._pending_global_edit = None
         self.globals_table.itemChanged.connect(self._on_globals_table_item_changed)
@@ -1611,7 +1623,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(buttons)
         self.blacs_table = QtWidgets.QTableWidget(0, 8)
         self.blacs_table.setHorizontalHeaderLabels(["name", "kind", "device", "channel", "range", "current value", "target value", "risk"])
-        self.blacs_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.blacs_table)
         self._loading_blacs_table = False
         self.blacs_table.itemChanged.connect(self._on_blacs_table_item_changed)
         layout.addWidget(self.blacs_table, 1)
@@ -1663,6 +1675,7 @@ class MainWindow(QtWidgets.QMainWindow):
         split = self._make_splitter(QtCore.Qt.Vertical)
         layout.addWidget(split, 1)
         self.h5_table = QtWidgets.QTableWidget(0, 0)
+        configure_table_columns(self.h5_table, stretch_last=False)
         split.addWidget(self.h5_table)
 
         lower = QtWidgets.QWidget()
@@ -1744,7 +1757,7 @@ class MainWindow(QtWidgets.QMainWindow):
         analysis_layout.addWidget(self.figure_area, 4, 0, 1, 4)
         self.analysis_results_table = QtWidgets.QTableWidget(0, 4)
         self.analysis_results_table.setHorizontalHeaderLabels(["kind", "name", "status", "summary"])
-        self.analysis_results_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.analysis_results_table)
         self.analysis_results_table.setMaximumHeight(130)
         analysis_layout.addWidget(QtWidgets.QLabel("Analysis records"), 5, 0, 1, 4)
         analysis_layout.addWidget(self.analysis_results_table, 6, 0, 1, 4)
@@ -1762,12 +1775,9 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        configure_table_columns(table, stretch_last=False)
+        for column, width in enumerate([46, 170, 110, 340, 70, 110]):
+            table.setColumnWidth(column, width)
         table.itemChanged.connect(self._on_lyse_module_table_item_changed)
         table.itemSelectionChanged.connect(lambda g=group: self._update_lyse_module_buttons(g))
         return table
@@ -1870,7 +1880,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.opt_params_table = QtWidgets.QTableWidget(0, 5)
         self.opt_params_table.setHorizontalHeaderLabels(["use", "name", "min", "max", "points"])
-        self.opt_params_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.opt_params_table)
         layout.addWidget(self.opt_params_table, 1)
         self._fill_optimizer_params()
 
@@ -2051,7 +2061,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(buttons)
         self.directory_table = QtWidgets.QTableWidget(0, 7)
         self.directory_table.setHorizontalHeaderLabels(["purpose", "path", "type", "exists", "source", "last modified", "action"])
-        self.directory_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.directory_table)
         layout.addWidget(self.directory_table, 1)
         self.directory_detail = QtWidgets.QPlainTextEdit()
         self.directory_detail.setReadOnly(True)
@@ -2120,7 +2130,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(controls)
         self.knowledge_table = QtWidgets.QTableWidget(0, 6)
         self.knowledge_table.setHorizontalHeaderLabels(["category", "file", "lines", "summary", "snippet", "status"])
-        self.knowledge_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.knowledge_table)
         layout.addWidget(self.knowledge_table, 2)
         self.knowledge_preview = QtWidgets.QPlainTextEdit()
         self.knowledge_preview.setReadOnly(True)
@@ -2186,7 +2196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(buttons)
         self.error_table = QtWidgets.QTableWidget(0, 6)
         self.error_table.setHorizontalHeaderLabels(["time", "severity", "kind", "title", "message", "advice"])
-        self.error_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.error_table)
         self.error_table.itemSelectionChanged.connect(self.preview_selected_error)
         layout.addWidget(self.error_table, 2)
         self.error_detail = QtWidgets.QPlainTextEdit()
@@ -4509,6 +4519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setRowCount(len(visible))
         table.setColumnCount(len(df.columns))
         table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        configure_table_columns(table, stretch_last=False)
         for row in range(len(visible)):
             for col, name in enumerate(df.columns):
                 table.setItem(row, col, QtWidgets.QTableWidgetItem(str(visible.iloc[row, col])))
@@ -4854,9 +4865,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return "lyse_script"
         return "labpilot_module" if "def run(" in text else "lyse_script"
 
-    def _save_lyse_registry_and_refresh(self):
+    def _refresh_lyse_module_tables(self, select_group=None, select_names=None):
+        if not hasattr(self, "single_modules") or not hasattr(self, "multi_modules"):
+            return
+        self._fill_module_lists()
+        if select_group and select_names:
+            for name in select_names:
+                if self._select_module_row(select_group, name):
+                    break
+        for table in [self.single_modules, self.multi_modules]:
+            table.resizeRowsToContents()
+            table.viewport().update()
+            table.repaint()
+
+    def _save_lyse_registry_and_refresh(self, select_group=None, select_names=None):
         self.settings.save_lyse_registry(self.lyse_registry)
-        self.reload_runtime()
+        self.reload_runtime_config()
+        self._refresh_lyse_module_tables(select_group, select_names or [])
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
         self.log("Lyse registry saved and runtime refreshed.")
 
     def _on_lyse_module_table_item_changed(self, item):
@@ -4922,6 +4948,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_lyse_module_buttons(self, group):
         return None
 
+    def _module_action_names(self, group, *, fallback_checked=True):
+        table = self._module_widget_for_group(group)
+        names = []
+        if isinstance(table, QtWidgets.QTableWidget):
+            selected_rows = sorted({index.row() for index in table.selectedIndexes()})
+            for row in selected_rows:
+                item = table.item(row, 1)
+                if item and item.text().strip():
+                    names.append(item.text().strip())
+            if not names and fallback_checked:
+                names = self._checked_names(table)
+            if not names and table.currentRow() >= 0:
+                item = table.item(table.currentRow(), 1)
+                if item and item.text().strip():
+                    names.append(item.text().strip())
+        return list(dict.fromkeys(names))
+
     def add_lyse_module_file(self, group=None):
         group, _, _, _ = self._selected_module(group)
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add lyse routine .py", "", "Python files (*.py);;All files (*.*)")
@@ -4943,7 +4986,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "description": "Added from Lyse page.",
             "params": {},
         }
-        self._save_lyse_registry_and_refresh()
+        self._save_lyse_registry_and_refresh(group, [name])
         self.log(f"Added lyse routine {group}.{name}: {path}")
 
     def add_lyse_module_folder(self, group=None):
@@ -4967,30 +5010,23 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         registry, report = merge_autoscanned_lyse_modules(self.lyse_registry, **kwargs)
         self.lyse_registry = registry
-        self._save_lyse_registry_and_refresh()
+        added_names = [item.split(".", 1)[1] for item in report.get("added", []) if item.startswith(f"{group}.")]
+        self._save_lyse_registry_and_refresh(group, added_names)
         self.log(
             f"Added lyse folder for {group}: {folder}; "
             f"added={len(report.get('added', []))}, updated={len(report.get('updated', []))}, skipped={len(report.get('skipped', []))}"
         )
 
     def remove_selected_lyse_module(self, group=None):
-        group, widget, name, _ = self._selected_module(group)
-        names = []
-        if isinstance(widget, QtWidgets.QTableWidget):
-            rows = sorted({index.row() for index in widget.selectedIndexes()})
-            for row in rows:
-                item = widget.item(row, 1)
-                if item and item.text().strip():
-                    names.append(item.text().strip())
-        elif name:
-            names = [name]
+        group, _widget, _name, _ = self._selected_module(group)
+        names = self._module_action_names(group, fallback_checked=True)
         if not names:
-            self.log("No lyse routine selected.")
+            self.log("No lyse routine selected or checked.")
             return
         answer = QtWidgets.QMessageBox.question(
             self,
             "Remove lyse routine",
-            f"Remove {len(names)} routine(s) from {group}? The .py files on disk will not be deleted.",
+            f"Remove {len(names)} routine(s) from {group}? This removes them from LabPilot only; .py files on disk are kept.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
@@ -4998,7 +5034,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         for item_name in names:
             self.lyse_registry.get(group, {}).pop(item_name, None)
-        self._save_lyse_registry_and_refresh()
+        self._save_lyse_registry_and_refresh(group)
         self.log(f"Removed lyse routine(s) from registry only: {group}: {', '.join(names)}")
 
     def toggle_selected_lyse_module(self, group=None):
@@ -5008,25 +5044,41 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cfg["enabled_by_default"] = not bool(cfg.get("enabled_by_default", False))
         self.lyse_registry[group][name] = cfg
-        self._save_lyse_registry_and_refresh()
+        self._save_lyse_registry_and_refresh(group, [name])
         self.log(f"{group}.{name} enabled_by_default={cfg['enabled_by_default']}")
 
     def move_selected_lyse_module(self, direction, group=None):
-        group, widget, name, cfg = self._selected_module(group)
-        if not name:
-            self.log("No lyse routine selected.")
+        group, _widget, _name, _cfg = self._selected_module(group)
+        names = self._module_action_names(group, fallback_checked=True)
+        if not names:
+            self.log("No lyse routine selected or checked.")
             return
         modules = self.lyse_registry.get(group, {}) or {}
         ordered = [item[0] for item in sorted(modules.items(), key=lambda item: int(item[1].get("order", 1000)))]
-        index = ordered.index(name)
-        new_index = max(0, min(len(ordered) - 1, index + int(direction)))
-        if new_index == index:
+        selected = [name for name in names if name in ordered]
+        if not selected:
+            self.log("Selected lyse routine is not in the registry.")
             return
-        other = ordered[new_index]
-        modules[name]["order"], modules[other]["order"] = int(modules[other].get("order", 1000)), int(modules[name].get("order", 1000))
-        self._save_lyse_registry_and_refresh()
-        self._select_module_row(group, name)
-        self.log(f"Moved lyse routine: {group}.{name}")
+        remaining = [name for name in ordered if name not in set(selected)]
+        if int(direction) <= -9999:
+            new_order = selected + remaining
+        elif int(direction) >= 9999:
+            new_order = remaining + selected
+        else:
+            new_order = ordered[:]
+            step = -1 if int(direction) < 0 else 1
+            iterable = selected if step < 0 else list(reversed(selected))
+            for name in iterable:
+                index = new_order.index(name)
+                new_index = max(0, min(len(new_order) - 1, index + step))
+                other = new_order[new_index]
+                if other in selected:
+                    continue
+                new_order[index], new_order[new_index] = new_order[new_index], new_order[index]
+        for index, name in enumerate(new_order):
+            modules[name]["order"] = (index + 1) * 10
+        self._save_lyse_registry_and_refresh(group, [selected[0]])
+        self.log(f"Reordered lyse routine(s): {group}: {', '.join(selected)}")
 
     def _selected_lyse_module_path(self, group=None):
         _, _, name, cfg = self._selected_module(group)
@@ -5262,7 +5314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             raise RuntimeError(f"Unsupported plot type: {plot_type}")
         self.figure_paths.append(str(out_path))
-        self._show_figure(fig)
+        self._show_figure(fig, title=f"LabPilot plot: {plot_type}", image_path=out_path)
         self._record_analysis_result(
             "plot",
             plot_type,
@@ -5271,7 +5323,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.log(f"plot saved: {out_path}")
 
-    def _show_figure(self, fig):
+    def _show_figure(self, fig, title="LabPilot figure", image_path=None):
         while self.figure_layout.count():
             item = self.figure_layout.takeAt(0)
             if item.widget():
@@ -5280,7 +5332,47 @@ class MainWindow(QtWidgets.QMainWindow):
                     plt.close(old_widget.figure)
                 old_widget.deleteLater()
         self.figure_layout.addWidget(FigureCanvas(fig))
+        if image_path:
+            self._open_figure_window(image_path, title=title)
         plt.close(fig)
+
+    def _open_figure_window(self, image_path, title="LabPilot figure"):
+        path = Path(image_path)
+        if not path.exists():
+            return None
+        window = QtWidgets.QDialog(self)
+        window.setWindowTitle(title)
+        window.resize(920, 700)
+        layout = QtWidgets.QVBoxLayout(window)
+        toolbar = QtWidgets.QHBoxLayout()
+        path_label = QtWidgets.QLineEdit(str(path))
+        path_label.setReadOnly(True)
+        open_folder = QtWidgets.QPushButton("Open folder")
+        open_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.parent.resolve()))))
+        toolbar.addWidget(path_label, 1)
+        toolbar.addWidget(open_folder)
+        layout.addLayout(toolbar)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        label = QtWidgets.QLabel()
+        pixmap = QtGui.QPixmap(str(path))
+        if not pixmap.isNull():
+            label.setPixmap(pixmap)
+            label.setAlignment(QtCore.Qt.AlignCenter)
+        else:
+            label.setText(f"Could not load image: {path}")
+        scroll.setWidget(label)
+        layout.addWidget(scroll, 1)
+        window.finished.connect(lambda _code, w=window: self._forget_figure_window(w))
+        self.figure_windows.append(window)
+        window.show()
+        return window
+
+    def _forget_figure_window(self, window):
+        try:
+            self.figure_windows.remove(window)
+        except ValueError:
+            pass
 
     def fit_from_ui(self):
         plot_type = self._current_plot_type()
@@ -5323,9 +5415,113 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             result = fit_xy(self.h5_df[x], self.h5_df[y], model=model)
         self.fit_results.append(result)
+        fit_figure_path = self._draw_fit_result(action, result)
+        if fit_figure_path:
+            result = dict(result)
+            result["figure_path"] = str(fit_figure_path)
         self._record_analysis_result("fit", model, result, metadata=action)
         self.log("fit result: " + dumps(result))
         return result
+
+    def _numeric_plot_data(self, columns):
+        data = pd.DataFrame({name: pd.to_numeric(self.h5_df[name], errors="coerce") for name in columns})
+        return data.replace([np.inf, -np.inf], np.nan).dropna()
+
+    def _evaluate_fit_y(self, model, x_values, params):
+        if model == "linear":
+            return MODEL_FUNCS[model](x_values, params["a"], params["b"])
+        if model in MODEL_FUNCS:
+            names = {
+                "gaussian": ["amp", "x0", "sigma", "offset"],
+                "logarithmic": ["a", "b"],
+                "exponential": ["amp", "tau", "offset"],
+                "lorentzian": ["amp", "x0", "gamma", "offset"],
+            }[model]
+            return MODEL_FUNCS[model](x_values, *[params[name] for name in names])
+        raise RuntimeError(f"Unsupported 1D fit model for drawing: {model}")
+
+    def _evaluate_fit_z(self, model, x_values, y_values, params):
+        if model == "gaussian2d":
+            names = ["amp", "x0", "y0", "sigma_x", "sigma_y", "offset"]
+            return gaussian2d((x_values, y_values), *[params[name] for name in names])
+        if model == "double_gaussian2d":
+            names = [
+                "amp1",
+                "x01",
+                "y01",
+                "sigma_x1",
+                "sigma_y1",
+                "amp2",
+                "x02",
+                "y02",
+                "sigma_x2",
+                "sigma_y2",
+                "offset",
+            ]
+            return double_gaussian2d((x_values, y_values), *[params[name] for name in names])
+        raise RuntimeError(f"Unsupported 2D fit model for drawing: {model}")
+
+    def _draw_fit_result(self, action, result):
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return None
+        params = result.get("params") or {}
+        model = action.get("model", "")
+        plot_type = action.get("plot_type") or self._current_plot_type()
+        x = action.get("x")
+        y = action.get("y") or action.get("value")
+        z = action.get("z") or action.get("value")
+        out_dir = Path.cwd() / "labpilot_outputs" / "figures"
+        out_path = out_dir / f"fit_{model}_{len(self.figure_paths) + 1}.png"
+        try:
+            if model in {"gaussian2d", "double_gaussian2d"}:
+                data = self._numeric_plot_data([x, y, z])
+                fig, ax = plt.subplots(figsize=(7, 5))
+                sc = ax.scatter(data[x], data[y], c=data[z], cmap="viridis", label="raw")
+                x_grid = np.linspace(float(data[x].min()), float(data[x].max()), 80)
+                y_grid = np.linspace(float(data[y].min()), float(data[y].max()), 80)
+                xx, yy = np.meshgrid(x_grid, y_grid)
+                zz = self._evaluate_fit_z(model, xx.ravel(), yy.ravel(), params).reshape(xx.shape)
+                contour = ax.contour(xx, yy, zz, colors="white", linewidths=1.0)
+                ax.clabel(contour, inline=True, fontsize=8)
+                ax.set_xlabel(x)
+                ax.set_ylabel(y)
+                ax.set_title(f"{model} fit, R2={result.get('r2', 0):.4g}")
+                fig.colorbar(sc, ax=ax, label=z)
+            elif plot_type == "histogram" or not x:
+                data = self._numeric_plot_data([y])
+                fig, ax = plt.subplots(figsize=(7, 4.5))
+                counts, edges, _patches = ax.hist(data[y], bins=30, alpha=0.55, label="histogram")
+                centers = (edges[:-1] + edges[1:]) / 2
+                x_fit = np.linspace(float(centers.min()), float(centers.max()), 400)
+                y_fit = self._evaluate_fit_y(model, x_fit, params)
+                ax.plot(x_fit, y_fit, color="#bf1d2d", linewidth=2.0, label=f"{model} fit")
+                ax.set_xlabel(y)
+                ax.set_ylabel("count")
+                ax.set_title(f"{model} fit, R2={result.get('r2', 0):.4g}")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+            else:
+                data = self._numeric_plot_data([x, y]).sort_values(x)
+                fig, ax = plt.subplots(figsize=(7, 4.5))
+                ax.scatter(data[x], data[y], alpha=0.75, label="raw")
+                ax.plot(data[x], data[y], alpha=0.25)
+                x_fit = np.linspace(float(data[x].min()), float(data[x].max()), 500)
+                if model == "logarithmic":
+                    x_fit = x_fit[x_fit > 0]
+                y_fit = self._evaluate_fit_y(model, x_fit, params)
+                ax.plot(x_fit, y_fit, color="#bf1d2d", linewidth=2.0, label=f"{model} fit")
+                ax.set_xlabel(x)
+                ax.set_ylabel(y)
+                ax.set_title(f"{model} fit, R2={result.get('r2', 0):.4g}")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+            plotting.save_figure(fig, out_path)
+            self.figure_paths.append(str(out_path))
+            self._show_figure(fig, title=f"LabPilot fit: {model}", image_path=out_path)
+            return out_path
+        except Exception as exc:
+            self.log(f"fit figure drawing failed: {exc}")
+            return None
 
     def generate_report_from_ui(self, title="LabPilot analysis report", include_errors=True, include_knowledge_context=True, include_optimizer_history=True):
         if not isinstance(title, str):
