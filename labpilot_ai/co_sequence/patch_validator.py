@@ -54,6 +54,15 @@ class PatchValidationResult:
         }
 
 
+@dataclass
+class _Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: list
+
+
 def _resolve(path):
     return Path(path).expanduser().resolve()
 
@@ -111,11 +120,28 @@ def _hunk_header(line):
     )
 
 
+def _parse_hunks(diff_lines):
+    hunks = []
+    index = 0
+    while index < len(diff_lines):
+        header = _hunk_header(diff_lines[index])
+        if header is None:
+            index += 1
+            continue
+        index += 1
+        lines = []
+        while index < len(diff_lines) and not diff_lines[index].startswith("@@ "):
+            lines.append(diff_lines[index])
+            index += 1
+        hunks.append(_Hunk(*header, lines=lines))
+    return hunks
+
+
 def _line_equal(expected, actual):
     return expected == actual or expected.rstrip("\r\n") == actual.rstrip("\r\n")
 
 
-def apply_unified_diff(original_text, diff_text):
+def _apply_unified_diff_strict(original_text, diff_text):
     original = original_text.splitlines(keepends=True)
     diff_lines = diff_text.splitlines(keepends=True)
     output = []
@@ -164,6 +190,132 @@ def apply_unified_diff(original_text, diff_text):
         raise ValueError("No unified diff hunk was found.")
     output.extend(original[old_index:])
     return "".join(output)
+
+
+def _body_lines(hunk_lines, prefixes):
+    bodies = []
+    for line in hunk_lines:
+        if line.startswith("\\") or not line:
+            continue
+        if line[:1] in prefixes:
+            bodies.append(line[1:])
+    return bodies
+
+
+def _sequence_equal(lines, start, sequence):
+    if start < 0 or start + len(sequence) > len(lines):
+        return False
+    return all(_line_equal(lines[start + offset], expected) for offset, expected in enumerate(sequence))
+
+
+def _find_sequence(lines, sequence, start=0):
+    if not sequence:
+        return []
+    return [
+        index
+        for index in range(max(0, start), len(lines) - len(sequence) + 1)
+        if _sequence_equal(lines, index, sequence)
+    ]
+
+
+def _near_header(indices, old_start, window=80):
+    header_index = max(0, old_start - 1)
+    near = [index for index in indices if abs(index - header_index) <= window]
+    return near or indices
+
+
+def _anchor_candidates(lines, context_lines, old_start):
+    if not context_lines:
+        return []
+    max_anchor = min(6, len(context_lines))
+    for size in range(max_anchor, 0, -1):
+        anchor = context_lines[-size:]
+        matches = _near_header(_find_sequence(lines, anchor), old_start)
+        if matches:
+            return [(match + size, anchor) for match in matches]
+    return []
+
+
+def _suffix_candidates(lines, suffix_context, old_start, start=0):
+    if not suffix_context:
+        return []
+    max_anchor = min(6, len(suffix_context))
+    for size in range(max_anchor, 0, -1):
+        anchor = suffix_context[:size]
+        matches = _near_header(_find_sequence(lines, anchor, start=start), old_start)
+        if matches:
+            return [(match, anchor) for match in matches]
+    return []
+
+
+def _fuzzy_insert_index(lines, hunk):
+    prefixes = {line[:1] for line in hunk.lines if line and not line.startswith("\\")}
+    if "-" in prefixes:
+        raise ValueError("Fuzzy patch repair is only allowed for pure insertion hunks.")
+    inserted = _body_lines(hunk.lines, {"+"})
+    if not inserted:
+        raise ValueError("Fuzzy patch repair found no inserted lines.")
+
+    first_insert = next(index for index, line in enumerate(hunk.lines) if line.startswith("+"))
+    last_insert = len(hunk.lines) - 1 - next(index for index, line in enumerate(reversed(hunk.lines)) if line.startswith("+"))
+    prefix_context = _body_lines(hunk.lines[:first_insert], {" "})
+    suffix_context = _body_lines(hunk.lines[last_insert + 1 :], {" "})
+
+    candidate_indices = set()
+    prefix_candidates = _anchor_candidates(lines, prefix_context, hunk.old_start)
+    if prefix_candidates:
+        for prefix_end, _anchor in prefix_candidates:
+            suffix_candidates = _suffix_candidates(lines, suffix_context, hunk.old_start, start=prefix_end)
+            if suffix_candidates:
+                for suffix_start, _suffix_anchor in suffix_candidates:
+                    candidate_indices.add(suffix_start)
+            elif not suffix_context:
+                candidate_indices.add(prefix_end)
+    elif suffix_context:
+        for suffix_start, _suffix_anchor in _suffix_candidates(lines, suffix_context, hunk.old_start):
+            candidate_indices.add(suffix_start)
+
+    if not candidate_indices:
+        raise ValueError(f"Patch context mismatch near original line {hunk.old_start}.")
+    if len(candidate_indices) > 1:
+        options = ", ".join(str(index + 1) for index in sorted(candidate_indices)[:8])
+        raise ValueError(
+            f"Patch insertion is ambiguous near original line {hunk.old_start}; "
+            f"candidate lines: {options}."
+        )
+    return next(iter(candidate_indices))
+
+
+def _apply_unified_diff_fuzzy_insertions(original_text, diff_text):
+    lines = original_text.splitlines(keepends=True)
+    hunks = _parse_hunks(diff_text.splitlines(keepends=True))
+    if not hunks:
+        raise ValueError("No unified diff hunk was found.")
+    warnings = []
+    for hunk in hunks:
+        inserted = _body_lines(hunk.lines, {"+"})
+        insertion_index = _fuzzy_insert_index(lines, hunk)
+        lines[insertion_index:insertion_index] = inserted
+        warnings.append(
+            f"Patch hunk near original line {hunk.old_start} was repaired with unique-context insertion."
+        )
+    return "".join(lines), warnings
+
+
+def apply_unified_diff_with_warnings(original_text, diff_text):
+    try:
+        return _apply_unified_diff_strict(original_text, diff_text), []
+    except ValueError as strict_error:
+        try:
+            new_text, warnings = _apply_unified_diff_fuzzy_insertions(original_text, diff_text)
+        except ValueError:
+            raise strict_error
+        return new_text, warnings
+
+
+def apply_unified_diff(original_text, diff_text):
+    new_text, _warnings = apply_unified_diff_with_warnings(original_text, diff_text)
+    return new_text
 
 
 def make_unified_diff(old_text, new_text, path):
@@ -282,7 +434,8 @@ def validate_patch_plan(plan, sequence_path, connection_table_path):
                 errors.append(f"{target.name}: creating, deleting, or binary patching files is not allowed.")
                 continue
             old_text = target.read_text(encoding="utf-8")
-            new_text = apply_unified_diff(old_text, diff_text)
+            new_text, repair_warnings = apply_unified_diff_with_warnings(old_text, diff_text)
+            warnings.extend(repair_warnings)
             errors.extend(_syntax_errors(target, new_text))
             previews.append(
                 {

@@ -55,6 +55,42 @@ def test_co_sequence_syntax_and_consistency_warnings(tmp_path):
     assert any("syntax error" in error.lower() for error in result.errors)
 
 
+def test_co_sequence_repairs_unique_context_insertion(tmp_path):
+    sequence = tmp_path / "seq.py"
+    connection = tmp_path / "connection_table.py"
+    old_text = (
+        "if do_cleanup:\n"
+        "    rf_switch.go_low(t)\n"
+        "    probe_shutter.go_low(t)\n"
+        "    repump_shutter.go_low(t)\n"
+        "    static_shutter.go_low()\n"
+        "\n"
+        "stop(t + 1e-3)\n"
+    )
+    sequence.write_text(old_text, encoding="utf-8")
+    connection.write_text("rf_switch = object()\n", encoding="utf-8")
+    # The LLM omitted the intervening static_shutter line from its context.
+    # LabPilot should repair this only because the before/after anchors are unique.
+    diff_text = (
+        f"--- a/{sequence}\n"
+        f"+++ b/{sequence}\n"
+        "@@ -2,5 +2,6 @@\n"
+        "     rf_switch.go_low(t)\n"
+        "     probe_shutter.go_low(t)\n"
+        "     repump_shutter.go_low(t)\n"
+        "+    t += 10e-3\n"
+        " stop(t + 1e-3)\n"
+    )
+    plan = {"summary": "add wait", "files": [{"path": str(sequence), "unified_diff": diff_text}]}
+
+    result = validate_patch_plan(plan, sequence, connection)
+
+    assert result.ok
+    assert any("unique-context insertion" in warning for warning in result.warnings)
+    repaired = result.previews[0]["new_text"]
+    assert "static_shutter.go_low()\n\n    t += 10e-3\nstop" in repaired
+
+
 def test_code_change_log_store_records_color_tags(tmp_path):
     store = CodeChangeLogStore(tmp_path / "logs")
     out = store.append({"summary": "changed Rabi timing", "status": "applied", "color_tags": ["red: hardware"]})

@@ -60,6 +60,8 @@ Return strict JSON with this shape:
 Rules:
 - Every file path must be exactly one of the two selected paths.
 - Use unified diffs only. No full file replacement.
+- Include exact unchanged context lines from the provided file; do not skip lines between the context before and after your insertion.
+- For timing edits after an `if` block's cleanup actions, keep indentation consistent with the intended block and include nearby lines such as the final cleanup call and `stop(...)`.
 - Keep sequence and connection table device/channel/global names consistent.
 - Prefer small, reviewable patches.
 - If the request is unsafe or underspecified, return an empty files list and put the issue in warnings.
