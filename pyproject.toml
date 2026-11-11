@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.2.2"
+version = "0.3.0rc1"
 description = "Industrial AI copilot for labscript-suite experiments: voice commands, runmanager/BLACS/lyse control, optimization, Knowledge, Co-Sequence, and supervised logs."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,6 +37,7 @@ labscript = [
 
 [project.scripts]
 labpilot = "labpilot_ai.automation_cli:main"
+labpilot-runmanager = "labpilot_ai.host.managed_runmanager:main"
 labpilot-ai = "labpilot_ai.main:main"
 labpilot-control = "labpilot_ai.local_control.cli:main"
 labpilot-blacs-bridge = "labpilot_ai.blacs_ctrl.manual_bridge_server:main"

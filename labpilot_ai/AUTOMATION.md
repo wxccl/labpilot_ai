@@ -48,19 +48,26 @@ labpilot events TASK_ID
       "enabled": true,
       "sequence_root": "D:/experiment",
       "output_root": "D:/experiment-data",
+      "batch_root": "D:/experiment-data/labpilot-batches",
       "allow": ["set_globals", "set_sequence", "set_output", "set_flags", "engage"],
       "max_shots": 100
     },
     "blacs": {
-      "enabled": false,
+      "enabled": true,
       "spool": ".labpilot-blacs-spool",
       "allow": {}
     }
+  },
+  "analysis": {
+    "routine": "D:/experiment/analysis/shot_quality.py",
+    "routine_sha256": "替换为已审核脚本的完整 SHA-256",
+    "quality_rules": [{"result": "signal", "type": "number", "min": 0.9, "max": 1.1}],
+    "timeout_s": 30
   }
 }
 ```
 
-Runmanager 使用原生本机 API。使用 BLACS 静态控制时，用原 Labscript Python 安装同版本 LabPilot wheel，执行 `python -m pip install --no-deps labpilot-ai==0.2.2`。在 profile 启用 BLACS 并填写精确设备与通道，然后用以下命令预览和应用插件配置。应用后正常重启 BLACS 以加载插件。卸载使用对应的 `uninstall-host` 命令。
+Runmanager 使用原生本机 API。使用原生批次验收或 BLACS 静态控制时，在原 Labscript Python 中安装同版本 LabPilot wheel。启用 BLACS 后，静态写入需要在 `allow` 中填写精确设备及通道。用以下命令预览和应用插件配置，应用后正常重启 BLACS。卸载使用对应的 `uninstall-host` 命令。
 
 ```powershell
 labpilot --profile station.json install-host --labconfig "D:/labscript-suite/labconfig/COMPUTER.ini"
@@ -70,7 +77,31 @@ labpilot --profile station.json discover
 
 静态通道来自设备实际暴露的标准控件。版本或设备能力超出已识别接口时，查看探测结果和现场文档。
 
-真实 Engage 的 RPC 确认表示已提交请求。编译、入队、设备完成、数据采集和科学质量各有独立的验收证据。回执丢失或证据不足时，查原任务与控制软件日志。`close-unresolved` 允许操作者在确认现场队列与设备状态之后附理由结案，保留未验证状态。模拟任务的结果标有 `simulated`。
+启用批次验收时，先在 `output_root` 下创建专用的 `batch_root`。使用同一份 profile 启动 BLACS 插件和托管 Runmanager。托管启动器打开原生 Runmanager 窗口。旧 Runmanager 实例需要先正常退出，避免争用同一 RPC 端口。
+
+```powershell
+labpilot-runmanager --profile "D:/experiment/station.json"
+labpilot --profile station.json doctor --labconfig "D:/labscript-suite/labconfig/COMPUTER.ini"
+labpilot --profile station.json discover
+labpilot --profile station.json snapshot runmanager
+```
+
+托管批次要求 Runmanager 的 Run shot(s) 已打开，目标 BLACS 在同一台机器且关闭 Repeat。每个请求在专用目录里独立生成批次，编译前恢复原输出设置。原生 shot 索引、序列标识、H5 内容和 BLACS 完成回调共同构成执行证据。任务在全批 Lyse 分析通过后进入 `COMPLETED`。质量未通过时，状态为 `FAILED`，每发执行证据和分析结果可继续查阅。
+
+将实际单发分析脚本及其 SHA-256 写入 `analysis`。脚本使用官方 `lyse.Run(lyse.path).save_result(...)` 接口写出规则引用的结果。分析使用经过身份和哈希验证的 H5 副本，保留原始 H5。为保证复制时与清单一致，本站 Lyse GUI 的其他例程应避开正在验收的批次目录。当前质量接口支持有限数值、布尔和文本标量，不覆盖多发联合拟合。完整的原生试运行方法见仓库内的 `tools/native_e2e.py`，该工具只创建独立测试 profile 和官方虚拟设备。
+
+回执丢失或证据不足时按原任务查询。`close-unresolved` 允许操作者确认现场队列与设备状态后附理由结案，保留未验证状态。模拟任务的结果标有 `simulated`。
+
+## 专用设备状态与版本
+
+`discover` 列出各设备的可用动作。已暴露这些能力的设备可以用 `labpilot snapshot blacs --device DEVICE --action ACTION` 读取 `dds_registers`、`camera_status` 或 `pseudoclock_status`。返回数据注明来源及新鲜度。NI DAQmx 与 NovaTech DDS9M 的写入按原生控件类型、单位和范围核验，其他厂商动作需要按设备补齐适配。
+
+原生两发闭环已用官方虚拟设备验证以下组合。现场设备和科学指标在控制机验收。
+
+| Runmanager | BLACS | Labscript | Lyse |
+| --- | --- | --- | --- |
+| 3.2.1 | 3.2.1 | 3.3.1 | 3.2.3 |
+| 3.3.0 | 3.2.3 | 3.4.2 | 3.3.0 |
 
 ## 批准和自动运行
 

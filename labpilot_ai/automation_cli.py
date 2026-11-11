@@ -28,6 +28,7 @@ def parser():
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("target", choices=("blacs", "runmanager"))
     snapshot.add_argument("--device")
+    snapshot.add_argument("--action", help="A read capability reported by BLACS discovery")
     prepare = commands.add_parser("prepare")
     prepare.add_argument("spec", type=Path, help="JSON object with target, action, values, and optional device or shot count")
     for name in ("status", "events", "cancel", "observe"):
@@ -142,6 +143,10 @@ def dispatch(args):
         params = {"target": args.target}
         if args.device:
             params["device"] = args.device
+        if args.action:
+            if args.target != "blacs":
+                raise ValueError("--action applies to BLACS device snapshots")
+            params["action"] = args.action
         return app.dispatch("snapshot", params)
     if command == "prepare":
         return app.dispatch("prepare", read_object(args.spec))

@@ -4,7 +4,9 @@ import ast
 import hashlib
 import math
 from pathlib import Path
+import time
 
+from .native_batch import BATCH_PROTOCOL
 from .protocol import Refused, RUN_ACTIONS, canonical, require_snapshot, snapshot
 
 
@@ -182,7 +184,33 @@ class Runmanager:
         version = self._connect().get_version()
         if not isinstance(version, str):
             raise RuntimeError("Unexpected Runmanager version response")
-        return {"available": True, "actions": sorted(self.config["allow"]), "version": version, "endpoint": "localhost"}
+        actions = set(self.config["allow"])
+        managed = bool(self.config.get("batch_root")) and self._managed_capable()
+        if self.config.get("batch_root") and not managed:
+            actions.discard("engage")
+        return {"available": True, "actions": sorted(actions), "version": version,
+                "endpoint": "localhost", "managed_batches": managed}
+
+    def _managed_capable(self):
+        try:
+            result = self._connect().request("labpilot_batch_capabilities")
+        except (AttributeError, RuntimeError, ValueError):
+            return False
+        return result == {"protocol": BATCH_PROTOCOL, "profile_sha256": self.profile.sha256}
+
+    def _managed_engage(self, params, before):
+        if not self._managed_capable():
+            raise Refused("Start Runmanager with the packaged managed_runmanager launcher and matching profile")
+        remote = self._connect()
+        result = remote.request("labpilot_engage_batch", params, self.profile.sha256, time.time() + remote.timeout)
+        if isinstance(result, dict) and result.get("state") == "REFUSED":
+            raise Refused(result.get("reason", "Managed Runmanager refused before enqueue"))
+        if (not isinstance(result, dict) or result.get("protocol") != BATCH_PROTOCOL or
+                result.get("batch_id") != params["request_id"] or
+                result.get("config_digest") != before["snapshot_sha256"] or
+                result.get("expected_n_shots") != before["n_shots"] or result.get("configuration_restored") is not True):
+            raise RuntimeError("Managed Runmanager returned no matching batch acceptance")
+        return {"evidence": result, "expected_n_shots": before["n_shots"]}
 
     def snapshot(self, params):
         rm = self._connect()
@@ -230,6 +258,8 @@ class Runmanager:
         values = run_values(action, params, before, self.config.get("max_shots", 10000))
         evidence = {"config_digest": before["snapshot_sha256"], "physical_execution_verified": False}
         if action == "engage":
+            if self.config.get("batch_root"):
+                return self._managed_engage(params, before)
             if not before["sequence_sha256"] or not before["output"]:
                 raise Refused("Engage requires a readable sequence and an output path")
             self._path("sequence", before["sequence"])

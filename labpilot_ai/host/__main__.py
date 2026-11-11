@@ -6,10 +6,13 @@ import sys
 
 
 if not __package__:
+    here = Path(__file__).resolve().parent
+    sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != here]
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from labpilot_ai.host.adapters import Runmanager, Simulator
 from labpilot_ai.host.blacs import Blacs
+from labpilot_ai.host.native_batch import NativeBatches
 from labpilot_ai.host.protocol import MAX_BYTES, Journal, Profile, Refused, canonical, loads, receipt, request_id
 
 
@@ -42,8 +45,10 @@ def dispatch(envelope, profile):
         observed = journal.observe(key, target)
         if observed is None:
             return receipt("UNKNOWN", request_id=key, reason="No host receipt for the requested operation")
-        return receipt("OBSERVED", request_id=key, value={"receipt": observed,
-                       "evidence": observed.get("value", {}).get("evidence", {})})
+        evidence = observed.get("value", {}).get("evidence", {})
+        if target == "runmanager" and not profile.simulate and profile.runmanager.get("batch_root"):
+            evidence = {**evidence, **NativeBatches(profile).observe(key)}
+        return receipt("OBSERVED", request_id=key, value={"receipt": observed, "evidence": evidence})
     if method != "execute":
         raise Refused("Unknown host method")
     key = request_id(params)

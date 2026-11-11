@@ -1,13 +1,14 @@
 """Inspect the existing Labscript interpreter and install an optional BLACS shim."""
 
 import configparser
-from importlib import metadata, util
+from importlib import util
 import os
 from pathlib import Path
 import re
 import sys
 import uuid
 
+from .compatibility import inspect_api
 from .protocol import Refused
 
 
@@ -55,21 +56,20 @@ def _atomic(path, data):
         stage.unlink(missing_ok=True)
 
 
-def _version(name):
-    try:
-        return metadata.version(name)
-    except metadata.PackageNotFoundError:
-        return None
-
-
 def doctor(profile, labconfig=None):
     shim = _shim_path()
-    found = {name: _version(name) for name in ("labscript", "labscript-utils", "runmanager", "blacs", "lyse")}
-    result = {"python": sys.executable, "packages": found, "profile": str(profile.path or ""),
+    compatibility = inspect_api()
+    if shim is None or not shim.is_file():
+        shim_state = "MISSING"
+    else:
+        with shim.open("rb") as stream:
+            shim_state = "MATCHES_PACKAGE" if stream.read(len(SHIM) + 1) == SHIM else "FOREIGN_OR_MODIFIED"
+    result = {"python": sys.executable, "packages": compatibility["packages"], "profile": str(profile.path or ""),
               "simulated": profile.simulate, "runmanager_enabled": bool(profile.runmanager.get("enabled")),
               "blacs_enabled": bool(profile.blacs.get("enabled")), "shim_path": str(shim or ""),
-              "shim_present": bool(shim and shim.is_file()), "labconfig": str(labconfig or ""),
-              "checks": "Installed package metadata and files; no hardware commands or restart"}
+              "shim_present": shim_state != "MISSING", "shim_state": shim_state, "labconfig": str(labconfig or ""),
+              "api_compatibility": compatibility,
+              "checks": "Installed package metadata and static API source; no application or driver imports"}
     if labconfig is not None:
         _, _, parsed = _config(labconfig)
         result["labconfig_blacs_plugin_enabled"] = parsed.getboolean(SECTION, "labpilot_host", fallback=False)

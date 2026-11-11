@@ -71,6 +71,9 @@ class Blacs:
     def snapshot(self, params):
         return self._contact("snapshot", params)
 
+    def batch_status(self):
+        return self._contact("batch.status", {})
+
     def execute(self, params):
         if params.get("action") != "set_manual":
             raise Refused("Only set_manual is supported by the packaged BLACS adapter")

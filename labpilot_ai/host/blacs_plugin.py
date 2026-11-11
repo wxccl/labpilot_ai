@@ -10,7 +10,9 @@ from labpilot_ai.blacs_bridge.plugin import Plugin as PluginHooks
 
 from .adapters import blacs_values
 from .blacs import atomic_json, mailbox
+from .device_actions import describe_device, read_device_action, require_typed_manual
 from .protocol import Profile, Refused, read_json, require_snapshot, snapshot
+from .native_batch import NativeBatches
 
 
 name = "LabPilot Host"
@@ -25,6 +27,7 @@ class Plugin(PluginHooks):
         self.generation = uuid.uuid4().hex
         self.updated = 0.0
         self.pending = None
+        self.batches = None
 
     def plugin_setup_complete(self, BLACS):
         try:
@@ -38,6 +41,8 @@ class Plugin(PluginHooks):
                 return
             self.accessor = BLACSAccessor(BLACS)
             self.queue = BLACS["experiment_queue"]
+            if self.profile.runmanager.get("batch_root"):
+                self.batches = NativeBatches(self.profile)
             self.manual_mode = MODE_MANUAL
             self.begin_state = define_state(MODE_MANUAL, False)(self._begin_state)
             self.finish_state = define_state(MODE_MANUAL, False)(self._finish_state)
@@ -65,6 +70,21 @@ class Plugin(PluginHooks):
                  "value": value, "reason": reason}
         atomic_json(self.spool / "outbox" / f"{message['mail_id']}.json", reply)
 
+    def get_callbacks(self):
+        return {"pre_transition_to_buffered": self._shot_queued, "shot_complete": self._shot_completed,
+                "shot_ignore_repeat": self._ignore_repeat}
+
+    def _shot_queued(self, path):
+        if self.batches is not None:
+            self.batches.record(path, "queued")
+
+    def _shot_completed(self, path):
+        if self.batches is not None:
+            self.batches.record(path, "executed")
+
+    def _ignore_repeat(self, path):
+        return self.batches is not None and self.batches.manages_path(path)
+
     def poll(self):
         try:
             now = time.time()
@@ -89,13 +109,35 @@ class Plugin(PluginHooks):
             return
         try:
             params = message["params"]
-            if message["method"] == "discover":
-                devices = sorted(self.accessor._tabs())
-                self._reply(message, "OK", value={"available": True, "devices": devices,
-                                                  "actions": ["set_manual"] if self.profile.blacs["allow"] else [],
-                                                  "write_channels": self.profile.blacs["allow"]})
+            if message["method"] == "batch.status":
+                if self.batches is None:
+                    raise Refused("Managed BLACS batch observation is disabled")
+                self._reply(message, "OK", value={"profile_sha256": self.profile.sha256,
+                                                  "repeat": bool(self.queue.manager_repeat)})
+            elif message["method"] == "discover":
+                tabs = self.accessor._tabs()
+                configured = self.profile.blacs["allow"]
+                capabilities = {
+                    device: describe_device(tab, manual_mode=self.manual_mode,
+                                            write_channels=configured.get(device, ()))
+                    for device, tab in tabs.items()
+                }
+                write_channels = {device: configured[device] for device, info in capabilities.items()
+                                  if info["write_actions"]}
+                self._reply(message, "OK", value={"available": True, "devices": sorted(tabs),
+                                                  "device_capabilities": capabilities,
+                                                  "actions": ["set_manual"] if write_channels else [],
+                                                  "write_channels": write_channels})
             elif message["method"] == "snapshot":
-                value, _ = self._capture(params.get("device"))
+                device = params.get("device")
+                action = params.get("action")
+                if action is None:
+                    value, _ = self._capture(device)
+                else:
+                    tabs = self.accessor._tabs()
+                    if type(device) is not str or device not in tabs:
+                        raise Refused("Select an exact discovered BLACS device")
+                    value = read_device_action(action, tabs[device], device=device, manual_mode=self.manual_mode)
                 self._reply(message, "OK", value=value)
             elif message["method"] == "execute" and params.get("action") == "set_manual":
                 self._prepare(message)
@@ -154,6 +196,7 @@ class Plugin(PluginHooks):
         if any(channel not in allowed or before["channels"][channel]["locked"] for channel in values):
             raise Refused("BLACS channel is locked or not allowed in the host profile")
         tab = next(iter(refs.values())).tab
+        require_typed_manual(tab, {channel: before["channels"][channel] for channel in values})
         self.pending = message
         self.begin_state(tab, message, self)
 
@@ -167,6 +210,7 @@ class Plugin(PluginHooks):
             before, refs = plugin._capture(params["device"])
             plugin._require_ready(before)
             require_snapshot(params, before)
+            require_typed_manual(tab, {channel: before["channels"][channel] for channel in params["values"]})
             for channel, value in params["values"].items():
                 ref = refs[channel]
                 output = getattr(ref.output, ref.subchannel) if ref.subchannel else ref.output

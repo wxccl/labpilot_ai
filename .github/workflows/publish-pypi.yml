@@ -76,6 +76,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: python-package-distributions
@@ -88,7 +91,17 @@ jobs:
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "LabPilot AI $tag" --generate-notes
+            options=()
+            if [[ "$tag" =~ (a|b|rc)[0-9]+$ ]]; then
+              options+=(--prerelease)
+            fi
+            notes="docs/releases/$tag.md"
+            if [[ -f "$notes" ]]; then
+              options+=(--notes-file "$notes")
+            else
+              options+=(--generate-notes)
+            fi
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "LabPilot AI $tag" "${options[@]}"
           fi
 
   publish:

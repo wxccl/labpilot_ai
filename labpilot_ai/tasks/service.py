@@ -34,9 +34,10 @@ def _call(method, params):
 class TaskService:
     """Run effects once after SQLite commits their intent. Recover by observing."""
 
-    def __init__(self, store, host):
+    def __init__(self, store, host, *, analysis=None):
         self.store = store
         self.host = host
+        self.analysis = analysis
 
     def run_next(self):
         with self.store._effect_lease() as available:
@@ -74,13 +75,60 @@ class TaskService:
 
     def observe(self, task_id):
         task = self.store.get(task_id)
+        if task["status"] == "COMPLETED" and task["evidence"].get("analysis_state") == "COMPLETE":
+            return task
         if task["status"] not in ACTIVE and not (task["kind"] == "batch" and task["status"] == "COMPLETED"):
             return task
         observation = _call(self.host.observe, {"target": task["params"]["target"], "request_id": task["request_id"]})
         status, evidence, problem = _observation_outcome(task, observation)
+        if task["kind"] == "batch" and not problem and not evidence.get("simulated"):
+            status, evidence, problem = self._analysis_outcome(task, observation, status, evidence)
         if problem:
             observation = {**observation, "reason": problem}
         return self.store._record_observation(task, status, observation, evidence)
+
+    def _analysis_outcome(self, task, observation, status, evidence):
+        if task["status"] in TERMINAL or status in ("FAILED", "CANCELLED"):
+            return status, evidence, None
+        if self.analysis is not None:
+            evidence = {**evidence, "quality": "UNKNOWN"}
+            if task["evidence"].get("manifest_sha256"):
+                evidence["analyzed_count"] = task["evidence"].get("analyzed_count", 0)
+            else:
+                evidence.pop("analyzed_count", None)
+        reported = observation.get("value", {}).get("evidence") if observation["state"] == "OBSERVED" else None
+        if not isinstance(reported, dict) or reported.get("batch_execution_complete") is not True:
+            if self.analysis is not None and status == "COMPLETED":
+                evidence = {key: value for key, value in evidence.items() if key not in ("terminal", "quality")}
+                return "OBSERVING", evidence, "Awaiting the verified physical batch and shot manifest"
+            return status, evidence, None
+        if any(evidence.get(field) != task["expected_shots"] for field in COUNTS[:3]):
+            return "UNKNOWN", evidence, "Physical completion needs all compiled, queued, and executed shots"
+        evidence = {**evidence, "batch_execution_complete": True}
+        evidence.pop("terminal", None)
+        evidence["quality"] = "UNKNOWN"
+        if self.analysis is None:
+            evidence["analysis_state"] = "NOT_CONFIGURED"
+            return "OBSERVING", evidence, "Lyse analysis is not configured for this site profile"
+        analysis = self.analysis.analyze(
+            reported.get("shot_manifest"), request_id=task["request_id"],
+            config_digest=task["expected_config_digest"], expected_n_shots=task["expected_shots"],
+            prior_manifest_sha256=evidence.get("manifest_sha256"),
+        )
+        if analysis["analysis_state"] == "COMPLETE" and analysis["analyzed_count"] != task["expected_shots"]:
+            return "FAILED", dict(evidence, terminal="FAILED", analysis_state="FAILED"), "Analysis did not cover all shots"
+        # Retain verified partial results if a later read or analysis fails.
+        if task["evidence"].get("manifest_sha256"):
+            analysis["analyzed_count"] = max(analysis["analyzed_count"], task["evidence"].get("analyzed_count", 0))
+        problem = analysis.pop("reason", None)
+        evidence.update(analysis)
+        if analysis["analysis_state"] == "COMPLETE":
+            if analysis["quality"] == "PASS":
+                return "COMPLETED", dict(evidence, terminal="COMPLETED"), None
+            problem = "One or more shots failed the reviewed Lyse quality rules"
+        elif analysis["analysis_state"] == "PENDING":
+            return "OBSERVING", evidence, None
+        return "FAILED", dict(evidence, terminal="FAILED"), problem or "Lyse analysis failed"
 
 
 def _observation_outcome(task, observation):

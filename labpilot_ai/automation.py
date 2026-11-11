@@ -107,12 +107,18 @@ class Automation:
         db = path_setting(self.profile, config.get("state_db", self.profile.stem + ".tasks.sqlite3"))
         # A changed host profile must not execute plans approved for another configuration.
         binding = hashlib.sha256(
-            json.dumps({"mode": mode, "python": str(python), "host": config.get("host", {})},
+            json.dumps({"mode": mode, "python": str(python), "host": config.get("host", {}),
+                        **({"analysis": config["analysis"]} if config.get("analysis") is not None else {})},
                        sort_keys=True, ensure_ascii=True, allow_nan=False).encode("ascii")
         ).hexdigest()
         db = db.with_name(f"{db.stem}.{mode}.{binding[:16]}{db.suffix}")
         self.store = TaskStore(db)
-        self.service = TaskService(self.store, self.host)
+        analysis = None
+        if not simulate and config.get("analysis") is not None:
+            from .shot_analysis import LyseBatchAnalysis
+
+            analysis = LyseBatchAnalysis(python, config["analysis"], base_dir=self.profile.parent)
+        self.service = TaskService(self.store, self.host, analysis=analysis)
         root = config.get("project_root")
         self.project_root = path_setting(self.profile, root) if root else None
 

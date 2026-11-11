@@ -1,0 +1,45 @@
+name: Native Labscript API contract
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "labpilot_ai/host/**"
+      - "tests/test_host*.py"
+      - ".github/workflows/native-contract.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-shim:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        python: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test runner and isolated upstream artifacts
+        shell: pwsh
+        run: |
+          python -m pip install pytest
+          python -m pip install --no-deps --target "$env:RUNNER_TEMP\labscript-artifacts" `
+            labscript==3.3.1 labscript-utils==3.3.1 runmanager==3.2.1 blacs==3.2.1 `
+            labscript-devices==3.2.0 lyse==3.2.3 qtutils==3.1.0 zprocess==2.24.0
+      - name: Verify upstream source contracts without importing hardware libraries
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$env:RUNNER_TEMP\labscript-artifacts"
+          @'
+          import json
+          from labpilot_ai.host.compatibility import inspect_api
+
+          report = inspect_api()
+          print(json.dumps(report, indent=2))
+          assert all(item["state"] == "API_SURFACE_PRESENT" for item in report["features"].values())
+          '@ | python -
+      - name: Verify host protocol, typed devices and isolated shim
+        run: python -m pytest -q tests/test_host_compatibility.py tests/test_host_protocol.py
