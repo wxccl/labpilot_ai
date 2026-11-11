@@ -15,7 +15,8 @@ def test_core_dependencies_do_not_claim_labscript_suite_packages():
 
     with open("pyproject.toml", "rb") as stream:
         pyproject = tomllib.load(stream)
-    dependencies = pyproject["project"]["dependencies"]
+    assert pyproject["project"]["dependencies"] == []
+    dependencies = pyproject["project"]["optional-dependencies"]["desktop"]
     normalized = [item.lower().replace("_", "-") for item in dependencies]
     blocked_defaults = ["labscript-suite", "labscript ", "runmanager", "blacs", "lyse", "labscript-utils"]
 

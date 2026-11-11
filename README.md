@@ -1,5 +1,7 @@
 # LabPilot AI
 
+**v0.2.0 automation** runs persistent experiment tasks through a packaged Labscript host. Start with `python -m pip install labpilot-ai` and `labpilot init` for a simulated station. The new `labpilot` CLI and optional task UI share the task database with Codex MCP and DeepSeek. See the [automation guide](labpilot_ai/AUTOMATION.md) for simulation, site setup, approval, evidence, and compatibility.
+
 LabPilot AI is an industrial-style local AI copilot for labscript-suite experiments. It does not modify labscript, runmanager, BLACS, or lyse internals. Instead, it wraps stable boundaries: registry whitelists, local safety validation, runmanager/BLACS/lyse adapters, HDF5-compatible data, SQLite/JSONL logs, and a PyQt5 desktop UI.
 
 The first release is designed to be safe by default: Mock LLM, Mock runmanager/BLACS, and Dry-run workflows can demonstrate the full loop before any real hardware action is enabled.
@@ -37,12 +39,10 @@ Directory treats labscript path types explicitly: sequence and connection table 
 
 ## Install
 
-Use the existing labscript-suite conda environment, or another environment that can already import the labscript suite:
+Install the original desktop in a separate Python environment:
 
 ```powershell
-conda activate labscript
-cd E:\Labpilot\labpilot_ai
-pip install -e .
+python -m pip install "labpilot-ai[desktop,ai]"
 ```
 
 LabPilot AI intentionally does not install or upgrade `labscript-suite`, `runmanager`, `blacs`, or `lyse` by default. This avoids pip changing a working labscript-suite environment. The core dependency ranges are deliberately broad and capped (`PyQt5<6`, `numpy<3`, `pandas<3`, `h5py<4`, `matplotlib<4`) so an existing labscript-suite install can keep its tested versions.
@@ -53,7 +53,7 @@ For a brand-new environment only, install labscript-suite first using the labscr
 pip install -e ".[labscript]"
 ```
 
-Do not use `pip install --upgrade labpilot-ai` on a hardware-control computer unless you have first reviewed the resolver plan. Prefer installing LabPilot into the active labscript environment without upgrading already-working labscript-suite packages.
+For a working hardware setup, point the new LabPilot profile at the existing Labscript interpreter. Follow the automation guide to configure the host and check each capability before enabling it.
 
 Optional extras:
 
