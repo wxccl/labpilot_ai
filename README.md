@@ -4,6 +4,8 @@ LabPilot AI is an industrial-style local AI copilot for labscript-suite experime
 
 The first release is designed to be safe by default: Mock LLM, Mock runmanager/BLACS, and Dry-run workflows can demonstrate the full loop before any real hardware action is enabled.
 
+For a Windows PC running both LabPilot and Labscript Suite, see the [中文同机部署与 Codex 控制手册](manual/00_local_control.md). The optional local gateway mode uses the installed Labscript host gateway through local Python and provides the `labpilot-control` JSON CLI. Mock mode remains available without Labscript.
+
 ## Main Features
 
 - Industrial PyQt5 UI: Command, Runmanager, BLACS Manual, Lyse, Optimizer, Co-Sequence, Experiment Log, Protocol, Knowledge, Directory, Diagnostics, Error Center, and Settings.

@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from labpilot_ai.ai.llm_client import LLMClient
 from labpilot_ai.blacs_ctrl.connection_table_discovery import (
     discover_blacs_channels_from_connection_table,
@@ -8,12 +6,18 @@ from labpilot_ai.blacs_ctrl.connection_table_discovery import (
 from labpilot_ai.safety.validator import SafetyValidator
 
 
-def test_connection_table_discovery_from_virtual_project():
-    root = Path(__file__).resolve().parents[2]
-    path = root / "virtual_real_labscript_project" / "connection_table.py"
+def test_connection_table_discovery_from_virtual_project(tmp_path):
+    path = tmp_path / "connection_table.py"
+    path.write_text(
+        'virtual_device = VirtualDevice("LabPilotVirtualDevice")\n'
+        'camera_trigger = DigitalOut("camera_trigger", virtual_device, "port0/line2")\n'
+        'bias_voltage = AnalogOut("bias_voltage", virtual_device, "ao0")\n'
+        'probe_intensity_voltage = AnalogOut("probe_intensity_voltage", virtual_device, "ao4")\n',
+        encoding="utf-8",
+    )
     registry, report = discover_blacs_channels_from_connection_table(path)
 
-    assert report["count"] >= 3
+    assert report["count"] == 3
     assert registry["camera_trigger"]["type"] == "bool"
     assert registry["camera_trigger"]["channel"] == "port0/line2"
     assert registry["bias_voltage"]["type"] == "float"

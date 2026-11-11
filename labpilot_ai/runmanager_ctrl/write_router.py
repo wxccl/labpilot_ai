@@ -1,4 +1,4 @@
-"""Route runmanager global writes through remote or direct H5 fallback."""
+"""Route Runmanager global writes according to the selected backend."""
 
 from __future__ import annotations
 
@@ -36,12 +36,22 @@ def write_runmanager_globals(
     globals_h5_path: str | Path | None = None,
     direct_h5_write: bool = True,
     h5_group: str = "",
+    prepared=None,
 ) -> RunmanagerWriteReport:
-    """Write globals with remote-first, direct-H5 fallback semantics."""
+    """Write through the local gateway, or use the legacy remote/H5 route."""
 
     report = RunmanagerWriteReport(h5_path=str(globals_h5_path or ""), h5_group=str(h5_group or ""))
     if not values:
         return report
+
+    if getattr(backend, "uses_local_gateway", False) is True:
+        # Failure ends this operation, including downstream Engage. An
+        # unverified live request cannot become a second write to the H5 file.
+        backend.set_globals(dict(values), prepared=prepared)
+        report.remote_written.update(values)
+        return report
+    if prepared is not None:
+        raise ValueError("Prepared globals requests require local gateway mode")
 
     remote_current: dict[str, Any] = {}
     try:
@@ -80,6 +90,13 @@ def preview_runmanager_write_targets(
     h5_group: str = "",
 ) -> dict[str, str]:
     """Return remote/H5/missing targets without writing."""
+
+    if getattr(backend, "uses_local_gateway", False) is True:
+        try:
+            active = backend.local_snapshot()["globals_raw"]
+        except Exception:
+            return {name: "unavailable" for name in values}
+        return {name: "remote" if name in active else "missing" for name in values}
 
     remote_current: dict[str, Any] = {}
     try:

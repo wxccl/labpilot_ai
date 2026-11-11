@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
+from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from ipaddress import IPv4Address
+from urllib.parse import urlparse
 
 from .accessor import BLACSAccessor, json_safe
 
 name = "LabPilot Bridge"
 module = "labpilot_bridge"
+MAX_REQUEST_BYTES = 64 * 1024
+READ_TIMEOUT_SECONDS = 5
+
+
+def _finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite JSON number")
+    return number
 
 
 def _env_truthy(name_: str, default: bool = False) -> bool:
@@ -91,16 +103,28 @@ class Plugin(object):
             self.server = None
 
     def start_server(self):
+        host = self.host.strip()
+        if host.lower() == "localhost":
+            host = "127.0.0.1"
+        try:
+            address = IPv4Address(host)
+        except ValueError as exc:
+            raise ValueError("BLACS bridge requires a local IPv4 loopback address") from exc
+        if not address.is_loopback:
+            raise ValueError("BLACS bridge requires a local IPv4 loopback address")
+        self.host = str(address)
         plugin = self
+        token = self.token.strip().encode("utf-8")
+        writes_enabled = self.allow_write and bool(token)
 
         class Handler(BaseHTTPRequestHandler):
+            timeout = READ_TIMEOUT_SECONDS
+
             def _authorised(self) -> bool:
-                if not plugin.token:
+                if not token:
                     return True
-                header_token = self.headers.get("X-LabPilot-Token", "")
-                query = parse_qs(urlparse(self.path).query)
-                query_token = query.get("token", [""])[0]
-                return header_token == plugin.token or query_token == plugin.token
+                headers = self.headers.get_all("X-LabPilot-Token", [])
+                return len(headers) == 1 and compare_digest(headers[0].encode("utf-8"), token)
 
             def do_GET(self):
                 if not self._authorised():
@@ -110,7 +134,7 @@ class Plugin(object):
                 try:
                     if path == "/status":
                         payload = plugin.accessor.status()
-                        payload.update({"allow_write": plugin.allow_write, "token_required": bool(plugin.token)})
+                        payload.update({"allow_write": writes_enabled, "token_required": bool(token)})
                         self._send(payload)
                     elif path == "/debug":
                         self._send(plugin.accessor.debug())
@@ -131,11 +155,42 @@ class Plugin(object):
                 if path != "/set_manual":
                     self.send_error(404)
                     return
+                if not writes_enabled:
+                    self._send({"ok": False, "error": "BLACS bridge writes require explicit enablement and a header token"}, status=403)
+                    return
+                lengths = self.headers.get_all("Content-Length", [])
+                if self.headers.get("Transfer-Encoding") or len(lengths) != 1:
+                    self._send({"ok": False, "error": "A single Content-Length is required"}, status=400)
+                    return
+                length_text = lengths[0]
+                if len(length_text) > 10 or not length_text.isascii() or not length_text.isdecimal():
+                    self._send({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                    return
+                length = int(length_text)
+                if length < 1:
+                    self._send({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                    return
+                if length > MAX_REQUEST_BYTES:
+                    self._send({"ok": False, "error": "Request body exceeds the bridge limit"}, status=413)
+                    return
                 try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    raw = self.rfile.read(length).decode("utf-8")
-                    payload = json.loads(raw or "{}")
-                    result = plugin.accessor.set_manual(payload, allow_write=plugin.allow_write)
+                    raw = self.rfile.read(length)
+                except TimeoutError:
+                    self._send({"ok": False, "error": "Request body timed out"}, status=408)
+                    return
+                if len(raw) != length:
+                    self._send({"ok": False, "error": "Incomplete request body"}, status=400)
+                    return
+                try:
+                    payload = json.loads(raw.decode("utf-8"), parse_float=_finite_float, parse_constant=_finite_float)
+                except (ValueError, RecursionError):
+                    self._send({"ok": False, "error": "Invalid JSON request body"}, status=400)
+                    return
+                if not isinstance(payload, dict):
+                    self._send({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+                    return
+                try:
+                    result = plugin.accessor.set_manual(payload, allow_write=writes_enabled)
                     self._send(result, status=200 if result.get("ok") else 400)
                 except Exception as exc:
                     self._send({"ok": False, "error": str(exc)}, status=500)
@@ -156,3 +211,13 @@ class Plugin(object):
         self.thread = threading.Thread(target=self.server.serve_forever, name="LabPilotRealBLACSBridge", daemon=True)
         self.thread.start()
         print(f"LabPilot real BLACS bridge listening at http://{self.host}:{self.port}/status")
+
+
+def diagnostic_main() -> int:
+    """Print installation and readback guidance without starting a server."""
+    print("BLACS loads labpilot_ai.blacs_bridge.plugin.Plugin in its own process.")
+    print("For legacy readback, run tools/install_real_blacs_bridge.py --disable-write in the Labscript environment.")
+    print("After a normal BLACS restart, GET http://127.0.0.1:8765/status.")
+    print("Expected service: labpilot-real-blacs-bridge; expected allow_write: false.")
+    print("For guarded same-machine control, configure the local gateway and use labpilot-control.")
+    return 0

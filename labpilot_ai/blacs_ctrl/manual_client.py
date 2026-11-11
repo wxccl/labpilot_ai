@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from urllib import error, request
 
+from labpilot_ai.local_control.transport import local_gateway_enabled
+
+from .local_gateway import LocalBlacs
+
 
 class BlacsBridgeConnectionError(ConnectionError):
     pass
@@ -16,16 +20,37 @@ class BlacsManualClient:
     The legacy placeholder bridge reports service='labpilot-blacs-manual-bridge'.
     """
 
-    def __init__(self, host="127.0.0.1", port=8765, mock=True, token=None):
+    def __init__(self, host="127.0.0.1", port=8765, mock=True, token=None, *, local_gateway=None):
         self.host = host
         self.port = int(port)
         self.mock = bool(mock)
         self.token = token
         self.values = {}
+        self.local = None
+        if not self.mock and (local_gateway is not None or local_gateway_enabled()):
+            self.local = LocalBlacs(local_gateway)
 
     @property
     def base_url(self) -> str:
+        if self.local is not None:
+            return "local BLACS gateway"
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def uses_local_gateway(self):
+        return self.local is not None
+
+    def prepare_local_manual(self, name, value, *, approver, instruction, **extra):
+        if self.local is None:
+            raise ValueError("Local BLACS gateway mode is required to prepare a manual request")
+        fields = ("device", "channel", "unit", "subchannel")
+        return self.local.prepare_selected_manual(name, value, approver=approver, instruction=instruction,
+                                                  **{key: extra[key] for key in fields if key in extra})
+
+    def apply_local_manual(self, request):
+        if self.local is None:
+            raise ValueError("Local BLACS gateway mode is required to apply a prepared manual request")
+        return self.local.apply_selected_manual(request)
 
     def _headers(self):
         headers = {"Content-Type": "application/json"}
@@ -67,11 +92,15 @@ class BlacsManualClient:
     def status(self):
         if self.mock:
             return {"ok": True, "service": "mock-blacs-bridge", "mock": True}
+        if self.local is not None:
+            return self.local.status()
         return self._get_json("/status", timeout=5)
 
     def test(self):
         payload = self.status()
         service = payload.get("service", "unknown")
+        if payload.get("backend") == "local_gateway":
+            return "connected to running BLACS via the local gateway"
         if service == "mock-blacs-bridge":
             return "mock-blacs-bridge: ok"
         if service == "labpilot-real-blacs-bridge":
@@ -86,6 +115,8 @@ class BlacsManualClient:
     def debug(self):
         if self.mock:
             return {"ok": True, "mock": True, "values": dict(self.values)}
+        if self.local is not None:
+            return self.local.status()
         return self._get_json("/debug", timeout=10)
 
     def discover_channels(self):
@@ -104,6 +135,8 @@ class BlacsManualClient:
                 }
                 for name, value in sorted(self.values.items())
             ]
+        if self.local is not None:
+            return self.local.discover_channels()
         payload = self._get_json("/channels", timeout=10)
         if isinstance(payload, dict) and payload.get("ok") is False:
             raise RuntimeError(payload.get("error") or "BLACS bridge channel discovery failed")
@@ -112,6 +145,8 @@ class BlacsManualClient:
     def get_values(self):
         if self.mock:
             return dict(self.values)
+        if self.local is not None:
+            return self.local.get_values()
         payload = self._get_json("/values", timeout=10)
         if isinstance(payload, dict) and payload.get("ok") is False:
             raise RuntimeError(payload.get("error") or "BLACS bridge value readback failed")
@@ -124,6 +159,11 @@ class BlacsManualClient:
                 self.values.setdefault(alias, value)
             return {"mock": True, "ok": True, "name": name, "value": value, "program": program}
 
+        if self.local is not None:
+            fields = ("device", "channel", "unit", "subchannel", "approver", "instruction")
+            return self.local.set_manual(name, value, program=program,
+                                         **{key: extra[key] for key in fields if key in extra})
+
         last_error = None
         attempted = []
         for candidate in _manual_name_candidates(name, extra):
@@ -133,13 +173,13 @@ class BlacsManualClient:
                 result = self._post_json("/set_manual", payload, timeout=10)
             except RuntimeError as exc:
                 last_error = exc
-                if "not found" in str(exc).lower():
+                if _channel_lookup_refused(str(exc)):
                     continue
                 raise
             if isinstance(result, dict) and result.get("ok") is False:
                 message = result.get("error") or "BLACS bridge manual write failed"
                 last_error = RuntimeError(message)
-                if "not found" in message.lower():
+                if _channel_lookup_refused(message):
                     continue
                 raise last_error
             if isinstance(result, dict):
@@ -170,6 +210,11 @@ class BlacsManualClient:
                     if value and str(value) not in names:
                         names.append(str(value))
         return names[:50]
+
+
+def _channel_lookup_refused(message):
+    # Only a documented pre-write lookup error permits trying an older alias.
+    return str(message).startswith("BLACS manual channel not found:")
 
 
 def _manual_name_candidates(name, extra):

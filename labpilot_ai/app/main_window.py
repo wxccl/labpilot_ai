@@ -390,6 +390,8 @@ class OptimizerAutoLoopWorker(QtCore.QObject):
                 high_risk_approved=self.high_risk_approved,
                 history_path=str(history_path),
             )
+            if self.runmanager.uses_local_gateway and not config.dry_run:
+                raise RuntimeError("Local gateway experiments require a reviewed Engage request for each batch.")
             db = LabPilotDatabase(output_dir / "labpilot.sqlite")
 
             def apply_params(params):
@@ -3357,7 +3359,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
             for name, value in safe.get("blacs_manual", {}).items():
                 rule = self.blacs_registry.get(name, {})
-                result = self.blacs.set_manual(
+                result = self._write_blacs_manual(
                     name,
                     value,
                     program=self.blacs_program.isChecked(),
@@ -3366,6 +3368,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     channel=rule.get("channel", ""),
                     unit=rule.get("unit", ""),
                     aliases=rule.get("aliases", []),
+                    subchannel=rule.get("subchannel"),
                 )
                 self._update_blacs_table_value(name, value, result=result)
                 self.log("BLACS set_manual OK: " + dumps(result))
@@ -3401,7 +3404,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     include_knowledge_context=item.get("include_knowledge_context", True),
                     include_optimizer_history=item.get("include_optimizer_history", True),
                 )
-            if engage:
+            if engage and self.rm.uses_local_gateway:
+                prepared = self.rm.prepare_engage()
+                n = prepared["expected_n_shots"]
+                ans = QtWidgets.QMessageBox.question(
+                    self, "Confirm Engage",
+                    f"Submit {n} shot(s) using the current Runmanager configuration?\n"
+                    f"Configuration SHA-256: {prepared['expected_config_digest']}",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                engage = ans == QtWidgets.QMessageBox.Yes
+                if engage:
+                    receipt = self.rm.engage(prepared=prepared)
+                    self.log("Runmanager acknowledged Engage: " + dumps(receipt))
+                else:
+                    self.log("Engage cancelled by user; earlier write actions were already applied.")
+            elif engage:
                 n = self.rm.n_shots()
                 if confirm_engage:
                     ans = QtWidgets.QMessageBox.question(
@@ -3464,7 +3483,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 remote_error = exc
                 g = {}
 
-            if not g:
+            if self.rm.uses_local_gateway:
+                if remote_error is not None:
+                    raise remote_error
+                source = "local Runmanager gateway"
+            elif not g:
                 try:
                     snapshot = self._read_runmanager_globals_h5_snapshot()
                 except Exception as exc:
@@ -3493,12 +3516,20 @@ class MainWindow(QtWidgets.QMainWindow):
         direct_h5 = bool(cfg.get("direct_h5_write", True))
         group = str(cfg.get("direct_h5_group", "") or "")
         h5_path = self._configured_runmanager_globals_h5_path()
+        prepared = None
+        if self.rm.uses_local_gateway and values:
+            prepared = self.rm.prepare_globals(values)
+            diff = prepared["plan"]["diff"]
+            text = "\n".join(f"{row['name']}: {row['before']} → {row['expected_after']}" for row in diff)
+            if not self._confirm_local_change("Apply Runmanager globals", text):
+                raise RuntimeError("Runmanager changes cancelled")
         report = write_runmanager_globals(
             self.rm,
             values,
             globals_h5_path=h5_path if h5_path else None,
             direct_h5_write=direct_h5,
             h5_group=group,
+            prepared=prepared,
         )
         if report.remote_written:
             self.log("runmanager remote write OK: " + dumps(report.remote_written))
@@ -3686,6 +3717,10 @@ class MainWindow(QtWidgets.QMainWindow):
             action = {"type": "set_global", "name": name, "value": str(value).strip().strip("'\"")}
             safe = self.validator.validate_command({"actions": [action]})
             converted = safe["globals"][name]
+            if self.rm.uses_local_gateway and self.dry_run.isChecked():
+                self.last_safe = safe
+                self._fill_actions(safe)
+                return
             report = self.write_runmanager_safe_globals({name: converted})
             self.last_safe = safe
             self._fill_actions(safe)
@@ -3961,6 +3996,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setText(str(value))
                 if col != 6:
                     item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.blacs_table.item(row, 0).setData(QtCore.Qt.UserRole, {
+                "unit": channel.get("unit", ""),
+                "subchannel": channel.get("subchannel"),
+            })
         finally:
             self.blacs_table.blockSignals(False)
             self._loading_blacs_table = False
@@ -3985,7 +4024,11 @@ class MainWindow(QtWidgets.QMainWindow):
             action = {"type": "set_blacs_manual", "name": canonical, "value": str(value).strip().strip("'\"")}
             safe = self.validator.validate_command({"actions": [action]})
             converted = safe["blacs_manual"][canonical]
-            result = self.blacs.set_manual(
+            if self.blacs.uses_local_gateway and self.dry_run.isChecked():
+                self.last_safe = safe
+                self._fill_actions(safe)
+                return
+            result = self._write_blacs_manual(
                 canonical,
                 converted,
                 program=self.blacs_program.isChecked(),
@@ -3994,6 +4037,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 channel=rule.get("channel", ""),
                 unit=rule.get("unit", ""),
                 aliases=rule.get("aliases", []),
+                subchannel=rule.get("subchannel"),
             )
             self.last_safe = safe
             self._fill_actions(safe)
@@ -4001,6 +4045,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"Auto uploaded BLACS manual channel: {canonical} = {converted!r}; result={dumps(result)}")
         except Exception as exc:
             self._show_error(f"Auto upload BLACS channel failed: {name}", exc)
+
+    def _confirm_local_change(self, title, detail):
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle(title)
+        dialog.setTextFormat(QtCore.Qt.PlainText)
+        dialog.setText(title)
+        dialog.setDetailedText(detail)
+        dialog.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        dialog.setDefaultButton(QtWidgets.QMessageBox.No)
+        dialog.setInformativeText(detail if len(detail) <= 450 else "Open Show Details to review the full change.")
+        return dialog.exec_() == QtWidgets.QMessageBox.Yes
+
+    def _write_blacs_manual(self, name, value, *, program, **extra):
+        if not self.blacs.uses_local_gateway:
+            return self.blacs.set_manual(name, value, program=program, **extra)
+        if not program:
+            raise ValueError("Enable Program before preparing a local BLACS output change.")
+        approver = os.getenv("LABPILOT_OPERATOR", "").strip()
+        if not approver:
+            approver, ok = QtWidgets.QInputDialog.getText(self, "BLACS operator", "Operator name registered in the gateway")
+            if not ok or not approver.strip():
+                raise RuntimeError("BLACS change cancelled")
+        instruction = f"Set {name} to {value!r}"
+        prepared = self.blacs.prepare_local_manual(name, value, approver=approver.strip(),
+                                                   instruction=instruction, **extra)
+        if not self._confirm_local_change("Apply BLACS output", dumps(prepared["payload"])):
+            raise RuntimeError("BLACS change cancelled")
+        receipt = self.blacs.apply_local_manual(prepared)
+        if receipt.get("state") != "APPLIED":
+            self.log("BLACS gateway receipt: " + dumps(receipt))
+            raise RuntimeError(
+                f"BLACS returned {receipt.get('state', 'UNKNOWN')}. Check the request receipt and current state."
+            )
+        after = receipt["value"]["after"]
+        channel, change = next(iter(prepared["payload"]["changes"].items()))
+        current = after[channel]
+        if isinstance(change, dict) and isinstance(current, dict):
+            current = current.get(next(iter(change)))
+        return {**receipt, "front_panel_value": current}
 
     def _update_blacs_table_value(self, name, value, result=None, row=None):
         if row is None or row < 0:
@@ -4071,17 +4154,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if not name_item or not name_item.text().strip():
                 continue
             name = name_item.text().strip()
-            range_text = self.blacs_table.item(row, 4).text() if self.blacs_table.item(row, 4) else ""
-            unit = ""
-            if " " in range_text:
-                unit = range_text.rsplit(" ", 1)[-1]
+            descriptor = name_item.data(QtCore.Qt.UserRole) or {}
+            kind_item = self.blacs_table.item(row, 1)
+            kind = kind_item.text() if kind_item else "manual"
             self.blacs_registry[name] = {
                 "name": name,
-                "kind": self.blacs_table.item(row, 1).text() if self.blacs_table.item(row, 1) else "manual",
+                "kind": kind,
                 "device": self.blacs_table.item(row, 2).text() if self.blacs_table.item(row, 2) else "",
                 "channel": self.blacs_table.item(row, 3).text() if self.blacs_table.item(row, 3) else name,
-                "type": "float",
-                "unit": unit,
+                "type": "bool" if kind.upper() == "DO" else "float",
+                "unit": descriptor.get("unit", ""),
+                "subchannel": descriptor.get("subchannel"),
                 "risk": self.blacs_table.item(row, 7).text() if self.blacs_table.item(row, 7) else "unknown",
                 "require_confirm": True,
                 "ai_control": False,
@@ -5780,6 +5863,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         h5_folder = self.h5_folder.text().strip() if hasattr(self, "h5_folder") else ""
         dry_run = self.dry_run.isChecked() if hasattr(self, "dry_run") else True
+        if self.rm.uses_local_gateway and not dry_run:
+            QtWidgets.QMessageBox.warning(self, "Review each Engage", "Use Dry run or prepare and confirm each batch separately in local gateway mode.")
+            return
         if not dry_run and not h5_folder:
             QtWidgets.QMessageBox.warning(self, "Missing H5 folder", "Choose an H5 output folder before starting a real supervised loop.")
             return
@@ -6431,15 +6517,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif not seq_path.exists():
                     messages.append(f"Skipped runmanager sequence: file does not exist: {seq_path}")
                 else:
-                    self.rm.set_labscript_file(str(seq_path))
+                    if self.rm.uses_local_gateway:
+                        request = self.rm.prepare_configuration("set_sequence", {"sequence": str(seq_path)})
+                        if not self._confirm_local_change("Set Runmanager sequence", dumps(request["plan"]["diff"])):
+                            return
+                        self.rm.set_labscript_file(str(seq_path), prepared=request)
+                    else:
+                        self.rm.set_labscript_file(str(seq_path))
                     values["active_sequence_file"] = str(seq_path)
                     values["sequence_dir"] = str(seq_path.parent)
                     messages.append(f"Applied runmanager active sequence: {seq_path}")
 
             if output_dir:
                 out_path = self._project_path(output_dir)
-                out_path.mkdir(parents=True, exist_ok=True)
-                self.rm.set_shot_output_folder(str(out_path))
+                if self.rm.uses_local_gateway:
+                    if not out_path.is_dir():
+                        raise ValueError("Choose an existing shot output directory.")
+                    request = self.rm.prepare_configuration("set_output", {"output": str(out_path)})
+                    if not self._confirm_local_change("Set Runmanager output folder", dumps(request["plan"]["diff"])):
+                        return
+                    self.rm.set_shot_output_folder(str(out_path), prepared=request)
+                else:
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    self.rm.set_shot_output_folder(str(out_path))
                 values["h5_output_dir"] = str(out_path)
                 if hasattr(self, "h5_folder"):
                     self.h5_folder.setText(str(out_path))
