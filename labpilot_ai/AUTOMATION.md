@@ -60,7 +60,7 @@ labpilot events TASK_ID
 }
 ```
 
-Runmanager 使用原生本机 API。使用 BLACS 静态控制时，用原 Labscript Python 安装同版本 LabPilot wheel，执行 `python -m pip install --no-deps labpilot-ai==0.2.0`。在 profile 启用 BLACS 并填写精确设备与通道，然后用以下命令预览和应用插件配置。应用后正常重启 BLACS 以加载插件。卸载使用对应的 `uninstall-host` 命令。
+Runmanager 使用原生本机 API。使用 BLACS 静态控制时，用原 Labscript Python 安装同版本 LabPilot wheel，执行 `python -m pip install --no-deps labpilot-ai==0.2.1`。在 profile 启用 BLACS 并填写精确设备与通道，然后用以下命令预览和应用插件配置。应用后正常重启 BLACS 以加载插件。卸载使用对应的 `uninstall-host` 命令。
 
 ```powershell
 labpilot --profile station.json install-host --labconfig "D:/labscript-suite/labconfig/COMPUTER.ini"

@@ -1,6 +1,6 @@
 # LabPilot AI
 
-**v0.2.0 automation** runs persistent experiment tasks through a packaged Labscript host. Start with `python -m pip install labpilot-ai` and `labpilot init` for a simulated station. The new `labpilot` CLI and optional task UI share the task database with Codex MCP and DeepSeek. See the [automation guide](labpilot_ai/AUTOMATION.md) for simulation, site setup, approval, evidence, and compatibility.
+**LabPilot automation** runs persistent experiment tasks through a packaged Labscript host. Start with `python -m pip install labpilot-ai` and `labpilot init` for a simulated station. The new `labpilot` CLI and optional task UI share the task database with Codex MCP and DeepSeek. See the [automation guide](labpilot_ai/AUTOMATION.md) for simulation, site setup, approval, evidence, and compatibility.
 
 LabPilot AI is an industrial-style local AI copilot for labscript-suite experiments. It does not modify labscript, runmanager, BLACS, or lyse internals. Instead, it wraps stable boundaries: registry whitelists, local safety validation, runmanager/BLACS/lyse adapters, HDF5-compatible data, SQLite/JSONL logs, and a PyQt5 desktop UI.
 
