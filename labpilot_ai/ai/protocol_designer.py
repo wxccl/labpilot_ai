@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 def draft_protocol_suggestion(prompt: str, known_globals: dict | None = None, project_context: str | None = None) -> str:
     known_globals = known_globals or {}
     names = ", ".join(list(known_globals)[:12]) or "no registered globals yet"
