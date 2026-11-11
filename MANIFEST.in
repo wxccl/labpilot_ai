@@ -1,6 +1,6 @@
 global-exclude *.bak *.bak_* *.pyc *.pyo
 include tools/install_real_blacs_bridge.py
 include tools/native_e2e.py
-include docs/releases/v0.3.0rc1.md
+include docs/releases/v0.3.0.md
 include manual/03_blacs/real_blacs_bridge.md
 include manual/00_local_control.md
