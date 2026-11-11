@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from .labscript_paths import expected_suffixes_for_key
+
 
 DIRECTORY_FIELDS = [
     {
@@ -32,9 +34,9 @@ DIRECTORY_FIELDS = [
     },
     {
         "key": "runmanager_globals_path",
-        "label": "Runmanager globals",
-        "kind": "file",
-        "meaning": "Optional path to a runmanager globals file or exported snapshot.",
+        "label": "Runmanager globals H5",
+        "kind": "hdf5",
+        "meaning": "Path to the runmanager globals HDF5 file (.h5/.hdf5). Values are edited live through runmanager.remote.set_globals().",
         "source": "runmanager/manual",
         "optional": True,
     },
@@ -42,7 +44,7 @@ DIRECTORY_FIELDS = [
         "key": "blacs_connection_context_path",
         "label": "BLACS connection context",
         "kind": "file",
-        "meaning": "Optional file used as BLACS connection/device context.",
+        "meaning": "Optional connection table context, usually labconfig connection_table_h5 or connection_table.py.",
         "source": "BLACS/manual",
         "optional": True,
     },
@@ -179,8 +181,12 @@ def validate_directory_settings(settings, project_dir=None):
         if not exists:
             messages.append({"key": key, "level": "warning", "message": f"Path does not exist: {path}"})
             continue
+        suffixes = expected_suffixes_for_key(key)
+        if suffixes and path.suffix.lower() not in suffixes:
+            expected = ", ".join(sorted(suffixes))
+            messages.append({"key": key, "level": "error", "message": f"Expected extension {expected}: {path}"})
         if kind == "dir" and not path.is_dir():
             messages.append({"key": key, "level": "error", "message": f"Expected a folder: {path}"})
-        elif kind in {"file", "sqlite"} and not path.is_file():
+        elif kind in {"file", "sqlite", "hdf5"} and not path.is_file():
             messages.append({"key": key, "level": "error", "message": f"Expected a file: {path}"})
     return messages

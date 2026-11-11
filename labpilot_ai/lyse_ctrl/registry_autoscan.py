@@ -43,6 +43,22 @@ def _detect_mode(path: Path) -> str:
     return "lyse_script"
 
 
+def _looks_like_analysis_routine(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+
+    routine_markers = [
+        r"^\s*def\s+run\s*\(",
+        r"\bRun\s*\(",
+        r"\bsave_result\s*\(",
+        r"\blyse\.data\s*\(",
+        r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*data\s*\(",
+    ]
+    return any(re.search(pattern, text, flags=re.MULTILINE) for pattern in routine_markers)
+
+
 def _scan_py_files(folder: str | Path | None) -> list[Path]:
     if not folder:
         return []
@@ -56,6 +72,8 @@ def _scan_py_files(folder: str | Path | None) -> list[Path]:
         if "__pycache__" in path.parts:
             continue
         if path.name.startswith("_"):
+            continue
+        if not _looks_like_analysis_routine(path):
             continue
         files.append(path.resolve())
 

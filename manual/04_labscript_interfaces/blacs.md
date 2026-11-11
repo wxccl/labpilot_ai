@@ -4,24 +4,22 @@ LabPilot AI talks to BLACS through a localhost bridge boundary. It does not patc
 
 ## v0.1.3 bridge scope
 
-The first real BLACS bridge target is readonly discovery and readback:
+The first real BLACS bridge target is controlled manual write/readback through the LabPilot bridge:
 
 - `GET /status`
 - `GET /channels`
 - `GET /values`
+- `POST /set_manual`
 
 The UI exposes:
 
 - `Test BLACS bridge`
-- `Refresh bridge status`
-- `Discover channels`
 - `Read current values`
-- `Import selected channels`
-- `Set selected manual value`
-- `Apply checked channels`
-- `Load connection table context`
+- `AI parse usable actions`
+- `Index H5/BLACS to Knowledge`
+- `Program hardware on write`
 
-`Discover channels` and `Read current values` are safe observation tools. `Import selected channels` writes only to the local LabPilot registry draft, marks imported channels as requiring confirmation, and keeps `ai_control: false` until a human reviews the entry.
+`AI parse usable actions` reads the active `connection_table.py` without executing it and imports manual AO/DO/static channels into the local BLACS registry. Editing the `target value` cell writes immediately through the BLACS bridge after local type/range validation; empty target cells are ignored.
 
 ## Registry example
 
@@ -45,8 +43,8 @@ mot_coil_current:
 ```text
 Natural-language command or UI edit
   -> JSON action with type="set_blacs_manual"
-  -> SafetyValidator whitelist/type/range/risk check
-  -> dry-run preview and high-risk confirmation
+  -> SafetyValidator whitelist/type/range check
+  -> table edits write immediately; natural-language commands still use Parse/Execute review
   -> manual_client
   -> localhost BLACS bridge
 ```

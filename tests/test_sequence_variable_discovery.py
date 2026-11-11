@@ -31,3 +31,23 @@ stop(1)
     assert registry["scan_values"]["type"] == "float_array"
     assert registry["do_SG"]["type"] == "bool"
     assert registry["duration_probe_us"]["unit"] == "us"
+
+
+def test_sequence_variable_discovery_ignores_nested_settings(tmp_path):
+    seq = tmp_path / "sequence.py"
+    seq.write_text("duration_tof_ms = 12.0\nif do_Rabi:\n    pass\n", encoding="utf-8")
+
+    registry, report = discover_sequence_globals(
+        {
+            "active_sequence_file": str(seq),
+            "co_sequence": {"review_required_default": True},
+            "voice": {"input_enabled": True},
+            "recent_sequence_paths": [str(seq)],
+        },
+        {},
+        project_dir=tmp_path,
+    )
+
+    assert report["files"] == [str(seq.resolve())]
+    assert registry["duration_tof_ms"]["type"] == "float"
+    assert registry["do_Rabi"]["type"] == "bool"

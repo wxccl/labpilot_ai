@@ -1,0 +1,4 @@
+global-exclude *.bak *.bak_* *.pyc *.pyo
+include tools/install_real_blacs_bridge.py
+include manual/03_blacs/real_blacs_bridge.md
+include manual/00_local_control.md

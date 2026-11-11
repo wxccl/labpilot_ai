@@ -8,6 +8,7 @@ from labpilot_ai.voice.cuda_paths import add_cuda_dll_dirs_to_env, cuda_dll_stat
 from labpilot_ai.voice.diagnostics import classify_stt_error, run_voice_diagnostics
 from labpilot_ai.voice.lexicon import VoiceLexicon
 from labpilot_ai.voice.stt_backend import SpeechToTextBackend
+from labpilot_ai.voice.tts_backend import TextToSpeechBackend, summarize_safe_actions
 from labpilot_ai.voice.wake_agent import contains_wake_name, strip_wake_name
 
 
@@ -143,3 +144,50 @@ def test_voice_diagnostics_cpu_only():
     assert report.cpu_only is True
     assert report.device == "cpu"
     assert report.compute_type == "int8"
+
+
+def test_tts_backend_disabled_does_not_speak():
+    backend = TextToSpeechBackend(enabled=False, backend="system")
+    assert backend.speak("hello")["spoken"] is False
+
+
+def test_tts_backend_missing_dependency_is_nonfatal(monkeypatch):
+    import labpilot_ai.voice.tts_backend as tts_backend
+
+    monkeypatch.setattr(tts_backend.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(tts_backend.os, "name", "posix")
+    backend = TextToSpeechBackend(enabled=True, backend="pyttsx3")
+    assert backend.available() is False
+
+
+def test_summarize_safe_actions_limits_sensitive_detail():
+    safe = {
+        "actions": [
+            {"type": "set_global", "name": "duration_tof_ms", "value": 17},
+            {"type": "set_blacs_manual", "name": "ao0", "value": 1.2},
+            {"type": "load_h5", "path": "E:/secret/lab/data/shot001.h5"},
+            {"type": "run_single_lyse", "name": "atom_number"},
+            {"type": "start_optimization", "method": "grid", "objective": "N_total"},
+        ],
+        "confirmations": [{"name": "ao0", "risk": "high"}],
+    }
+    text = summarize_safe_actions(safe, max_chars=120)
+    assert "duration_tof_ms" in text
+    assert "ao0" in text
+    assert "shot001.h5" in text
+    assert "E:/secret" not in text
+    assert len(text) <= 120
+    assert "确认" in text or "..." in text
+
+
+def test_project_voice_template_has_reply_defaults():
+    import yaml
+    from pathlib import Path
+
+    path = Path("labpilot_ai/templates/configs/project_settings.yaml")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    voice = data["voice"]
+    assert voice["input_enabled"] is True
+    assert voice["reply_enabled"] is False
+    assert voice["tts_backend"] == "system"
+    assert voice["tts_max_chars"] == 240

@@ -39,6 +39,8 @@ def run_lyse_script(script_path, *, mode, h5_path=None, dataframe=None, meta_h5_
 
     with tempfile.TemporaryDirectory(prefix="labpilot_lyse_script_") as temp_dir:
         result_json = Path(temp_dir) / "result.json"
+        dataframe_json = Path(temp_dir) / "dataframe.json"
+        dataframe_json.write_text(_dataframe_payload(dataframe), encoding="utf-8")
         command = [
             sys.executable,
             "-m",
@@ -51,8 +53,8 @@ def run_lyse_script(script_path, *, mode, h5_path=None, dataframe=None, meta_h5_
             str(h5_path or ""),
             "--meta-h5-path",
             str(meta_h5_path or ""),
-            "--dataframe-json",
-            _dataframe_payload(dataframe),
+            "--dataframe-json-file",
+            str(dataframe_json),
             "--params-json",
             json.dumps(params or {}, ensure_ascii=False),
             "--result-json",

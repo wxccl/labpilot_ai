@@ -1,10 +1,12 @@
 import os
 import json
 import queue
+import re
 import time
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import yaml
 import pandas as pd
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -15,11 +17,22 @@ from labpilot_ai.ai.llm_client import LLMClient
 from labpilot_ai.ai.protocol_importer import build_protocol_prompt, describe_image_attachment, import_protocol_file
 from labpilot_ai.ai.protocol_designer import draft_protocol_suggestion
 from labpilot_ai.analysis import plotting
-from labpilot_ai.analysis.fit_models import fit_histogram, fit_xy, fit_xyz
+from labpilot_ai.analysis.fit_models import MODEL_FUNCS, double_gaussian2d, fit_histogram, fit_xy, fit_xyz, gaussian2d
+from labpilot_ai.analysis.plot_specs import (
+    PLOT_SPECS,
+    default_plot_columns,
+    numeric_varying_columns,
+    required_columns,
+    valid_fit_models,
+)
 from labpilot_ai.analysis.report_generator import generate_markdown_report
 from labpilot_ai.app.error_center import ErrorCenter
 from labpilot_ai.app.theme import APP_STYLE
 from labpilot_ai.blacs_ctrl.manual_client import BlacsManualClient
+from labpilot_ai.blacs_ctrl.connection_table_discovery import (
+    discover_blacs_channels_from_connection_table,
+    merge_blacs_registry_from_connection_table,
+)
 from labpilot_ai.co_sequence import CodeChangeLogStore, apply_patch_plan, validate_patch_plan
 from labpilot_ai.config.registry_editor import (
     BLACS_FIELDS,
@@ -35,12 +48,12 @@ from labpilot_ai.config.registry_editor import (
     validate_lyse_registry,
 )
 from labpilot_ai.config.settings_manager import SettingsManager
-from labpilot_ai.directory import DIRECTORY_FIELDS, default_directory_settings, validate_directory_settings
+from labpilot_ai.directory import DIRECTORY_FIELDS, default_directory_settings, detect_labscript_paths, field_file_filter, validate_directory_settings
 from labpilot_ai.experiment_log import generate_experiment_log, save_experiment_log
 from labpilot_ai.knowledge.context_builder import build_project_context
 from labpilot_ai.knowledge.indexer import KnowledgeIndexer, discover_source_files, project_db_path, source_counts
 from labpilot_ai.knowledge.search import KnowledgeSearch
-from labpilot_ai.lyse_ctrl.h5_loader import load_h5_folder, read_shot_summary
+from labpilot_ai.lyse_ctrl.h5_loader import iter_h5_paths, load_h5_folder, read_shot_summary
 from labpilot_ai.lyse_ctrl.multi_runner import run_multi_module
 from labpilot_ai.lyse_ctrl.result_store import JsonlResultStore, default_result_store_path, merge_result_columns
 from labpilot_ai.lyse_ctrl.single_runner import run_single_module
@@ -50,6 +63,8 @@ from labpilot_ai.optimizer.experiment_loop import OptimizerLoop
 from labpilot_ai.optimizer.history import save_optimization_history
 from labpilot_ai.optimizer.lyse_feedback import latest_row_position, objective_values_from_row, tell_optimizer_from_dataframe
 from labpilot_ai.runmanager_ctrl.backend import RunmanagerBackend
+from labpilot_ai.runmanager_ctrl.globals_h5 import read_runmanager_globals_h5, registry_from_globals_h5
+from labpilot_ai.runmanager_ctrl.write_router import preview_runmanager_write_targets, write_runmanager_globals
 from labpilot_ai.runmanager_ctrl.sequence_variable_discovery import discover_sequence_globals
 from labpilot_ai.safety.validator import SafetyValidator
 from labpilot_ai.storage.database import LabPilotDatabase
@@ -58,9 +73,69 @@ from labpilot_ai.utils.paths import app_icon_path, default_config_dir
 from labpilot_ai.voice.recorder import AudioRecorder, write_wav
 from labpilot_ai.voice.diagnostics import run_voice_diagnostics
 from labpilot_ai.voice.stt_backend import SpeechToTextBackend
+from labpilot_ai.voice.tts_backend import TextToSpeechBackend, summarize_safe_actions
 from labpilot_ai.voice.vad import SilenceDetector, rms
 from labpilot_ai.voice.wake_agent import WakeAgentConfig, contains_wake_name, strip_wake_name
 from labpilot_ai.voice.lexicon import VoiceLexicon
+
+
+def configure_table_columns(table, *, stretch_last=True, movable=False):
+    """Use manually resizable table columns across the industrial UI."""
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+    header.setStretchLastSection(bool(stretch_last))
+    header.setSectionsMovable(bool(movable))
+    table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+    table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+
+
+NO_SHOT_TOKENS = (
+    "do not run",
+    "don't run",
+    "no run",
+    "not run",
+    "dry run",
+    "preview only",
+    "不运行",
+    "不要运行",
+    "别运行",
+    "不跑",
+    "不要跑",
+    "别跑",
+    "不提交",
+    "不要提交",
+)
+
+
+SHOT_REQUEST_RE = re.compile(
+    r"\b(run|submit|engage)\b|"
+    r"\b(run|submit|engage)\s+(a\s+)?(shot|sequence|experiment)\b|"
+    r"\b(start|execute)\s+(a\s+)?(shot|sequence|experiment)\b",
+    re.IGNORECASE,
+)
+
+
+SHOT_REQUEST_TOKENS = (
+    "运行",
+    "跑一次",
+    "跑实验",
+    "跑时序",
+    "开始实验",
+    "提交shot",
+    "提交 shot",
+    "提交时序",
+    "提交实验",
+    "engage",
+)
+
+
+def user_text_requests_shot(text) -> bool:
+    """Return True only when the user explicitly asks to submit/run a shot."""
+    raw = str(text or "")
+    low = raw.lower()
+    if any(token in low or token in raw for token in NO_SHOT_TOKENS):
+        return False
+    return bool(SHOT_REQUEST_RE.search(raw)) or any(token in raw for token in SHOT_REQUEST_TOKENS)
 
 
 class TranscriptionWorker(QtCore.QObject):
@@ -83,6 +158,61 @@ class TranscriptionWorker(QtCore.QObject):
             self.finished.emit(text, self.audio_path)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class SpeechWorker(QtCore.QObject):
+    status = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, tts):
+        super().__init__()
+        self.tts = tts
+        self._queue = queue.Queue()
+        self._running = False
+
+    def enqueue(self, text, priority=False):
+        if priority:
+            self.clear()
+        self._queue.put(str(text or ""))
+
+    def clear(self):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def stop(self):
+        self._running = False
+        try:
+            self.tts.stop()
+        except Exception:
+            pass
+        self._queue.put(None)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        self._running = True
+        try:
+            while self._running:
+                try:
+                    text = self._queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if text is None:
+                    break
+                if not text:
+                    continue
+                try:
+                    result = self.tts.speak(text)
+                    if result.get("spoken"):
+                        self.status.emit("Speaker ready")
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+        finally:
+            self._running = False
+            self.stopped.emit()
 
 
 class WakeStandbyWorker(QtCore.QObject):
@@ -260,6 +390,8 @@ class OptimizerAutoLoopWorker(QtCore.QObject):
                 high_risk_approved=self.high_risk_approved,
                 history_path=str(history_path),
             )
+            if self.runmanager.uses_local_gateway and not config.dry_run:
+                raise RuntimeError("Local gateway experiments require a reviewed Engage request for each batch.")
             db = LabPilotDatabase(output_dir / "labpilot.sqlite")
 
             def apply_params(params):
@@ -402,9 +534,11 @@ class RegistryEditorWidget(QtWidgets.QWidget):
         layout.addLayout(header)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(8)
         self.table = QtWidgets.QTableWidget(0, len(self.fields))
         self.table.setHorizontalHeaderLabels(self.fields)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.table)
         self.table.itemSelectionChanged.connect(self.load_selected_row_to_form)
         split.addWidget(self.table)
 
@@ -630,7 +764,7 @@ class ProjectPathsWidget(QtWidgets.QWidget):
 
     def browse(self, field):
         if field in {"connection_table", "active_connection_table", "active_sequence_file", "runmanager_globals_path", "blacs_connection_context_path"}:
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field}", "", "Python files (*.py);;YAML files (*.yaml *.yml);;All files (*.*)")
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field}", "", field_file_filter(field, field))
         elif field == "knowledge_db_path":
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Choose knowledge database", "", "SQLite database (*.sqlite *.db);;All files (*.*)")
         else:
@@ -671,6 +805,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blacs_registry = self.settings.load_blacs_registry()
         self.lyse_registry = self.settings.load_lyse_registry()
         self.project_settings = self.settings.load_project_settings()
+        self.runtime_api_key = ""
+        self.runtime_api_key_source = "missing"
         self.error_records = []
         self.database = database or LabPilotDatabase(Path.cwd() / "labpilot_outputs" / "labpilot_state.sqlite")
         self.error_center = error_center or ErrorCenter(database=self.database, parent=self)
@@ -702,6 +838,17 @@ class MainWindow(QtWidgets.QMainWindow):
             samplerate=voice_cfg.get("samplerate", 16000),
             channels=1,
         )
+        self.tts = TextToSpeechBackend(
+            enabled=voice_cfg.get("reply_enabled", False),
+            backend=voice_cfg.get("tts_backend", "system"),
+            rate=voice_cfg.get("tts_rate", 180),
+            volume=voice_cfg.get("tts_volume", 0.85),
+            voice_name=voice_cfg.get("tts_voice_name", ""),
+            language=voice_cfg.get("language", "zh,en"),
+            max_chars=voice_cfg.get("tts_max_chars", 240),
+        )
+        self.speech_thread = None
+        self.speech_worker = None
         self.voice_recording = False
         self.transcription_thread = None
         self.transcription_worker = None
@@ -713,11 +860,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.last_command = None
         self.last_safe = None
+        self.last_user_requested_run = False
         self.h5_df = None
+        self.h5_file_states = {}
+        self.h5_read_errors = {}
+        self.h5_auto_loading = False
         self.visible_h5_columns = None
         self.fit_results = []
         self.figure_paths = []
+        self.figure_windows = []
         self.analysis_records = []
+        self.plot_column_candidates = []
         self.result_store = JsonlResultStore(default_result_store_path())
         self.optimizer_loop = None
         self.optimizer_pending_params = None
@@ -732,8 +885,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.co_sequence_plan = None
         self.co_sequence_validation = None
         self.experiment_log_text = ""
+        self.lyse_auto_load_timer = QtCore.QTimer(self)
+        lyse_cfg = self.project_settings.get("lyse", {}) or {}
+        self.lyse_auto_load_timer.setInterval(int(lyse_cfg.get("auto_load_interval_ms", 1000)))
+        self.lyse_auto_load_timer.timeout.connect(self.auto_refresh_h5_table)
 
         self._build_ui()
+        self.lyse_auto_load_timer.start()
         self._install_llm_api_status_panel()
         self._install_runtime_status_widgets()
         self._force_real_connections()
@@ -746,7 +904,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _llm_api_status_text(self):
         client = getattr(self, "llm", None)
         if client is None:
-            client = LLMClient(mock=False)
+            client = self._make_llm_client()
             self.llm = client
         status = client.status() if hasattr(client, "status") else {
             "mock": getattr(client, "mock", False),
@@ -760,7 +918,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return "LLM real requested, but API key missing. Set DEEPSEEK_API_KEY or OPENAI_API_KEY and restart."
 
     def refresh_llm_status(self):
-        self.llm = LLMClient(mock=False)
+        self.llm = self._make_llm_client()
+        self.update_llm_api_status()
         text = self._llm_api_status_text()
         try:
             if not hasattr(self, "llm_status_label"):
@@ -786,7 +945,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 widget.blockSignals(False)
             except Exception:
                 pass
-        self.llm = LLMClient(mock=False)
+        self.llm = self._make_llm_client()
         self.rm = RunmanagerBackend(mock=False)
         self.blacs = BlacsManualClient(mock=False)
         self.refresh_llm_status()
@@ -809,7 +968,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _llm_runtime_status(self):
         """Return sanitized LLM runtime status without exposing the full API key."""
-        client = LLMClient(mock=False)
+        client = self._make_llm_client()
+        self.llm = client
         if hasattr(client, "status"):
             status = dict(client.status())
         else:
@@ -828,7 +988,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 source = "OPENAI_API_KEY"
             else:
                 source = "missing"
-        raw_key = os.getenv(source, "") if source.endswith("_API_KEY") else ""
+        raw_key = getattr(client, "api_key", "") or (os.getenv(source, "") if source.endswith("_API_KEY") else "")
         if raw_key:
             masked = raw_key[:8] + "..." + raw_key[-4:] if len(raw_key) > 12 else "***"
         else:
@@ -939,6 +1099,13 @@ class MainWindow(QtWidgets.QMainWindow):
         button.clicked.connect(lambda checked=False, s=slot: s())
         return button
 
+    def _make_splitter(self, orientation):
+        splitter = QtWidgets.QSplitter(orientation)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        splitter.setOpaqueResize(True)
+        return splitter
+
     def _project_dock(self):
         dock = QtWidgets.QDockWidget("Project", self)
         dock.setObjectName("LabPilotProjectDock")
@@ -1000,6 +1167,135 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         self.inspector_text.setPlainText(dumps(payload, indent=2))
 
+    def _ai_config(self):
+        settings = dict(self.project_settings or {})
+        ai = dict(settings.get("ai", {}) or {})
+        settings["ai"] = ai
+        return settings, ai
+
+    def _environment_api_key(self):
+        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            value = os.getenv(name)
+            if value:
+                return value, name
+        return "", "missing"
+
+    def _configured_api_key(self):
+        _settings, ai = self._ai_config()
+        value = str(ai.get("api_key", "") or "").strip()
+        if value:
+            return value, "local project_settings.yaml"
+        return self._environment_api_key()
+
+    def _current_api_key(self):
+        if hasattr(self, "api_key"):
+            value = self.api_key.text().strip()
+            return value, "UI field" if value else "UI field empty"
+        if getattr(self, "runtime_api_key", ""):
+            return self.runtime_api_key, getattr(self, "runtime_api_key_source", "runtime")
+        return self._configured_api_key()
+
+    def _current_ai_base_url(self):
+        if hasattr(self, "base_url") and self.base_url.text().strip():
+            return self.base_url.text().strip()
+        return str((self.project_settings.get("ai", {}) or {}).get("base_url", "https://api.deepseek.com"))
+
+    def _current_ai_model(self):
+        if hasattr(self, "model") and self.model.text().strip():
+            return self.model.text().strip()
+        return str((self.project_settings.get("ai", {}) or {}).get("model", "deepseek-v4-flash"))
+
+    def _make_llm_client(self):
+        key, source = self._current_api_key()
+        client = LLMClient(
+            api_key=key or None,
+            base_url=self._current_ai_base_url(),
+            model=self._current_ai_model(),
+            mock=False,
+        )
+        if key:
+            client.api_key_source = source
+        return client
+
+    def _populate_ai_fields_from_runtime(self):
+        if not hasattr(self, "api_key"):
+            return
+        key, source = self._configured_api_key()
+        self.runtime_api_key = key
+        self.runtime_api_key_source = source
+        if key and not self.api_key.text().strip():
+            self.api_key.blockSignals(True)
+            self.api_key.setText(key)
+            self.api_key.blockSignals(False)
+        self.api_key.setPlaceholderText("Paste DeepSeek/OpenAI-compatible API key")
+        self.api_key.setToolTip(f"Current key source: {source}; key is hidden in the field.")
+        if hasattr(self, "api_key_source_label"):
+            preview = self._mask_api_key_for_ui(key) if key else "missing"
+            self.api_key_source_label.setText(f"{source}: {preview}")
+
+    def on_show_api_key_toggled(self, checked):
+        if not hasattr(self, "api_key"):
+            return
+        self.api_key.setEchoMode(QtWidgets.QLineEdit.Normal if checked else QtWidgets.QLineEdit.Password)
+
+    def apply_ai_settings(self, *, save=False, log=True):
+        try:
+            key, source = self._current_api_key()
+            self.runtime_api_key = key
+            self.runtime_api_key_source = source
+            base_url = self._current_ai_base_url()
+            model = self._current_ai_model()
+            if key:
+                env_name = "OPENAI_API_KEY" if "openai" in base_url.lower() else "DEEPSEEK_API_KEY"
+                os.environ[env_name] = key
+                self.runtime_api_key_source = f"UI/{env_name}" if source == "UI field" else source
+            self.llm = self._make_llm_client()
+            if save:
+                settings, ai = self._ai_config()
+                ai["base_url"] = base_url
+                ai["model"] = model
+                ai["temperature"] = ai.get("temperature", 0)
+                # Do not save api_key by default: local runtime/env controls secrets.
+                ai.pop("api_key", None)
+                self.project_settings = settings
+                path = self.settings.save_project_settings(settings)
+                if log:
+                    self.log(f"AI settings saved without API key: {path}")
+            if hasattr(self, "api_key_source_label"):
+                preview = self._mask_api_key_for_ui(key) if key else "missing"
+                self.api_key_source_label.setText(f"{self.runtime_api_key_source}: {preview}")
+            status = self.update_llm_api_status()
+            if log:
+                self.log(
+                    f"AI runtime applied: source={self.runtime_api_key_source}, "
+                    f"base_url={base_url}, model={model}, key={self._mask_api_key_for_ui(key) or 'missing'}"
+                )
+            return status
+        except Exception as exc:
+            self._show_error("Apply AI settings failed", exc)
+            return {"error": str(exc)}
+
+    def save_ai_settings(self):
+        self.apply_ai_settings(save=True)
+
+    def clear_api_key_field(self):
+        if hasattr(self, "api_key"):
+            self.api_key.clear()
+        self.runtime_api_key = ""
+        self.runtime_api_key_source = "missing"
+        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            if name in os.environ:
+                os.environ.pop(name, None)
+        settings, ai = self._ai_config()
+        if "api_key" in ai:
+            ai.pop("api_key", None)
+            self.project_settings = settings
+            try:
+                self.settings.save_project_settings(settings)
+            except Exception as exc:
+                self.log(f"Could not remove saved API key: {exc}")
+        self.apply_ai_settings(log=True)
+
     def _command_page(self):
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
@@ -1011,6 +1307,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.api_key.setEchoMode(QtWidgets.QLineEdit.Password)
         self.base_url = QtWidgets.QLineEdit(ai_cfg.get("base_url", "https://api.deepseek.com"))
         self.model = QtWidgets.QLineEdit(ai_cfg.get("model", "deepseek-v4-flash"))
+        self.show_api_key = QtWidgets.QCheckBox("Show")
+        self.show_api_key.toggled.connect(self.on_show_api_key_toggled)
+        self.api_key_source_label = QtWidgets.QLabel("key: checking...")
+        self.api_key_source_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.apply_ai_button = QtWidgets.QPushButton("Apply API settings")
+        self.apply_ai_button.clicked.connect(lambda: self.apply_ai_settings(save=False))
+        self.save_ai_button = QtWidgets.QPushButton("Save base/model")
+        self.save_ai_button.clicked.connect(self.save_ai_settings)
+        self.clear_api_button = QtWidgets.QPushButton("Clear runtime key")
+        self.clear_api_button.clicked.connect(self.clear_api_key_field)
         self.mock_llm = QtWidgets.QCheckBox("Mock LLM")
         self.mock_llm.setVisible(False)
         self.mock_llm.setEnabled(False)
@@ -1034,19 +1340,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dry_run = QtWidgets.QCheckBox("Dry run")
         self.dry_run.setChecked(True)
         self.auto_write = QtWidgets.QCheckBox("Auto write")
-        self.auto_run = QtWidgets.QCheckBox("Auto write and run")
+        self.auto_write.setToolTip(
+            "After Parse, execute safe write actions automatically. If the text explicitly asks to run a shot, show the engage confirmation dialog."
+        )
+        self.auto_run = QtWidgets.QCheckBox("Auto write and run if requested")
+        self.auto_run.setToolTip(
+            "After Parse, execute safe write actions automatically. If the text explicitly asks to run a shot, submit it without the extra engage confirmation dialog."
+        )
         self.clear_after_parse = QtWidgets.QCheckBox("Clear command after Parse")
         grid.addWidget(QtWidgets.QLabel("API key"), 0, 0)
-        grid.addWidget(self.api_key, 0, 1, 1, 3)
+        grid.addWidget(self.api_key, 0, 1, 1, 2)
+        grid.addWidget(self.show_api_key, 0, 3)
+        grid.addWidget(self.api_key_source_label, 0, 4)
         grid.addWidget(QtWidgets.QLabel("Base URL"), 1, 0)
         grid.addWidget(self.base_url, 1, 1)
         grid.addWidget(QtWidgets.QLabel("Model"), 1, 2)
         grid.addWidget(self.model, 1, 3)
+        grid.addWidget(self.apply_ai_button, 1, 4)
+        grid.addWidget(self.save_ai_button, 2, 3)
+        grid.addWidget(self.clear_api_button, 2, 4)
         for col, widget in enumerate([self.mock_llm, self.mock_rm, self.mock_blacs, self.dry_run, self.auto_write, self.auto_run, self.clear_after_parse]):
-            grid.addWidget(widget, 2 + col // 3, col % 3)
+            grid.addWidget(widget, 3 + col // 3, col % 3)
+        self._populate_ai_fields_from_runtime()
+        self.api_key.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
+        self.base_url.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
+        self.model.editingFinished.connect(lambda: self.apply_ai_settings(log=False))
         layout.addWidget(top)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split = self._make_splitter(QtCore.Qt.Horizontal)
         layout.addWidget(split, 1)
 
         left = QtWidgets.QWidget()
@@ -1061,10 +1382,17 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(QtWidgets.QLabel("Natural language command"))
         left_layout.addWidget(self.command_text, 1)
         command_buttons = QtWidgets.QHBoxLayout()
-        b_voice = QtWidgets.QPushButton("Transcribe audio file")
-        b_voice.clicked.connect(self.transcribe_audio_file)
+        self.transcribe_audio_button = QtWidgets.QPushButton("Transcribe audio file")
+        self.transcribe_audio_button.clicked.connect(self.transcribe_audio_file)
         voice_box = QtWidgets.QGroupBox("Voice input")
         voice_layout = QtWidgets.QGridLayout(voice_box)
+        voice_cfg = self.project_settings.get("voice", {})
+        self.voice_input_enabled = QtWidgets.QCheckBox("Enable voice input")
+        self.voice_input_enabled.setChecked(bool(voice_cfg.get("input_enabled", True)))
+        self.voice_input_enabled.toggled.connect(self.on_voice_input_enabled_changed)
+        self.voice_reply_enabled = QtWidgets.QCheckBox("Enable spoken replies")
+        self.voice_reply_enabled.setChecked(bool(voice_cfg.get("reply_enabled", False)))
+        self.voice_reply_enabled.toggled.connect(self.on_voice_reply_enabled_changed)
         self.voice_toggle_button = QtWidgets.QPushButton("Start voice recording")
         self.voice_toggle_button.setCheckable(True)
         self.voice_toggle_button.clicked.connect(self.toggle_voice_recording)
@@ -1097,6 +1425,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.voice_lifetime.currentIndexChanged.connect(self.apply_voice_profile)
         release_model = QtWidgets.QPushButton("Release STT model")
         release_model.clicked.connect(self.release_stt_model)
+        self.tts_rate = QtWidgets.QSpinBox()
+        self.tts_rate.setRange(80, 260)
+        self.tts_rate.setValue(int(voice_cfg.get("tts_rate", 180)))
+        self.tts_rate.valueChanged.connect(self.apply_tts_settings)
+        self.tts_volume = QtWidgets.QSpinBox()
+        self.tts_volume.setRange(0, 100)
+        self.tts_volume.setSuffix("%")
+        self.tts_volume.setValue(int(float(voice_cfg.get("tts_volume", 0.85)) * 100))
+        self.tts_volume.valueChanged.connect(self.apply_tts_settings)
+        self.speaker_status_label = QtWidgets.QLabel("Speaker off")
+        self.speaker_status_label.setObjectName("StatusLightWarn")
+        test_speaker = QtWidgets.QPushButton("Test speaker")
+        test_speaker.clicked.connect(self.test_speaker)
+        stop_speaker = QtWidgets.QPushButton("Stop speaking")
+        stop_speaker.clicked.connect(self.stop_speaking)
         self.voice_language = QtWidgets.QComboBox()
         self.voice_language.addItem("Chinese + English auto", "zh,en")
         self.voice_language.addItem("Auto detect", "auto")
@@ -1120,6 +1463,7 @@ class MainWindow(QtWidgets.QMainWindow):
         voice_layout.addWidget(self.voice_toggle_button, 0, 0)
         voice_layout.addWidget(QtWidgets.QLabel("After transcription"), 0, 1)
         voice_layout.addWidget(self.voice_after_transcribe, 0, 2)
+        voice_layout.addWidget(self.voice_input_enabled, 0, 3)
         voice_layout.addWidget(QtWidgets.QLabel("Backend"), 1, 0)
         voice_layout.addWidget(self.voice_backend, 1, 1)
         voice_layout.addWidget(QtWidgets.QLabel("Profile"), 1, 2)
@@ -1137,7 +1481,16 @@ class MainWindow(QtWidgets.QMainWindow):
         voice_layout.addWidget(QtWidgets.QLabel("Model lifetime"), 5, 0)
         voice_layout.addWidget(self.voice_lifetime, 5, 1, 1, 2)
         voice_layout.addWidget(release_model, 5, 3)
-        voice_layout.addWidget(self.voice_status, 6, 0, 1, 4)
+        voice_layout.addWidget(self.voice_reply_enabled, 6, 0)
+        voice_layout.addWidget(QtWidgets.QLabel("TTS rate"), 6, 1)
+        voice_layout.addWidget(self.tts_rate, 6, 2)
+        voice_layout.addWidget(self.tts_volume, 6, 3)
+        voice_layout.addWidget(test_speaker, 7, 0)
+        voice_layout.addWidget(stop_speaker, 7, 1)
+        voice_layout.addWidget(self.speaker_status_label, 7, 2, 1, 2)
+        voice_layout.addWidget(self.voice_status, 8, 0, 1, 4)
+        self.apply_voice_input_enabled()
+        self.update_speaker_status()
         left_layout.addWidget(voice_box)
 
         b_parse = QtWidgets.QPushButton("Parse only")
@@ -1150,7 +1503,7 @@ class MainWindow(QtWidgets.QMainWindow):
         b_context.clicked.connect(self.show_retrieved_context)
         b_clear = QtWidgets.QPushButton("Clear")
         b_clear.clicked.connect(lambda: self.command_text.setPlainText(""))
-        for button in [b_voice, b_parse, b_preview, b_exec, b_context, b_clear]:
+        for button in [self.transcribe_audio_button, b_parse, b_preview, b_exec, b_context, b_clear]:
             command_buttons.addWidget(button)
         left_layout.addLayout(command_buttons)
         split.addWidget(left)
@@ -1159,7 +1512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(right)
         self.actions_table = QtWidgets.QTableWidget(0, 4)
         self.actions_table.setHorizontalHeaderLabels(["action", "name/path", "value", "status"])
-        self.actions_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.actions_table)
         self.json_view = QtWidgets.QPlainTextEdit()
         self.json_view.setReadOnly(True)
         right_layout.addWidget(QtWidgets.QLabel("Validated actions"))
@@ -1179,19 +1532,30 @@ class MainWindow(QtWidgets.QMainWindow):
         test.clicked.connect(self.test_rm)
         refresh = QtWidgets.QPushButton("Refresh globals")
         refresh.clicked.connect(self.refresh_globals)
-        engage = QtWidgets.QPushButton("Engage from last action")
-        engage.clicked.connect(lambda: self.execute_last(force_run=True))
+        check_active = QtWidgets.QPushButton("Check active globals")
+        check_active.clicked.connect(self.check_runmanager_active_globals)
         build_array = QtWidgets.QPushButton("Build array scan")
         build_array.clicked.connect(self.build_array_scan_from_selected)
-        load_sequence = QtWidgets.QPushButton("Load sequence folder")
-        load_sequence.clicked.connect(self.load_sequence_folder)
+        detect_paths = QtWidgets.QPushButton("Detect RM paths")
+        detect_paths.clicked.connect(self.detect_directory_from_labscript_apps)
+        apply_paths = QtWidgets.QPushButton("Apply RM paths")
+        apply_paths.clicked.connect(self.apply_directory_paths_to_running_apps)
         ai_parse = QtWidgets.QPushButton("AI parse sequence variables")
         ai_parse.setToolTip("Parse active sequence code and auto-complete the runmanager global registry")
         ai_parse.clicked.connect(self.ai_parse_sequence_variables)
         index_sequence = QtWidgets.QPushButton("Index sequence code")
         index_sequence.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
 
-        for button in [test, refresh, engage, build_array, load_sequence, ai_parse, index_sequence]:
+        for button in [
+            test,
+            refresh,
+            check_active,
+            build_array,
+            detect_paths,
+            apply_paths,
+            ai_parse,
+            index_sequence,
+        ]:
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -1199,16 +1563,26 @@ class MainWindow(QtWidgets.QMainWindow):
         status_row = QtWidgets.QHBoxLayout()
         self.rm_shots_label = QtWidgets.QLabel("n_shots: --")
         self.rm_shots_label.setObjectName("StatusLightOk")
-        self.rm_autowrite_label = QtWidgets.QLabel("Editing a registered value cell auto-uploads it through SafetyValidator")
+        self.rm_active_globals_label = QtWidgets.QLabel("remote active globals: --")
+        self.rm_active_globals_label.setObjectName("StatusLightWarn")
+        self.rm_h5_globals_label = QtWidgets.QLabel("H5 globals: --")
+        self.rm_h5_globals_label.setObjectName("StatusLightWarn")
+        direct_enabled = bool((self.project_settings.get("runmanager", {}) or {}).get("direct_h5_write", True))
+        self.rm_h5_write_label = QtWidgets.QLabel(f"direct H5 write: {'on' if direct_enabled else 'off'}")
+        self.rm_h5_write_label.setObjectName("StatusLightOk" if direct_enabled else "StatusLightWarn")
+        self.rm_autowrite_label = QtWidgets.QLabel("Editing a value cell writes immediately: remote first, H5 fallback")
         self.rm_autowrite_label.setObjectName("StatusLightWarn")
         status_row.addWidget(QtWidgets.QLabel("Runmanager"))
         status_row.addWidget(self.rm_shots_label)
+        status_row.addWidget(self.rm_active_globals_label)
+        status_row.addWidget(self.rm_h5_globals_label)
+        status_row.addWidget(self.rm_h5_write_label)
         status_row.addWidget(self.rm_autowrite_label, 1)
         layout.addLayout(status_row)
 
         self.globals_table = QtWidgets.QTableWidget(0, 6)
         self.globals_table.setHorizontalHeaderLabels(["name", "value", "type", "unit", "risk", "description"])
-        self.globals_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.globals_table)
         self._loading_globals_table = False
         self._pending_global_edit = None
         self.globals_table.itemChanged.connect(self._on_globals_table_item_changed)
@@ -1231,28 +1605,29 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons = QtWidgets.QHBoxLayout()
         test = QtWidgets.QPushButton("Test BLACS bridge")
         test.clicked.connect(self.test_blacs)
-        set_selected = QtWidgets.QPushButton("Set selected manual value")
-        set_selected.clicked.connect(self.set_selected_blacs)
-        refresh_bridge = QtWidgets.QPushButton("Refresh bridge status")
-        refresh_bridge.clicked.connect(self.test_blacs)
-        discover_channels = QtWidgets.QPushButton("Discover channels")
-        discover_channels.clicked.connect(self.discover_blacs_channels)
         read_values = QtWidgets.QPushButton("Read current values")
         read_values.clicked.connect(self.read_blacs_values)
-        import_channels = QtWidgets.QPushButton("Import selected channels")
-        import_channels.clicked.connect(self.import_selected_blacs_channels)
-        apply_checked = QtWidgets.QPushButton("Apply checked channels")
-        apply_checked.clicked.connect(self.apply_checked_blacs)
-        load_connection = QtWidgets.QPushButton("Load connection table context")
-        load_connection.clicked.connect(self.load_connection_table)
-        self.blacs_program = QtWidgets.QCheckBox("Program hardware")
-        for widget in [test, refresh_bridge, discover_channels, read_values, import_channels, set_selected, apply_checked, load_connection, self.blacs_program]:
+        parse_connection = QtWidgets.QPushButton("AI parse usable actions")
+        parse_connection.clicked.connect(self.parse_and_import_blacs_actions)
+        index_h5 = QtWidgets.QPushButton("Index H5/BLACS to Knowledge")
+        index_h5.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
+        self.blacs_program = QtWidgets.QCheckBox("Program hardware on write")
+        self.blacs_program.setChecked(True)
+        for widget in [
+            test,
+            read_values,
+            parse_connection,
+            index_h5,
+            self.blacs_program,
+        ]:
             buttons.addWidget(widget)
         buttons.addStretch()
         layout.addLayout(buttons)
         self.blacs_table = QtWidgets.QTableWidget(0, 8)
         self.blacs_table.setHorizontalHeaderLabels(["name", "kind", "device", "channel", "range", "current value", "target value", "risk"])
-        self.blacs_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.blacs_table)
+        self._loading_blacs_table = False
+        self.blacs_table.itemChanged.connect(self._on_blacs_table_item_changed)
         layout.addWidget(self.blacs_table, 1)
         self._fill_blacs_registry()
         return w
@@ -1260,124 +1635,96 @@ class MainWindow(QtWidgets.QMainWindow):
     def _lyse_page(self):
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
-        row = QtWidgets.QHBoxLayout()
+
+        source_row = QtWidgets.QHBoxLayout()
+        source_row.addWidget(QtWidgets.QLabel("H5 output folder"))
         self.h5_folder = QtWidgets.QLineEdit(self.project_settings.get("h5_output_dir", ""))
         self.h5_recursive = QtWidgets.QCheckBox("Recursive")
-        browse = QtWidgets.QPushButton("Choose h5 folder")
-        browse.clicked.connect(self.choose_h5_folder)
-        load = QtWidgets.QPushButton("Load h5 table")
-        load.clicked.connect(lambda: self.load_h5_table())
-        add_h5_files = QtWidgets.QPushButton("Add H5 files")
+        self.lyse_auto_load = QtWidgets.QCheckBox("Auto load finished shots")
+        self.lyse_auto_load.setChecked(bool((self.project_settings.get("lyse", {}) or {}).get("auto_load_finished_shots", True)))
+        self.lyse_auto_load.toggled.connect(self._update_lyse_auto_load_status)
+        self.lyse_auto_status = QtWidgets.QLabel("Auto load idle")
+        self.lyse_auto_status.setObjectName("StatusLightOk")
+        source_row.addWidget(self.h5_folder, 1)
+        source_row.addWidget(self.h5_recursive)
+        source_row.addWidget(self.lyse_auto_load)
+        source_row.addWidget(self.lyse_auto_status)
+        self.h5_folder.textChanged.connect(lambda _text: self._update_lyse_auto_load_status())
+        layout.addLayout(source_row)
+
+        filebox_tools = QtWidgets.QHBoxLayout()
+        self.lyse_analysis_running = QtWidgets.QPushButton("Analysis running")
+        self.lyse_analysis_running.setCheckable(True)
+        self.lyse_analysis_running.setChecked(True)
+        self.lyse_analysis_running.toggled.connect(self._on_lyse_analysis_running_toggled)
+        mark_not_done = QtWidgets.QPushButton("Mark as not done")
+        mark_not_done.clicked.connect(self.mark_selected_h5_not_done)
+        run_multishot = QtWidgets.QPushButton("Run multishot analysis")
+        run_multishot.clicked.connect(self.run_checked_multi_table)
+        add_h5_files = QtWidgets.QPushButton("Add shots")
+        add_h5_files.setToolTip("Add shots")
         add_h5_files.clicked.connect(self.add_h5_files)
-        save_merged = QtWidgets.QPushButton("Save merged results")
-        save_merged.clicked.connect(self.save_merged_results)
-        export_h5 = QtWidgets.QPushButton("Export selected H5 table")
-        export_h5.clicked.connect(self.export_h5_table)
-        open_output = QtWidgets.QPushButton("Open analysis output folder")
-        open_output.clicked.connect(self.open_analysis_output_folder)
-        load_single_dir = QtWidgets.QPushButton("Load single modules folder")
-        load_single_dir.clicked.connect(lambda: self.load_lyse_modules_folder("single_modules_dir"))
-        load_multi_dir = QtWidgets.QPushButton("Load multi modules folder")
-        load_multi_dir.clicked.connect(lambda: self.load_lyse_modules_folder("multi_modules_dir"))
-        scan_lyse_modules = QtWidgets.QPushButton("Scan .py modules")
-        scan_lyse_modules.clicked.connect(self.auto_scan_lyse_modules_ui)
-        index_analysis = QtWidgets.QPushButton("Index analysis code")
-        index_analysis.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
-        for widget in [
-            self.h5_folder,
-            self.h5_recursive,
-            browse,
-            load,
-            add_h5_files,
-            save_merged,
-            export_h5,
-            open_output,
-            load_single_dir,
-            load_multi_dir,
-            scan_lyse_modules,
-            index_analysis,
-        ]:
-            row.addWidget(widget, 1 if widget is self.h5_folder else 0)
-        layout.addLayout(row)
-
-        h5_tools = QtWidgets.QHBoxLayout()
-        remove_rows = QtWidgets.QPushButton("Remove selected rows")
+        remove_rows = QtWidgets.QPushButton("Remove selected shots")
+        remove_rows.setToolTip("Remove selected shots")
         remove_rows.clicked.connect(self.remove_selected_h5_rows)
-        clear_rows = QtWidgets.QPushButton("Clear table")
-        clear_rows.clicked.connect(self.clear_h5_table)
-        reload_rows = QtWidgets.QPushButton("Reload selected")
-        reload_rows.clicked.connect(self.reload_selected_h5_rows)
-        column_chooser = QtWidgets.QPushButton("Column chooser")
+        column_chooser = QtWidgets.QPushButton("Columns...")
         column_chooser.clicked.connect(self.open_column_chooser)
-        send_plot = QtWidgets.QPushButton("Send selected columns to Plot")
-        send_plot.clicked.connect(self.send_selected_columns_to_plot)
-        send_fit = QtWidgets.QPushButton("Send selected columns to Fit")
-        send_fit.clicked.connect(self.send_selected_columns_to_fit)
-        for widget in [remove_rows, clear_rows, reload_rows, column_chooser, send_plot, send_fit]:
-            h5_tools.addWidget(widget)
-        h5_tools.addStretch()
-        layout.addLayout(h5_tools)
+        for widget in [self.lyse_analysis_running, mark_not_done, run_multishot, add_h5_files, remove_rows, column_chooser]:
+            filebox_tools.addWidget(widget)
+        filebox_tools.addStretch()
+        layout.addLayout(filebox_tools)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        split = self._make_splitter(QtCore.Qt.Vertical)
         layout.addWidget(split, 1)
         self.h5_table = QtWidgets.QTableWidget(0, 0)
+        configure_table_columns(self.h5_table, stretch_last=False)
         split.addWidget(self.h5_table)
 
         lower = QtWidgets.QWidget()
         lower_layout = QtWidgets.QHBoxLayout(lower)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
+        lower_split = self._make_splitter(QtCore.Qt.Horizontal)
+        lower_layout.addWidget(lower_split, 1)
 
-        module_box = QtWidgets.QGroupBox("Lyse modules")
-        module_layout = QtWidgets.QVBoxLayout(module_box)
-        self.single_modules = QtWidgets.QListWidget()
-        self.multi_modules = QtWidgets.QListWidget()
+        module_box = QtWidgets.QGroupBox("Analysis routines")
+        module_layout = QtWidgets.QHBoxLayout(module_box)
+        self.single_modules = self._make_lyse_module_table("single_modules")
+        self.multi_modules = self._make_lyse_module_table("multi_modules")
         self._fill_module_lists()
-        module_tools = QtWidgets.QGridLayout()
-        add_py = QtWidgets.QPushButton("Add .py")
-        add_py.clicked.connect(self.add_lyse_module_file)
-        add_folder = QtWidgets.QPushButton("Add folder")
-        add_folder.clicked.connect(self.add_lyse_module_folder)
-        remove_py = QtWidgets.QPushButton("Remove selected .py")
-        remove_py.clicked.connect(self.remove_selected_lyse_module)
-        toggle_module = QtWidgets.QPushButton("Enable/disable selected")
-        toggle_module.clicked.connect(self.toggle_selected_lyse_module)
-        move_up = QtWidgets.QPushButton("Move up")
-        move_up.clicked.connect(lambda: self.move_selected_lyse_module(-1))
-        move_down = QtWidgets.QPushButton("Move down")
-        move_down.clicked.connect(lambda: self.move_selected_lyse_module(1))
-        open_py = QtWidgets.QPushButton("Open .py")
-        open_py.clicked.connect(self.open_selected_lyse_module_file)
-        open_folder_button = QtWidgets.QPushButton("Open containing folder")
-        open_folder_button.clicked.connect(self.open_selected_lyse_module_folder)
-        for index, button in enumerate([add_py, add_folder, remove_py, toggle_module, move_up, move_down, open_py, open_folder_button]):
-            module_tools.addWidget(button, index // 2, index % 2)
-        run_single = QtWidgets.QPushButton("Run selected single on selected shot")
-        run_single.clicked.connect(self.run_selected_single)
-        run_checked_single = QtWidgets.QPushButton("Run checked singles on selected shot")
-        run_checked_single.clicked.connect(self.run_checked_single_selected)
-        run_checked_single_table = QtWidgets.QPushButton("Run checked singles on table")
-        run_checked_single_table.clicked.connect(self.run_checked_single_table)
-        run_multi = QtWidgets.QPushButton("Run selected multi on table")
-        run_multi.clicked.connect(self.run_selected_multi)
-        run_checked_multi = QtWidgets.QPushButton("Run checked multis on table")
-        run_checked_multi.clicked.connect(self.run_checked_multi_table)
-        module_layout.addWidget(QtWidgets.QLabel("Single"))
-        module_layout.addWidget(self.single_modules)
-        module_layout.addLayout(module_tools)
-        module_layout.addWidget(run_single)
-        module_layout.addWidget(run_checked_single)
-        module_layout.addWidget(run_checked_single_table)
-        module_layout.addWidget(QtWidgets.QLabel("Multi"))
-        module_layout.addWidget(self.multi_modules)
-        module_layout.addWidget(run_multi)
-        module_layout.addWidget(run_checked_multi)
-        lower_layout.addWidget(module_box, 1)
+        module_layout.addWidget(
+            self._lyse_routine_panel(
+                "Singleshot routines",
+                self.single_modules,
+                "single_modules",
+                run_selected=self.run_selected_single,
+                run_checked=self.run_checked_single_selected,
+                run_table=self.run_checked_single_table,
+            ),
+            1,
+        )
+        module_layout.addWidget(
+            self._lyse_routine_panel(
+                "Multishot routines",
+                self.multi_modules,
+                "multi_modules",
+                run_selected=self.run_selected_multi,
+                run_checked=self.run_checked_multi_table,
+                run_table=self.run_checked_multi_table,
+            ),
+            1,
+        )
+        lower_split.addWidget(module_box)
+        split.addWidget(lower)
+        split.setSizes([620, 260])
 
-        plot_box = QtWidgets.QGroupBox("Plot, fit, report")
-        plot_layout = QtWidgets.QGridLayout(plot_box)
+        analysis_box = QtWidgets.QGroupBox("Plot, fit, report")
+        analysis_layout = QtWidgets.QGridLayout(analysis_box)
         self.plot_type = QtWidgets.QComboBox()
-        self.plot_type.addItems(["scatter_line", "mean_errorbar", "histogram", "scatter2d", "heatmap2d", "surface3d"])
+        for key, spec in PLOT_SPECS.items():
+            self.plot_type.addItem(spec.label, key)
+            self.plot_type.setItemData(self.plot_type.count() - 1, spec.description, QtCore.Qt.ToolTipRole)
+        self.plot_type.currentIndexChanged.connect(self._on_plot_type_changed)
         self.fit_model = QtWidgets.QComboBox()
-        self.fit_model.addItems(["linear", "gaussian", "logarithmic", "exponential", "lorentzian", "gaussian2d", "double_gaussian2d"])
         self.x_col = QtWidgets.QComboBox()
         self.y_col = QtWidgets.QComboBox()
         self.z_col = QtWidgets.QComboBox()
@@ -1390,35 +1737,106 @@ class MainWindow(QtWidgets.QMainWindow):
         fit.clicked.connect(self.fit_from_ui)
         report = QtWidgets.QPushButton("Generate report")
         report.clicked.connect(lambda: self.generate_report_from_ui())
-        multi_report = QtWidgets.QPushButton("Generate multi report")
+        multi_report = QtWidgets.QPushButton("Multi report")
         multi_report.clicked.connect(lambda: self.generate_report_from_ui("LabPilot multi analysis report"))
-        plot_layout.addWidget(QtWidgets.QLabel("Plot"), 0, 0)
-        plot_layout.addWidget(self.plot_type, 0, 1)
-        plot_layout.addWidget(QtWidgets.QLabel("Fit"), 0, 2)
-        plot_layout.addWidget(self.fit_model, 0, 3)
-        plot_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
-        plot_layout.addWidget(self.x_col, 1, 1)
-        plot_layout.addWidget(QtWidgets.QLabel("y/value"), 1, 2)
-        plot_layout.addWidget(self.y_col, 1, 3)
-        plot_layout.addWidget(QtWidgets.QLabel("z/color"), 2, 0)
-        plot_layout.addWidget(self.z_col, 2, 1)
-        plot_layout.addWidget(draw, 3, 0)
-        plot_layout.addWidget(fit, 3, 1)
-        plot_layout.addWidget(report, 3, 2)
-        plot_layout.addWidget(multi_report, 3, 3)
+        analysis_layout.addWidget(QtWidgets.QLabel("Plot"), 0, 0)
+        analysis_layout.addWidget(self.plot_type, 0, 1)
+        analysis_layout.addWidget(QtWidgets.QLabel("Fit"), 0, 2)
+        analysis_layout.addWidget(self.fit_model, 0, 3)
+        analysis_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
+        analysis_layout.addWidget(self.x_col, 1, 1)
+        analysis_layout.addWidget(QtWidgets.QLabel("y/value"), 1, 2)
+        analysis_layout.addWidget(self.y_col, 1, 3)
+        analysis_layout.addWidget(QtWidgets.QLabel("z/color"), 2, 0)
+        analysis_layout.addWidget(self.z_col, 2, 1)
+        analysis_layout.addWidget(draw, 3, 0)
+        analysis_layout.addWidget(fit, 3, 1)
+        analysis_layout.addWidget(report, 3, 2)
+        analysis_layout.addWidget(multi_report, 3, 3)
         self.figure_area = QtWidgets.QWidget()
         self.figure_layout = QtWidgets.QVBoxLayout(self.figure_area)
-        plot_layout.addWidget(self.figure_area, 4, 0, 1, 4)
+        self.figure_area.setMinimumHeight(160)
+        analysis_layout.addWidget(self.figure_area, 4, 0, 1, 4)
         self.analysis_results_table = QtWidgets.QTableWidget(0, 4)
         self.analysis_results_table.setHorizontalHeaderLabels(["kind", "name", "status", "summary"])
-        self.analysis_results_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.analysis_results_table.setMaximumHeight(150)
-        plot_layout.addWidget(QtWidgets.QLabel("Analysis records"), 5, 0)
-        plot_layout.addWidget(self.analysis_results_table, 6, 0, 1, 4)
-        lower_layout.addWidget(plot_box, 2)
-        split.addWidget(lower)
-        split.setSizes([520, 320])
+        configure_table_columns(self.analysis_results_table)
+        self.analysis_results_table.setMaximumHeight(130)
+        analysis_layout.addWidget(QtWidgets.QLabel("Analysis records"), 5, 0, 1, 4)
+        analysis_layout.addWidget(self.analysis_results_table, 6, 0, 1, 4)
+        lower_split.addWidget(analysis_box)
+        lower_split.setSizes([560, 760])
+        self._on_plot_type_changed()
+        self._update_lyse_auto_load_status()
         return w
+
+    def _make_lyse_module_table(self, group):
+        table = QtWidgets.QTableWidget(0, 6)
+        table.setProperty("module_group", group)
+        table.setHorizontalHeaderLabels(["use", "name", "mode", "path", "order", "status"])
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        configure_table_columns(table, stretch_last=False)
+        for column, width in enumerate([46, 170, 110, 340, 70, 110]):
+            table.setColumnWidth(column, width)
+        table.itemChanged.connect(self._on_lyse_module_table_item_changed)
+        table.itemSelectionChanged.connect(lambda g=group: self._update_lyse_module_buttons(g))
+        return table
+
+    def _make_table_item(self, text="", *, editable=True, checkable=False, checked=False, user_data=None):
+        item = QtWidgets.QTableWidgetItem(str(text))
+        flags = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+        if editable:
+            flags |= QtCore.Qt.ItemIsEditable
+        if checkable:
+            flags |= QtCore.Qt.ItemIsUserCheckable
+            item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        item.setFlags(flags)
+        if user_data is not None:
+            item.setData(QtCore.Qt.UserRole, user_data)
+        return item
+
+    def _lyse_routine_panel(self, title, list_widget, group, *, run_selected, run_checked, run_table):
+        panel = QtWidgets.QGroupBox(title)
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.addWidget(list_widget, 1)
+
+        file_tools = QtWidgets.QGridLayout()
+        add_button = QtWidgets.QPushButton("Add .py")
+        add_button.clicked.connect(lambda _checked=False, g=group: self.add_lyse_module_file(g))
+        add_folder = QtWidgets.QPushButton("Add folder")
+        add_folder.clicked.connect(lambda _checked=False, g=group: self.add_lyse_module_folder(g))
+        remove_button = QtWidgets.QPushButton("Remove selected")
+        remove_button.clicked.connect(lambda _checked=False, g=group: self.remove_selected_lyse_module(g))
+        open_button = QtWidgets.QPushButton("Open .py")
+        open_button.clicked.connect(lambda _checked=False, g=group: self.open_selected_lyse_module_file(g))
+        open_folder = QtWidgets.QPushButton("Open folder")
+        open_folder.clicked.connect(lambda _checked=False, g=group: self.open_selected_lyse_module_folder(g))
+        toggle_button = QtWidgets.QPushButton("Enable/disable")
+        toggle_button.clicked.connect(lambda _checked=False, g=group: self.toggle_selected_lyse_module(g))
+        for index, button in enumerate([add_button, add_folder, remove_button, open_button, open_folder, toggle_button]):
+            file_tools.addWidget(button, index // 3, index % 3)
+        layout.addLayout(file_tools)
+
+        order_tools = QtWidgets.QHBoxLayout()
+        for text, direction in [("Top", -9999), ("Up", -1), ("Down", 1), ("Bottom", 9999)]:
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(lambda _checked=False, g=group, d=direction: self.move_selected_lyse_module(d, g))
+            order_tools.addWidget(button)
+        layout.addLayout(order_tools)
+
+        run_tools = QtWidgets.QHBoxLayout()
+        selected_button = QtWidgets.QPushButton("Run selected")
+        selected_button.clicked.connect(run_selected)
+        checked_button = QtWidgets.QPushButton("Run checked")
+        checked_button.clicked.connect(run_checked)
+        table_button = QtWidgets.QPushButton("Run checked on table")
+        table_button.clicked.connect(run_table)
+        for button in [selected_button, checked_button, table_button]:
+            run_tools.addWidget(button)
+        layout.addLayout(run_tools)
+        return panel
 
     def _optimizer_page(self):
         w = QtWidgets.QWidget()
@@ -1464,7 +1882,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.opt_params_table = QtWidgets.QTableWidget(0, 5)
         self.opt_params_table.setHorizontalHeaderLabels(["use", "name", "min", "max", "points"])
-        self.opt_params_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.opt_params_table)
         layout.addWidget(self.opt_params_table, 1)
         self._fill_optimizer_params()
 
@@ -1553,7 +1971,7 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.addStretch()
         layout.addLayout(buttons)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split = self._make_splitter(QtCore.Qt.Horizontal)
         self.co_sequence_context = QtWidgets.QPlainTextEdit()
         self.co_sequence_context.setReadOnly(True)
         self.co_sequence_context.setPlaceholderText("Knowledge snippets used for this code change will appear here.")
@@ -1631,17 +2049,21 @@ class MainWindow(QtWidgets.QMainWindow):
         validate.clicked.connect(self.validate_directory_paths_ui)
         detect = QtWidgets.QPushButton("Detect active files")
         detect.clicked.connect(self.detect_directory_active_files)
+        detect_labscript = QtWidgets.QPushButton("Detect from labscript apps")
+        detect_labscript.clicked.connect(self.detect_directory_from_labscript_apps)
+        apply_apps = QtWidgets.QPushButton("Apply to running apps")
+        apply_apps.clicked.connect(self.apply_directory_paths_to_running_apps)
         index = QtWidgets.QPushButton("Index to Knowledge")
         index.clicked.connect(lambda: self.build_knowledge_index(rebuild=False))
         open_folder = QtWidgets.QPushButton("Open selected folder")
         open_folder.clicked.connect(self.open_selected_directory_path)
-        for button in [save, validate, detect, index, open_folder]:
+        for button in [save, validate, detect, detect_labscript, apply_apps, index, open_folder]:
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
         self.directory_table = QtWidgets.QTableWidget(0, 7)
         self.directory_table.setHorizontalHeaderLabels(["purpose", "path", "type", "exists", "source", "last modified", "action"])
-        self.directory_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.directory_table)
         layout.addWidget(self.directory_table, 1)
         self.directory_detail = QtWidgets.QPlainTextEdit()
         self.directory_detail.setReadOnly(True)
@@ -1710,7 +2132,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(controls)
         self.knowledge_table = QtWidgets.QTableWidget(0, 6)
         self.knowledge_table.setHorizontalHeaderLabels(["category", "file", "lines", "summary", "snippet", "status"])
-        self.knowledge_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.knowledge_table)
         layout.addWidget(self.knowledge_table, 2)
         self.knowledge_preview = QtWidgets.QPlainTextEdit()
         self.knowledge_preview.setReadOnly(True)
@@ -1730,8 +2152,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.diag_faster_whisper = QtWidgets.QLabel("not checked")
         self.diag_microphones = QtWidgets.QLabel("not checked")
         self.diag_lexicon = QtWidgets.QLabel(f"{len(self.voice_lexicon.terms)} terms")
+        self.diag_tts = QtWidgets.QLabel("not checked")
         run_diag = QtWidgets.QPushButton("Run voice diagnostics")
         run_diag.clicked.connect(self.run_voice_diagnostics_ui)
+        test_tts = QtWidgets.QPushButton("Test speaker")
+        test_tts.clicked.connect(self.test_speaker)
         grid.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
         grid.addWidget(self.diag_cpu_mode, 0, 1)
         grid.addWidget(QtWidgets.QLabel("NVIDIA GPU"), 1, 0)
@@ -1744,7 +2169,10 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.diag_microphones, 4, 1)
         grid.addWidget(QtWidgets.QLabel("Lexicon"), 5, 0)
         grid.addWidget(self.diag_lexicon, 5, 1)
-        grid.addWidget(run_diag, 6, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Text-to-speech"), 6, 0)
+        grid.addWidget(self.diag_tts, 6, 1)
+        grid.addWidget(run_diag, 7, 0)
+        grid.addWidget(test_tts, 7, 1)
         layout.addWidget(top)
         self.diag_report = QtWidgets.QPlainTextEdit()
         self.diag_report.setReadOnly(True)
@@ -1770,7 +2198,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(buttons)
         self.error_table = QtWidgets.QTableWidget(0, 6)
         self.error_table.setHorizontalHeaderLabels(["time", "severity", "kind", "title", "message", "advice"])
-        self.error_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        configure_table_columns(self.error_table)
         self.error_table.itemSelectionChanged.connect(self.preview_selected_error)
         layout.addWidget(self.error_table, 2)
         self.error_detail = QtWidgets.QPlainTextEdit()
@@ -1997,6 +2425,12 @@ class MainWindow(QtWidgets.QMainWindow):
         voice_cfg = self.project_settings.get("voice", {})
         self.stt.model_lifetime = voice_cfg.get("model_lifetime", getattr(self.stt, "model_lifetime", "isolated_release"))
         self.stt.isolated = self._voice_isolated_from_config(voice_cfg)
+        self.tts.enabled = bool(voice_cfg.get("reply_enabled", getattr(self.tts, "enabled", False)))
+        self.tts.backend = voice_cfg.get("tts_backend", getattr(self.tts, "backend", "system"))
+        self.tts.rate = int(voice_cfg.get("tts_rate", getattr(self.tts, "rate", 180)))
+        self.tts.volume = float(voice_cfg.get("tts_volume", getattr(self.tts, "volume", 0.85)))
+        self.tts.voice_name = voice_cfg.get("tts_voice_name", getattr(self.tts, "voice_name", ""))
+        self.tts.max_chars = int(voice_cfg.get("tts_max_chars", getattr(self.tts, "max_chars", 240)))
         if hasattr(self, "global_editor"):
             self.global_editor.set_rows(self._global_registry_rows())
         if hasattr(self, "blacs_editor"):
@@ -2024,12 +2458,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
         if hasattr(self, "h5_folder"):
             self.h5_folder.setText(self.project_settings.get("h5_output_dir", ""))
+        if hasattr(self, "lyse_auto_load"):
+            lyse_cfg = self.project_settings.get("lyse", {}) or {}
+            self.lyse_auto_load.setChecked(bool(lyse_cfg.get("auto_load_finished_shots", True)))
+            self._update_lyse_auto_load_status()
         if hasattr(self, "knowledge_command_enabled"):
             enabled = bool(self.project_settings.get("knowledge_context_enabled", True))
             self.knowledge_command_enabled.setChecked(enabled)
             self.knowledge_protocol_enabled.setChecked(enabled)
+        if hasattr(self, "base_url") and hasattr(self, "model"):
+            ai_cfg = self.project_settings.get("ai", {}) or {}
+            self.base_url.setText(str(ai_cfg.get("base_url", "https://api.deepseek.com")))
+            self.model.setText(str(ai_cfg.get("model", "deepseek-v4-flash")))
+            self._populate_ai_fields_from_runtime()
+            self.apply_ai_settings(log=False)
         if hasattr(self, "voice_lifetime"):
             self.voice_lifetime.setCurrentIndex(max(0, self.voice_lifetime.findData(self.stt.model_lifetime)))
+        if hasattr(self, "voice_input_enabled"):
+            self.voice_input_enabled.setChecked(bool(voice_cfg.get("input_enabled", True)))
+            self.apply_voice_input_enabled()
+        if hasattr(self, "voice_reply_enabled"):
+            self.voice_reply_enabled.setChecked(bool(voice_cfg.get("reply_enabled", False)))
+            self.tts_rate.setValue(int(voice_cfg.get("tts_rate", 180)))
+            self.tts_volume.setValue(int(float(voice_cfg.get("tts_volume", 0.85)) * 100))
+            self.update_speaker_status()
         self.log("Runtime configuration reloaded.")
         self._update_inspector()
 
@@ -2206,16 +2658,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _llm_status_dict_for_ui(self):
         """Return current LLM status without exposing the full key."""
-        client = getattr(self, "llm", None)
-        if client is None:
-            client = LLMClient(mock=False)
-            self.llm = client
-        else:
-            try:
-                # After the no-mock patch, force any stale UI-created client into real mode.
-                client.mock = False
-            except Exception:
-                pass
+        client = self._make_llm_client()
+        self.llm = client
 
         if hasattr(client, "status"):
             status = dict(client.status())
@@ -2267,8 +2711,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     "border-radius: 5px; background: #fff3e0; color: #e65100; font-weight: 700; }"
                 )
             else:
-                one_line = "LLM API: MISSING KEY | set DEEPSEEK_API_KEY or OPENAI_API_KEY"
-                detail = "Missing API key. Set DEEPSEEK_API_KEY or OPENAI_API_KEY, then restart PowerShell / VS Code / LabPilot AI."
+                one_line = "LLM API: MISSING KEY | paste key in UI or set env"
+                detail = (
+                    "Missing API key. Paste a DeepSeek/OpenAI-compatible key in the Command page "
+                    "and click Apply API settings, or set DEEPSEEK_API_KEY / OPENAI_API_KEY."
+                )
                 style = (
                     "QLabel { padding: 5px 10px; border: 1px solid #b71c1c; "
                     "border-radius: 5px; background: #ffebee; color: #b71c1c; font-weight: 700; }"
@@ -2307,6 +2754,153 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "log_text"):
             self.log_text.appendPlainText(str(msg))
         print(msg)
+
+    def _voice_config(self):
+        settings = dict(self.project_settings or {})
+        voice = dict(settings.get("voice", {}) or {})
+        settings["voice"] = voice
+        return settings, voice
+
+    def _save_voice_config(self, **values):
+        settings, voice = self._voice_config()
+        voice.update(values)
+        self.project_settings = settings
+        try:
+            self.settings.save_project_settings(settings)
+        except Exception as exc:
+            self.log(f"Could not save voice settings: {exc}")
+
+    def _start_speech_worker(self):
+        if self.speech_thread and self.speech_thread.isRunning():
+            return
+        self.speech_thread = QtCore.QThread(self)
+        self.speech_worker = SpeechWorker(self.tts)
+        self.speech_worker.moveToThread(self.speech_thread)
+        self.speech_thread.started.connect(self.speech_worker.run)
+        self.speech_worker.failed.connect(self.on_speech_failed)
+        self.speech_worker.status.connect(self.on_speech_status)
+        self.speech_worker.stopped.connect(self.speech_thread.quit)
+        self.speech_worker.stopped.connect(self.speech_worker.deleteLater)
+        self.speech_thread.finished.connect(self.speech_thread.deleteLater)
+        self.speech_thread.finished.connect(self._clear_speech_worker)
+        self.speech_thread.start()
+
+    def _clear_speech_worker(self):
+        self.speech_thread = None
+        self.speech_worker = None
+
+    def on_speech_status(self, message):
+        if hasattr(self, "speaker_status_label"):
+            self.speaker_status_label.setText(str(message or "Speaker ready"))
+            self.speaker_status_label.setObjectName("StatusLightOk")
+            self.speaker_status_label.style().unpolish(self.speaker_status_label)
+            self.speaker_status_label.style().polish(self.speaker_status_label)
+
+    def on_speech_failed(self, message):
+        if hasattr(self, "speaker_status_label"):
+            self.speaker_status_label.setText("Speaker unavailable")
+            self.speaker_status_label.setObjectName("StatusLightBad")
+            self.speaker_status_label.style().unpolish(self.speaker_status_label)
+            self.speaker_status_label.style().polish(self.speaker_status_label)
+        self._show_error("Text-to-speech failed", RuntimeError(message), modal=False)
+
+    def voice_input_is_enabled(self):
+        if hasattr(self, "voice_input_enabled"):
+            return self.voice_input_enabled.isChecked()
+        return bool(self.project_settings.get("voice", {}).get("input_enabled", True))
+
+    def apply_voice_input_enabled(self):
+        enabled = self.voice_input_is_enabled()
+        for attr in ("voice_toggle_button", "voice_standby", "transcribe_audio_button"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+        if not enabled and self.voice_recording:
+            self.stop_voice_recording()
+        if not enabled and self.wake_worker:
+            self.stop_wake_standby()
+        if hasattr(self, "voice_status") and not enabled:
+            self.voice_status.setText("Voice input disabled.")
+
+    def on_voice_input_enabled_changed(self, checked):
+        self._save_voice_config(input_enabled=bool(checked))
+        self.apply_voice_input_enabled()
+        self.log(f"voice input enabled: {bool(checked)}")
+
+    def apply_tts_settings(self, *args):
+        enabled = bool(self.voice_reply_enabled.isChecked()) if hasattr(self, "voice_reply_enabled") else bool(self.project_settings.get("voice", {}).get("reply_enabled", False))
+        rate = int(self.tts_rate.value()) if hasattr(self, "tts_rate") else int(self.project_settings.get("voice", {}).get("tts_rate", 180))
+        volume = (float(self.tts_volume.value()) / 100.0) if hasattr(self, "tts_volume") else float(self.project_settings.get("voice", {}).get("tts_volume", 0.85))
+        self.tts.enabled = enabled
+        self.tts.rate = rate
+        self.tts.volume = volume
+        self.tts.max_chars = int(self.project_settings.get("voice", {}).get("tts_max_chars", getattr(self.tts, "max_chars", 240)))
+        self._save_voice_config(reply_enabled=enabled, tts_rate=rate, tts_volume=volume)
+        self.update_speaker_status()
+
+    def on_voice_reply_enabled_changed(self, checked):
+        self.apply_tts_settings()
+        if checked:
+            self.speak_event("reply_enabled", "语音回复已开启。", priority=True)
+        else:
+            self.stop_speaking()
+        self.log(f"spoken replies enabled: {bool(checked)}")
+
+    def update_speaker_status(self):
+        if not hasattr(self, "speaker_status_label"):
+            return
+        if not self.tts.enabled:
+            text, obj = "Speaker off", "StatusLightWarn"
+        elif self.tts.available():
+            text, obj = "Speaker ready", "StatusLightOk"
+        else:
+            text, obj = "Speaker unavailable", "StatusLightBad"
+        self.speaker_status_label.setText(text)
+        self.speaker_status_label.setObjectName(obj)
+        self.speaker_status_label.style().unpolish(self.speaker_status_label)
+        self.speaker_status_label.style().polish(self.speaker_status_label)
+
+    def speak_event(self, event, text, priority=False):
+        voice_cfg = self.project_settings.get("voice", {}) or {}
+        event_flags = {
+            "wake": "reply_on_wake",
+            "before_parse": "reply_before_parse",
+            "before_execute": "reply_before_execute",
+            "after_execute": "reply_after_execute",
+            "error": "reply_on_error",
+        }
+        flag = event_flags.get(str(event or ""))
+        if flag and not bool(voice_cfg.get(flag, True)):
+            return False
+        if not self.tts.enabled:
+            return False
+        if self.voice_recording and event not in {"recording_start", "recording_stop"}:
+            self.log(f"Skipped spoken reply during active recording: {event}")
+            return False
+        if not self.tts.available():
+            self.update_speaker_status()
+            return False
+        if self.speech_worker is None:
+            self._start_speech_worker()
+        if self.speech_worker is not None:
+            self.speech_worker.enqueue(text, priority=priority)
+            return True
+        return False
+
+    def test_speaker(self):
+        self.apply_tts_settings()
+        if not self.tts.enabled:
+            self.voice_reply_enabled.setChecked(True)
+            self.apply_tts_settings()
+        if not self.speak_event("test", "LabPilot AI 语音回复测试。", priority=True):
+            self._show_error("Text-to-speech unavailable", RuntimeError("Speaker is disabled or unavailable."), modal=False)
+
+    def stop_speaking(self):
+        if self.speech_worker is not None:
+            self.speech_worker.clear()
+        self.tts.stop()
+        self.update_speaker_status()
+        self.log("Speech output stopped.")
 
     def apply_voice_profile(self, *args):
         profile = self.voice_profile.currentData() if hasattr(self, "voice_profile") else "balanced"
@@ -2367,6 +2961,7 @@ class MainWindow(QtWidgets.QMainWindow):
         report = run_voice_diagnostics(voice_cfg)
         self.voice_diagnostic_report = report
         payload = report.to_dict()
+        payload["text_to_speech"] = self.tts.status()
         if hasattr(self, "diag_report"):
             self.diag_report.setPlainText(dumps(payload, indent=2))
             self.diag_sounddevice.setText("OK" if report.sounddevice else "missing")
@@ -2376,7 +2971,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.diag_microphones.setText(str(report.microphone_count))
             self.diag_gpu.setText(report.gpu_name if report.gpu_available else "not detected")
             self.diag_gpu.setObjectName("StatusLightOk" if report.gpu_available else "StatusLightWarn")
-            for label in [self.diag_sounddevice, self.diag_faster_whisper, self.diag_gpu]:
+            self.diag_tts.setText("OK" if self.tts.available() else "missing")
+            self.diag_tts.setObjectName("StatusLightOk" if self.tts.available() else "StatusLightWarn")
+            for label in [self.diag_sounddevice, self.diag_faster_whisper, self.diag_gpu, self.diag_tts]:
                 label.style().unpolish(label)
                 label.style().polish(label)
         if hasattr(self, "voice_status"):
@@ -2394,12 +2991,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blacs = BlacsManualClient(mock=False)
         self.log("BLACS mode: localhost bridge")
     def transcribe_audio_file(self):
+        if not self.voice_input_is_enabled():
+            self.voice_status.setText("Voice input is disabled.")
+            return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose audio file", "", "Audio files (*.wav *.mp3 *.m4a *.flac);;All files (*.*)")
         if not path:
             return
+        self.speak_event("recording_stop", "正在转写音频文件。")
         self.start_transcription(path)
 
     def toggle_voice_recording(self, checked=False):
+        if not self.voice_input_is_enabled():
+            self.voice_toggle_button.setChecked(False)
+            self.voice_status.setText("Voice input is disabled.")
+            return
         if self.voice_recording:
             self.stop_voice_recording()
         else:
@@ -2407,6 +3012,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def start_voice_recording(self):
         try:
+            self.speak_event("recording_start", "开始录音。", priority=True)
             self.voice_recorder.start()
             self.voice_recording = True
             self.voice_toggle_button.setChecked(True)
@@ -2433,6 +3039,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.voice_status.setText(f"Recorded audio: {path}")
                 self.log(f"Voice recording saved: {path}, stats={stats}")
+            self.speak_event("recording_stop", "录音结束，正在转写。", priority=True)
             self.start_transcription(path)
         except Exception as exc:
             self.voice_recording = False
@@ -2464,6 +3071,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mic_signal_label.style().polish(self.mic_signal_label)
 
     def start_transcription(self, audio_path, strip_wake_name_value=None):
+        if not self.voice_input_is_enabled():
+            self.voice_status.setText("Voice input is disabled.")
+            return
         if not self.stt.available():
             self._show_error(
                 "Speech-to-text unavailable",
@@ -2500,16 +3110,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.command_text.setPlainText((current + "\n" + corrected).strip())
         self.voice_status.setText("Transcription corrected and added to command box.")
         self.log(f"Audio transcription added from {audio_path}: raw={text} corrected={corrected}")
+        self.speak_event("transcription_finished", "已识别指令。")
         action = self.voice_after_transcribe.currentData()
         if action == "parse":
             self.parse_command(allow_auto=False)
         elif action == "execute":
             self.parse_command(allow_auto=False)
             if self.last_safe:
-                self.execute_last(force_run=True)
+                self.execute_last(force_run=self.last_user_requested_run, confirm_engage=True)
 
     def on_transcription_failed(self, message):
         self.voice_status.setText("Transcription failed.")
+        self.speak_event("error", "语音识别失败。", priority=True)
         self._show_error("Speech-to-text failed", RuntimeError(message))
 
     def toggle_wake_standby(self):
@@ -2519,6 +3131,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_wake_standby()
 
     def start_wake_standby(self):
+        if not self.voice_input_is_enabled():
+            self.voice_standby.blockSignals(True)
+            self.voice_standby.setChecked(False)
+            self.voice_standby.blockSignals(False)
+            self.voice_status.setText("Voice input is disabled.")
+            return
         if self.wake_thread and self.wake_thread.isRunning():
             return
         if not self.stt.available():
@@ -2554,7 +3172,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wake_worker = WakeStandbyWorker(self.stt, config)
         self.wake_worker.moveToThread(self.wake_thread)
         self.wake_thread.started.connect(self.wake_worker.run)
-        self.wake_worker.status.connect(self.voice_status.setText)
+        self.wake_worker.status.connect(self.on_wake_status)
         self.wake_worker.level.connect(self.set_mic_level)
         self.wake_worker.command_audio_ready.connect(
             lambda path, wake_name: self.start_transcription(path, strip_wake_name_value=wake_name)
@@ -2572,6 +3190,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.wake_worker:
             self.wake_worker.stop()
         self.voice_status.setText("Wake standby stopping...")
+
+    def on_wake_status(self, message):
+        text = str(message or "")
+        self.voice_status.setText(text)
+        if "Wake word accepted" in text:
+            self.speak_event("wake", "你好，我在听，请说实验指令。", priority=True)
 
     def _on_wake_standby_stopped(self):
         self.voice_standby.blockSignals(True)
@@ -2595,13 +3219,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def parse_command(self, allow_auto=True):
         user_text = ""
         try:
-            client = LLMClient(
-                api_key=self.api_key.text().strip(),
-                base_url=self.base_url.text().strip(),
-                model=self.model.text().strip(),
-                mock=False,
-            )
+            client = self._make_llm_client()
             user_text = self.command_text.toPlainText()
+            self.speak_event("before_parse", "正在解析指令并进行安全检查。")
             project_context = self.project_context_for_query(user_text, purpose="command")
             command = client.parse_command(
                 user_text,
@@ -2610,27 +3230,82 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.lyse_registry,
                 project_context=project_context,
             )
+            command = self._correct_blacs_actions_from_user_text(command, user_text)
+            command, run_requested = self._strip_unrequested_engage(command, user_text)
+            self.last_user_requested_run = run_requested
             safe = self.validator.validate_command(command)
             self.last_command, self.last_safe = command, safe
             self.json_view.setPlainText("AI JSON:\n" + dumps(command, indent=2) + "\n\nSAFE:\n" + dumps(safe, indent=2))
             self._fill_actions(safe)
             self.record_command_event("parse_ok", user_text, {"command": command, "safe": safe, "project_context": self.last_project_context})
             self.log("Parse OK")
+            self.speak_event("parse_ok", summarize_safe_actions(safe, max_chars=self.tts.max_chars))
             if hasattr(self, "clear_after_parse") and self.clear_after_parse.isChecked():
                 self.command_text.clear()
             if allow_auto and self.auto_run.isChecked():
-                self.execute_last(force_run=True)
+                self.execute_last(force_run=run_requested, confirm_engage=False)
             elif allow_auto and self.auto_write.isChecked():
-                self.execute_last(force_run=False)
+                self.execute_last(force_run=run_requested, confirm_engage=True)
         except Exception as exc:
             self.record_command_event("parse_failed", user_text, {"error": str(exc)})
+            self.speak_event("error", "指令解析或安全检查失败。", priority=True)
             self._show_error("Parse/safety failed", exc)
+
+    def _strip_unrequested_engage(self, command, user_text):
+        run_requested = user_text_requests_shot(user_text)
+        actions = list((command or {}).get("actions", []) or [])
+        if run_requested or not actions:
+            return command, run_requested
+        filtered = [action for action in actions if not (isinstance(action, dict) and action.get("type") == "engage")]
+        if len(filtered) != len(actions):
+            command = dict(command or {})
+            command["actions"] = filtered
+            command["comment"] = (
+                str(command.get("comment", "") or "")
+                + " Engage removed because the user did not explicitly ask to run a shot."
+            ).strip()
+            self.log("Removed unrequested engage action; parameter/static writes will not submit a shot.")
+        return command, run_requested
+
+    def _correct_blacs_actions_from_user_text(self, command, user_text):
+        """Prefer explicit channel names from the user's text over a wrong LLM channel guess."""
+        actions = list((command or {}).get("actions", []) or [])
+        if not actions or not self.blacs_registry:
+            return command
+        text = str(user_text or "").lower()
+        norm_text = SafetyValidator._norm_name(user_text or "")
+        matches = []
+        for registered, rule in self.blacs_registry.items():
+            candidates = [registered, rule.get("bridge_name", ""), rule.get("channel", "")]
+            if rule.get("device") and rule.get("channel"):
+                candidates.append(f"{rule.get('device')}.{rule.get('channel')}")
+            candidates.extend(rule.get("aliases", []) or [])
+            for candidate in candidates:
+                candidate_text = str(candidate or "").strip()
+                if len(candidate_text) < 3:
+                    continue
+                candidate_norm = SafetyValidator._norm_name(candidate_text)
+                if not candidate_norm:
+                    continue
+                if candidate_text.lower() in text or candidate_norm in norm_text:
+                    matches.append((len(candidate_norm), registered, candidate_text))
+        if not matches:
+            return command
+        matches.sort(reverse=True)
+        best_name = matches[0][1]
+        blacs_actions = [action for action in actions if isinstance(action, dict) and action.get("type") == "set_blacs_manual"]
+        if len(blacs_actions) == 1 and blacs_actions[0].get("name") != best_name:
+            old_name = blacs_actions[0].get("name")
+            blacs_actions[0]["name"] = best_name
+            self.log(f"Corrected BLACS action name from user text: {old_name!r} -> {best_name!r}")
+        return command
 
     def dry_run_preview(self):
         self.parse_command(allow_auto=False)
         if self.last_safe:
             self.json_view.appendPlainText("\n\nDRY-RUN PREVIEW:\n" + dumps(self.last_safe, indent=2))
             self.log("Dry-run preview generated; no hardware action was executed.")
+            self.speak_event("dry_run", "这是 dry-run 预览，不会控制硬件。")
 
     def show_retrieved_context(self):
         context = self.last_project_context or self.project_context_for_query(self.command_text.toPlainText(), purpose="command")
@@ -2656,7 +3331,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setBackground(QtGui.QColor(225, 255, 225))
                 self.actions_table.setItem(row, col, item)
 
-    def execute_last(self, force_run=False):
+    def execute_last(self, force_run=False, confirm_engage=True):
         if not self.last_safe:
             QtWidgets.QMessageBox.warning(self, "No safe command", "Parse a command first.")
             return
@@ -2666,18 +3341,36 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.dry_run.isChecked():
                 self.log("Dry run: not executing. " + dumps(safe))
                 self.record_command_event("dry_run", payload={"safe": safe, "force_run": force_run})
+                self.speak_event("dry_run", "这是 dry-run 模式，不会控制硬件。")
                 return
+            self.speak_event("before_execute", summarize_safe_actions(safe, max_chars=self.tts.max_chars), priority=True)
             if safe.get("confirmations") and not self._confirm_high_risk(safe["confirmations"]):
                 self.log("Execution cancelled by user.")
                 self.record_command_event("cancelled", payload={"safe": safe, "force_run": force_run})
+                self.speak_event("after_execute", "执行已取消。", priority=True)
                 return
             if safe.get("globals"):
-                diff = self.rm.preview_diff(safe["globals"])
-                self.log("runmanager diff: " + dumps(diff))
-                self.rm.set_globals(safe["globals"])
-                self.log("set_globals OK: " + dumps(safe["globals"]))
+                report = self.write_runmanager_safe_globals(safe["globals"])
+                self.log(report.summary())
+                if report.missing:
+                    raise RuntimeError(
+                        "Some runmanager globals were not found in active remote globals or the configured H5: "
+                        + ", ".join(sorted(report.missing))
+                    )
             for name, value in safe.get("blacs_manual", {}).items():
-                result = self.blacs.set_manual(name, value, program=self.blacs_program.isChecked())
+                rule = self.blacs_registry.get(name, {})
+                result = self._write_blacs_manual(
+                    name,
+                    value,
+                    program=self.blacs_program.isChecked(),
+                    bridge_name=rule.get("bridge_name", ""),
+                    device=rule.get("device", ""),
+                    channel=rule.get("channel", ""),
+                    unit=rule.get("unit", ""),
+                    aliases=rule.get("aliases", []),
+                    subchannel=rule.get("subchannel"),
+                )
+                self._update_blacs_table_value(name, value, result=result)
                 self.log("BLACS set_manual OK: " + dumps(result))
             for item in safe.get("load_h5", []):
                 self.h5_folder.setText(item["path"])
@@ -2711,23 +3404,52 @@ class MainWindow(QtWidgets.QMainWindow):
                     include_knowledge_context=item.get("include_knowledge_context", True),
                     include_optimizer_history=item.get("include_optimizer_history", True),
                 )
-            if engage:
-                n = self.rm.n_shots()
+            if engage and self.rm.uses_local_gateway:
+                prepared = self.rm.prepare_engage()
+                n = prepared["expected_n_shots"]
                 ans = QtWidgets.QMessageBox.question(
-                    self,
-                    "Confirm engage",
-                    f"About to submit shot(s). Estimated n_shots={n}. Continue?",
+                    self, "Confirm Engage",
+                    f"Submit {n} shot(s) using the current Runmanager configuration?\n"
+                    f"Configuration SHA-256: {prepared['expected_config_digest']}",
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                     QtWidgets.QMessageBox.No,
                 )
-                if ans == QtWidgets.QMessageBox.Yes:
+                engage = ans == QtWidgets.QMessageBox.Yes
+                if engage:
+                    receipt = self.rm.engage(prepared=prepared)
+                    self.log("Runmanager acknowledged Engage: " + dumps(receipt))
+                else:
+                    self.log("Engage cancelled by user; earlier write actions were already applied.")
+            elif engage:
+                n = self.rm.n_shots()
+                if confirm_engage:
+                    ans = QtWidgets.QMessageBox.question(
+                        self,
+                        "Confirm engage",
+                        f"About to submit shot(s). Estimated n_shots={n}. Continue?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if ans != QtWidgets.QMessageBox.Yes:
+                        self.log("Engage cancelled by user; write actions were already applied.")
+                        engage = False
+                    else:
+                        self.rm.set_run_shots(True)
+                        self.rm.engage()
+                        self.log("engage OK")
+                else:
                     self.rm.set_run_shots(True)
                     self.rm.engage()
-                    self.log("engage OK")
+                    self.log("engage OK without extra confirmation")
             self.refresh_globals()
-            self.record_command_event("execute_ok", payload={"safe": safe, "force_run": force_run, "engage": engage})
+            self.record_command_event(
+                "execute_ok",
+                payload={"safe": safe, "force_run": force_run, "engage": engage, "confirm_engage": confirm_engage},
+            )
+            self.speak_event("after_execute", "已提交 shot。" if engage else "执行完成。", priority=True)
         except Exception as exc:
             self.record_command_event("execute_failed", payload={"safe": safe, "force_run": force_run, "error": str(exc)})
+            self.speak_event("error", "执行失败，已记录错误。", priority=True)
             self._show_error("Execute failed", exc)
 
     def _confirm_high_risk(self, confirmations):
@@ -2746,17 +3468,200 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = self.rm.connect()
             self.log(msg)
             self.statusBar().showMessage(str(msg))
+            self.detect_directory_from_labscript_apps(silent=True)
         except Exception as exc:
             self._show_error("runmanager failed", exc)
 
     def refresh_globals(self):
+        remote_error = None
+        fallback_error = None
+        source = "runmanager remote"
         try:
-            g = self.rm.get_globals()
+            try:
+                g = self.rm.get_globals() or {}
+            except Exception as exc:
+                remote_error = exc
+                g = {}
+
+            if self.rm.uses_local_gateway:
+                if remote_error is not None:
+                    raise remote_error
+                source = "local Runmanager gateway"
+            elif not g:
+                try:
+                    snapshot = self._read_runmanager_globals_h5_snapshot()
+                except Exception as exc:
+                    fallback_error = exc
+                    snapshot = None
+                if snapshot and snapshot.values:
+                    g = snapshot.values
+                    source = f"H5 fallback: {snapshot.path}"
+                    self._merge_global_registry_from_h5(snapshot)
+                elif remote_error is not None:
+                    details = f"runmanager remote failed: {remote_error}"
+                    if fallback_error is not None:
+                        details += f"\nH5 fallback failed: {fallback_error}"
+                    raise RuntimeError(details) from remote_error
+                elif fallback_error is not None:
+                    raise RuntimeError(f"runmanager returned 0 globals and H5 fallback failed: {fallback_error}") from fallback_error
+
             self._fill_globals(g)
             self.update_runmanager_shot_preview(silent=True)
-            self.log(f"globals loaded: {len(g)}")
+            self.log(f"globals loaded from {source}: {len(g)}")
         except Exception as exc:
             self._show_error("refresh globals failed", exc, modal=False)
+
+    def write_runmanager_safe_globals(self, values):
+        cfg = (self.project_settings.get("runmanager", {}) or {}) if hasattr(self, "project_settings") else {}
+        direct_h5 = bool(cfg.get("direct_h5_write", True))
+        group = str(cfg.get("direct_h5_group", "") or "")
+        h5_path = self._configured_runmanager_globals_h5_path()
+        prepared = None
+        if self.rm.uses_local_gateway and values:
+            prepared = self.rm.prepare_globals(values)
+            diff = prepared["plan"]["diff"]
+            text = "\n".join(f"{row['name']}: {row['before']} → {row['expected_after']}" for row in diff)
+            if not self._confirm_local_change("Apply Runmanager globals", text):
+                raise RuntimeError("Runmanager changes cancelled")
+        report = write_runmanager_globals(
+            self.rm,
+            values,
+            globals_h5_path=h5_path if h5_path else None,
+            direct_h5_write=direct_h5,
+            h5_group=group,
+            prepared=prepared,
+        )
+        if report.remote_written:
+            self.log("runmanager remote write OK: " + dumps(report.remote_written))
+        if report.h5_written:
+            self.log("runmanager H5 direct-write OK: " + dumps(report.h5_written))
+            self.refresh_globals_from_h5(silent=True)
+        if report.remote_error:
+            self.log(f"runmanager remote write/read warning: {report.remote_error}")
+        self.update_runmanager_write_status()
+        return report
+
+    def _configured_runmanager_globals_h5_path(self):
+        path_text = (self.project_settings or {}).get("runmanager_globals_path", "")
+        if not path_text:
+            return None
+        path = self._project_path(path_text)
+        return path if path.exists() else None
+
+    def check_runmanager_active_globals(self):
+        remote_count = None
+        h5_count = None
+        messages = []
+        try:
+            remote = self.rm.get_globals() or {}
+            remote_count = len(remote)
+            messages.append(f"remote active globals: {remote_count}")
+        except Exception as exc:
+            messages.append(f"remote active globals unavailable: {exc}")
+        try:
+            snapshot = self._read_runmanager_globals_h5_snapshot()
+            h5_count = len(snapshot.values)
+            messages.append(f"H5 globals: {h5_count} ({snapshot.path})")
+        except Exception as exc:
+            messages.append(f"H5 globals unavailable: {exc}")
+        self.update_runmanager_write_status(remote_count=remote_count, h5_count=h5_count)
+        detail = "\n".join(messages)
+        self.log(detail)
+        self.statusBar().showMessage(detail.replace("\n", " | "), 8000)
+
+    def refresh_globals_from_h5(self, silent=False):
+        try:
+            snapshot = self._read_runmanager_globals_h5_snapshot()
+            self._merge_global_registry_from_h5(snapshot)
+            self._fill_globals(snapshot.values)
+            self.update_runmanager_write_status(h5_count=len(snapshot.values))
+            self.log(f"globals loaded from H5 direct snapshot: {len(snapshot.values)}")
+            if not silent:
+                self.statusBar().showMessage(f"Loaded {len(snapshot.values)} globals from H5.", 8000)
+            return snapshot
+        except Exception as exc:
+            if silent:
+                self.log(f"Refresh globals from H5 failed: {exc}")
+                return None
+            self._show_error("Refresh globals from H5 failed", exc)
+            return None
+
+    def preview_selected_global_write_target(self):
+        row = self.globals_table.currentRow() if hasattr(self, "globals_table") else -1
+        if row < 0:
+            self.log("Select a global row before write-target dry-run.")
+            return
+        name_item = self.globals_table.item(row, 0)
+        value_item = self.globals_table.item(row, 1)
+        if not name_item:
+            return
+        name = name_item.text().strip()
+        value = value_item.text().strip() if value_item else ""
+        h5_path = self._configured_runmanager_globals_h5_path()
+        targets = preview_runmanager_write_targets(self.rm, {name: value}, globals_h5_path=h5_path)
+        self.log("runmanager write dry-run target: " + dumps(targets))
+
+    def update_runmanager_write_status(self, remote_count=None, h5_count=None, direct_on=None):
+        if direct_on is None:
+            direct_on = bool((self.project_settings.get("runmanager", {}) or {}).get("direct_h5_write", True))
+        if remote_count is None:
+            try:
+                remote_count = len(self.rm.get_globals() or {})
+            except Exception:
+                remote_count = None
+        if h5_count is None:
+            try:
+                h5_count = len(self._read_runmanager_globals_h5_snapshot().values)
+            except Exception:
+                h5_count = None
+        if hasattr(self, "rm_active_globals_label"):
+            self.rm_active_globals_label.setText(f"remote active globals: {remote_count if remote_count is not None else '--'}")
+            self.rm_active_globals_label.setObjectName("StatusLightOk" if remote_count else "StatusLightWarn")
+            self.rm_active_globals_label.style().unpolish(self.rm_active_globals_label)
+            self.rm_active_globals_label.style().polish(self.rm_active_globals_label)
+        if hasattr(self, "rm_h5_globals_label"):
+            self.rm_h5_globals_label.setText(f"H5 globals: {h5_count if h5_count is not None else '--'}")
+            self.rm_h5_globals_label.setObjectName("StatusLightOk" if h5_count else "StatusLightWarn")
+            self.rm_h5_globals_label.style().unpolish(self.rm_h5_globals_label)
+            self.rm_h5_globals_label.style().polish(self.rm_h5_globals_label)
+        if hasattr(self, "rm_h5_write_label"):
+            self.rm_h5_write_label.setText(f"direct H5 write: {'on' if direct_on else 'off'}")
+            self.rm_h5_write_label.setObjectName("StatusLightOk" if direct_on else "StatusLightWarn")
+            self.rm_h5_write_label.style().unpolish(self.rm_h5_write_label)
+            self.rm_h5_write_label.style().polish(self.rm_h5_write_label)
+
+    def _read_runmanager_globals_h5_snapshot(self):
+        path_text = (self.project_settings or {}).get("runmanager_globals_path", "")
+        if not path_text:
+            raise FileNotFoundError("runmanager_globals_path is not configured")
+        return read_runmanager_globals_h5(self._project_path(path_text))
+
+    def _merge_global_registry_from_h5(self, snapshot):
+        merged = registry_from_globals_h5(snapshot, self.global_registry)
+        if merged == self.global_registry:
+            return False
+        before = set(self.global_registry)
+        self.global_registry = merged
+        self.settings.save_global_registry(self.global_registry)
+        self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+        self.voice_lexicon = VoiceLexicon.from_registries(
+            self.global_registry,
+            self.blacs_registry,
+            self.lyse_registry,
+            extra_path=self.settings.path("voice_lexicon.yaml"),
+        )
+        self.stt.initial_prompt = self.voice_lexicon.prompt()
+        if hasattr(self, "global_editor"):
+            self.global_editor.set_rows(self._global_registry_rows())
+        if hasattr(self, "opt_params_table"):
+            self._fill_optimizer_params()
+        if hasattr(self, "project_tree"):
+            self._fill_project_tree()
+        if hasattr(self, "diag_lexicon"):
+            self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+        added = len(set(self.global_registry) - before)
+        self.log(f"Global registry updated from H5 fallback: added {added}, total {len(self.global_registry)}")
+        return True
 
     def update_runmanager_shot_preview(self, silent=True):
         try:
@@ -2810,10 +3715,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def auto_upload_global_from_table_value(self, name, value):
         try:
             action = {"type": "set_global", "name": name, "value": str(value).strip().strip("'\"")}
-            self.last_safe = self.validator.validate_command({"actions": [action]})
-            self._fill_actions(self.last_safe)
-            self.log(f"Auto uploading global: {name} = {action['value']}")
-            self.execute_last(force_run=False)
+            safe = self.validator.validate_command({"actions": [action]})
+            converted = safe["globals"][name]
+            if self.rm.uses_local_gateway and self.dry_run.isChecked():
+                self.last_safe = safe
+                self._fill_actions(safe)
+                return
+            report = self.write_runmanager_safe_globals({name: converted})
+            self.last_safe = safe
+            self._fill_actions(safe)
+            if report.missing:
+                raise RuntimeError(
+                    "Runmanager global was not found in active remote globals or configured H5: "
+                    + ", ".join(sorted(report.missing))
+                )
+            self.log(f"Auto uploaded runmanager global: {name} = {converted!r}; {report.summary()}")
             self.update_runmanager_shot_preview(silent=True)
         except Exception as exc:
             self._show_error(f"Auto upload global failed: {name}", exc)
@@ -2942,6 +3858,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def test_blacs(self):
         try:
             self.log(str(self.blacs.test()))
+            self.detect_directory_from_labscript_apps(silent=True)
         except Exception as exc:
             self._show_error("BLACS bridge failed", exc)
 
@@ -2951,11 +3868,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         name = self.blacs_table.item(row, 0).text()
         value_item = self.blacs_table.item(row, 6)
-        value = value_item.text() if value_item else ""
+        value = value_item.text().strip() if value_item else ""
+        if not value:
+            self.log(f"BLACS write skipped for {name}: target value is empty.")
+            return
         try:
-            safe = self.validator.validate_command({"actions": [{"type": "set_blacs_manual", "name": name, "value": value}]})
-            self.last_safe = safe
-            self.execute_last()
+            self.auto_upload_blacs_from_table_value(name, value, row=row)
         except Exception as exc:
             self._show_error("BLACS validation failed", exc)
 
@@ -2966,10 +3884,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if not name_item or name_item.checkState() != QtCore.Qt.Checked:
                 continue
             value_item = self.blacs_table.item(row, 6)
-            value = value_item.text() if value_item else ""
+            value = value_item.text().strip() if value_item else ""
+            if not value:
+                continue
             actions.append({"type": "set_blacs_manual", "name": name_item.text(), "value": value})
         if not actions:
-            self.log("No checked BLACS channels to apply.")
+            self.log("No checked BLACS channels with non-empty target values to apply.")
             return
         try:
             self.last_safe = self.validator.validate_command({"actions": actions})
@@ -2980,31 +3900,63 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _fill_blacs_registry(self):
         names = sorted(self.blacs_registry.keys())
-        self.blacs_table.setRowCount(len(names))
-        for row, name in enumerate(names):
-            rule = self.blacs_registry[name]
-            vals = [
-                name,
-                rule.get("kind", ""),
-                rule.get("device", ""),
-                rule.get("channel", ""),
-                f"{rule.get('min', '')}..{rule.get('max', '')} {rule.get('unit', '')}",
-                "",
-                "",
-                rule.get("risk", ""),
-            ]
-            for col, val in enumerate(vals):
-                item = QtWidgets.QTableWidgetItem(str(val))
-                if col == 0:
-                    item.setCheckState(QtCore.Qt.Unchecked)
-                self.blacs_table.setItem(row, col, item)
+        self._loading_blacs_table = True
+        self.blacs_table.blockSignals(True)
+        try:
+            self.blacs_table.setRowCount(len(names))
+            for row, name in enumerate(names):
+                rule = self.blacs_registry[name]
+                vals = [
+                    name,
+                    rule.get("kind", ""),
+                    rule.get("device", ""),
+                    rule.get("channel", ""),
+                    f"{rule.get('min', '')}..{rule.get('max', '')} {rule.get('unit', '')}",
+                    rule.get("current_value", rule.get("default", "")),
+                    "",
+                    rule.get("risk", ""),
+                ]
+                for col, val in enumerate(vals):
+                    item = QtWidgets.QTableWidgetItem(str(val))
+                    if col != 6:
+                        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.blacs_table.setItem(row, col, item)
+        finally:
+            self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
 
     def _find_blacs_row(self, name):
+        target = self._resolve_blacs_table_name(name)
         for row in range(self.blacs_table.rowCount()):
             item = self.blacs_table.item(row, 0)
-            if item and item.text() == name:
+            if item and item.text() == target:
                 return row
         return -1
+
+    def _resolve_blacs_table_name(self, name):
+        try:
+            resolved = self.validator.resolve_registry_name(name, self.blacs_registry)
+            if resolved in self.blacs_registry:
+                return resolved
+        except Exception:
+            pass
+        text = str(name or "").strip()
+        norm = SafetyValidator._norm_name(text)
+        for registered, rule in (self.blacs_registry or {}).items():
+            candidates = [
+                registered,
+                rule.get("bridge_name", ""),
+                rule.get("channel", ""),
+                f"{rule.get('device', '')}.{rule.get('channel', '')}" if rule.get("device") and rule.get("channel") else "",
+            ]
+            candidates.extend(rule.get("aliases", []) or [])
+            if any(SafetyValidator._norm_name(candidate) == norm for candidate in candidates if candidate):
+                return registered
+        return text
+
+    def _blacs_rule_for_name(self, name):
+        resolved = self._resolve_blacs_table_name(name)
+        return resolved, dict(self.blacs_registry.get(resolved, {}))
 
     def _format_blacs_range(self, channel):
         unit = channel.get("unit", "")
@@ -3018,28 +3970,141 @@ class MainWindow(QtWidgets.QMainWindow):
         name = str(channel.get("name") or channel.get("channel") or "").strip()
         if not name:
             return
+        name = self._resolve_blacs_table_name(name)
         row = self._find_blacs_row(name)
+        self._loading_blacs_table = True
+        self.blacs_table.blockSignals(True)
         if row < 0:
             row = self.blacs_table.rowCount()
             self.blacs_table.insertRow(row)
-        values = [
-            name,
-            channel.get("kind", "manual"),
-            channel.get("device", ""),
-            channel.get("channel", name),
-            self._format_blacs_range(channel),
-            channel.get("current_value", channel.get("value", "")),
-            channel.get("target_value", ""),
-            channel.get("risk", "unknown"),
-        ]
-        for col, value in enumerate(values):
-            item = self.blacs_table.item(row, col)
-            if item is None:
-                item = QtWidgets.QTableWidgetItem()
-                self.blacs_table.setItem(row, col, item)
-            item.setText(str(value))
-            if col == 0 and item.checkState() == QtCore.Qt.Unchecked:
-                item.setCheckState(QtCore.Qt.Unchecked)
+        try:
+            values = [
+                name,
+                channel.get("kind", "manual"),
+                channel.get("device", ""),
+                channel.get("channel", name),
+                self._format_blacs_range(channel),
+                channel.get("current_value", channel.get("value", "")),
+                channel.get("target_value", ""),
+                channel.get("risk", "unknown"),
+            ]
+            for col, value in enumerate(values):
+                item = self.blacs_table.item(row, col)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem()
+                    self.blacs_table.setItem(row, col, item)
+                item.setText(str(value))
+                if col != 6:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.blacs_table.item(row, 0).setData(QtCore.Qt.UserRole, {
+                "unit": channel.get("unit", ""),
+                "subchannel": channel.get("subchannel"),
+            })
+        finally:
+            self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
+
+    def _on_blacs_table_item_changed(self, item):
+        if getattr(self, "_loading_blacs_table", False):
+            return
+        if item is None or item.column() != 6:
+            return
+        value = item.text().strip()
+        if not value:
+            return
+        row = item.row()
+        name_item = self.blacs_table.item(row, 0)
+        if not name_item:
+            return
+        self.auto_upload_blacs_from_table_value(name_item.text().strip(), value, row=row)
+
+    def auto_upload_blacs_from_table_value(self, name, value, row=None):
+        try:
+            canonical, rule = self._blacs_rule_for_name(name)
+            action = {"type": "set_blacs_manual", "name": canonical, "value": str(value).strip().strip("'\"")}
+            safe = self.validator.validate_command({"actions": [action]})
+            converted = safe["blacs_manual"][canonical]
+            if self.blacs.uses_local_gateway and self.dry_run.isChecked():
+                self.last_safe = safe
+                self._fill_actions(safe)
+                return
+            result = self._write_blacs_manual(
+                canonical,
+                converted,
+                program=self.blacs_program.isChecked(),
+                bridge_name=rule.get("bridge_name", ""),
+                device=rule.get("device", ""),
+                channel=rule.get("channel", ""),
+                unit=rule.get("unit", ""),
+                aliases=rule.get("aliases", []),
+                subchannel=rule.get("subchannel"),
+            )
+            self.last_safe = safe
+            self._fill_actions(safe)
+            self._update_blacs_table_value(canonical, converted, result=result, row=row)
+            self.log(f"Auto uploaded BLACS manual channel: {canonical} = {converted!r}; result={dumps(result)}")
+        except Exception as exc:
+            self._show_error(f"Auto upload BLACS channel failed: {name}", exc)
+
+    def _confirm_local_change(self, title, detail):
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle(title)
+        dialog.setTextFormat(QtCore.Qt.PlainText)
+        dialog.setText(title)
+        dialog.setDetailedText(detail)
+        dialog.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        dialog.setDefaultButton(QtWidgets.QMessageBox.No)
+        dialog.setInformativeText(detail if len(detail) <= 450 else "Open Show Details to review the full change.")
+        return dialog.exec_() == QtWidgets.QMessageBox.Yes
+
+    def _write_blacs_manual(self, name, value, *, program, **extra):
+        if not self.blacs.uses_local_gateway:
+            return self.blacs.set_manual(name, value, program=program, **extra)
+        if not program:
+            raise ValueError("Enable Program before preparing a local BLACS output change.")
+        approver = os.getenv("LABPILOT_OPERATOR", "").strip()
+        if not approver:
+            approver, ok = QtWidgets.QInputDialog.getText(self, "BLACS operator", "Operator name registered in the gateway")
+            if not ok or not approver.strip():
+                raise RuntimeError("BLACS change cancelled")
+        instruction = f"Set {name} to {value!r}"
+        prepared = self.blacs.prepare_local_manual(name, value, approver=approver.strip(),
+                                                   instruction=instruction, **extra)
+        if not self._confirm_local_change("Apply BLACS output", dumps(prepared["payload"])):
+            raise RuntimeError("BLACS change cancelled")
+        receipt = self.blacs.apply_local_manual(prepared)
+        if receipt.get("state") != "APPLIED":
+            self.log("BLACS gateway receipt: " + dumps(receipt))
+            raise RuntimeError(
+                f"BLACS returned {receipt.get('state', 'UNKNOWN')}. Check the request receipt and current state."
+            )
+        after = receipt["value"]["after"]
+        channel, change = next(iter(prepared["payload"]["changes"].items()))
+        current = after[channel]
+        if isinstance(change, dict) and isinstance(current, dict):
+            current = current.get(next(iter(change)))
+        return {**receipt, "front_panel_value": current}
+
+    def _update_blacs_table_value(self, name, value, result=None, row=None):
+        if row is None or row < 0:
+            row = self._find_blacs_row(name)
+        if row < 0:
+            return
+        readback = value
+        if isinstance(result, dict):
+            readback = result.get("front_panel_value", result.get("value", value))
+        self._loading_blacs_table = True
+        self.blacs_table.blockSignals(True)
+        try:
+            self.blacs_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(readback)))
+            self.blacs_table.setItem(row, 6, QtWidgets.QTableWidgetItem(""))
+            for col in (5, 6):
+                item = self.blacs_table.item(row, col)
+                if item is not None and col != 6:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+        finally:
+            self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
 
     def discover_blacs_channels(self):
         try:
@@ -3053,6 +4118,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def read_blacs_values(self):
         try:
             values = self.blacs.get_values()
+            self._loading_blacs_table = True
+            self.blacs_table.blockSignals(True)
             for name, payload in values.items():
                 row = self._find_blacs_row(str(name))
                 if row < 0:
@@ -3063,10 +4130,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     value = payload
                 if row >= 0:
-                    self.blacs_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(value)))
+                    item = QtWidgets.QTableWidgetItem(str(value))
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.blacs_table.setItem(row, 5, item)
             self.log(f"BLACS readonly values refreshed for {len(values)} channel(s).")
         except Exception as exc:
             self._show_error("BLACS value readback failed", exc)
+        finally:
+            if hasattr(self, "blacs_table"):
+                self.blacs_table.blockSignals(False)
+            self._loading_blacs_table = False
 
     def import_selected_blacs_channels(self):
         rows = sorted({index.row() for index in self.blacs_table.selectedIndexes()})
@@ -3081,17 +4154,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if not name_item or not name_item.text().strip():
                 continue
             name = name_item.text().strip()
-            range_text = self.blacs_table.item(row, 4).text() if self.blacs_table.item(row, 4) else ""
-            unit = ""
-            if " " in range_text:
-                unit = range_text.rsplit(" ", 1)[-1]
+            descriptor = name_item.data(QtCore.Qt.UserRole) or {}
+            kind_item = self.blacs_table.item(row, 1)
+            kind = kind_item.text() if kind_item else "manual"
             self.blacs_registry[name] = {
                 "name": name,
-                "kind": self.blacs_table.item(row, 1).text() if self.blacs_table.item(row, 1) else "manual",
+                "kind": kind,
                 "device": self.blacs_table.item(row, 2).text() if self.blacs_table.item(row, 2) else "",
                 "channel": self.blacs_table.item(row, 3).text() if self.blacs_table.item(row, 3) else name,
-                "type": "float",
-                "unit": unit,
+                "type": "bool" if kind.upper() == "DO" else "float",
+                "unit": descriptor.get("unit", ""),
+                "subchannel": descriptor.get("subchannel"),
                 "risk": self.blacs_table.item(row, 7).text() if self.blacs_table.item(row, 7) else "unknown",
                 "require_confirm": True,
                 "ai_control": False,
@@ -3105,6 +4178,102 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"Imported {imported} BLACS channel(s) into the local registry draft.")
         else:
             self.log("No valid BLACS channel rows were imported.")
+
+    def parse_connection_table_blacs_actions(self):
+        try:
+            path = self._active_connection_table_text()
+            if not path:
+                raise FileNotFoundError("No active connection_table.py is configured in Directory.")
+            registry, report = discover_blacs_channels_from_connection_table(self._project_path(path))
+            self.last_parsed_blacs_registry = registry
+            for name, rule in registry.items():
+                self._upsert_blacs_channel_row(
+                    {
+                        "name": name,
+                        "kind": rule.get("kind", "manual"),
+                        "device": rule.get("device", ""),
+                        "channel": rule.get("channel", name),
+                        "unit": rule.get("unit", ""),
+                        "min": rule.get("min", ""),
+                        "max": rule.get("max", ""),
+                        "current_value": rule.get("default", ""),
+                        "risk": rule.get("risk", "medium"),
+                    }
+                )
+            self.log(f"Parsed {report.get('count', 0)} BLACS action channel(s) from connection table: {report.get('path')}")
+        except Exception as exc:
+            self._show_error("Parse connection table BLACS actions failed", exc)
+
+    def parse_and_import_blacs_actions(self):
+        """Parse connection_table.py and immediately make the channels AI-addressable."""
+        try:
+            path = self._active_connection_table_text()
+            if not path:
+                raise FileNotFoundError("No active connection_table.py is configured in Directory.")
+            registry, report = discover_blacs_channels_from_connection_table(self._project_path(path))
+            self.last_parsed_blacs_registry = registry
+            self.blacs_registry = merge_blacs_registry_from_connection_table(registry, self.blacs_registry)
+            saved = self.settings.save_blacs_registry(self.blacs_registry)
+            self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_lexicon = VoiceLexicon.from_registries(
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                extra_path=self.settings.path("voice_lexicon.yaml"),
+            )
+            self.stt.initial_prompt = self.voice_lexicon.prompt()
+            self._fill_blacs_registry()
+            if hasattr(self, "diag_lexicon"):
+                self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+            self.log(
+                f"AI parse usable BLACS actions: imported {report.get('count', 0)} channel(s) "
+                f"from {report.get('path')}; registry={saved}"
+            )
+        except Exception as exc:
+            self._show_error("AI parse usable BLACS actions failed", exc)
+
+    def import_parsed_connection_table_blacs_channels(self):
+        try:
+            registry = getattr(self, "last_parsed_blacs_registry", None)
+            if not registry:
+                path = self._active_connection_table_text()
+                if not path:
+                    raise FileNotFoundError("No active connection_table.py is configured in Directory.")
+                registry, _ = discover_blacs_channels_from_connection_table(self._project_path(path))
+            self.blacs_registry = merge_blacs_registry_from_connection_table(registry, self.blacs_registry)
+            saved = self.settings.save_blacs_registry(self.blacs_registry)
+            self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_lexicon = VoiceLexicon.from_registries(
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                extra_path=self.settings.path("voice_lexicon.yaml"),
+            )
+            self.stt.initial_prompt = self.voice_lexicon.prompt()
+            self._fill_blacs_registry()
+            if hasattr(self, "diag_lexicon"):
+                self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+            self.log(f"Imported {len(registry)} parsed BLACS channel(s) into registry: {saved}")
+        except Exception as exc:
+            self._show_error("Import parsed BLACS channels failed", exc)
+
+    def refresh_blacs_registry_from_disk(self):
+        try:
+            self.blacs_registry = self.settings.load_blacs_registry()
+            self.validator.reload(self.global_registry, self.blacs_registry, self.lyse_registry)
+            self.voice_lexicon = VoiceLexicon.from_registries(
+                self.global_registry,
+                self.blacs_registry,
+                self.lyse_registry,
+                extra_path=self.settings.path("voice_lexicon.yaml"),
+            )
+            self.stt.initial_prompt = self.voice_lexicon.prompt()
+            self._fill_blacs_registry()
+            if hasattr(self, "diag_lexicon"):
+                self.diag_lexicon.setText(f"{len(self.voice_lexicon.terms)} terms")
+            self.log(f"BLACS registry refreshed: {len(self.blacs_registry)} channel(s).")
+        except Exception as exc:
+            self._show_error("Refresh BLACS registry failed", exc)
 
     def _save_project_setting_value(self, key, value):
         settings = dict(self.project_settings or {})
@@ -3231,6 +4400,123 @@ class MainWindow(QtWidgets.QMainWindow):
         if folder:
             self.h5_folder.setText(folder)
 
+    def _update_lyse_auto_load_status(self):
+        if not hasattr(self, "lyse_auto_status"):
+            return
+        enabled = bool(getattr(self, "lyse_auto_load", None) and self.lyse_auto_load.isChecked())
+        folder = self.h5_folder.text().strip() if hasattr(self, "h5_folder") else ""
+        if not enabled:
+            text = "Auto load paused"
+            status = "StatusLightWarn"
+        elif not folder:
+            text = "Auto load: no H5 folder"
+            status = "StatusLightWarn"
+        elif not Path(folder).exists():
+            text = "Auto load: folder missing"
+            status = "StatusLightError"
+        else:
+            text = "Auto load watching"
+            status = "StatusLightOk"
+        self.lyse_auto_status.setText(text)
+        self.lyse_auto_status.setObjectName(status)
+        self.lyse_auto_status.style().unpolish(self.lyse_auto_status)
+        self.lyse_auto_status.style().polish(self.lyse_auto_status)
+
+    def _on_lyse_analysis_running_toggled(self, checked):
+        if hasattr(self, "lyse_analysis_running"):
+            self.lyse_analysis_running.setText("Analysis running" if checked else "Analysis paused")
+        self.log("Lyse analysis " + ("running" if checked else "paused"))
+
+    def _h5_state(self, path):
+        stat = Path(path).stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _remember_h5_states(self):
+        self.h5_file_states = {}
+        if self.h5_df is None or self.h5_df.empty or "filepath" not in self.h5_df.columns:
+            return
+        for value in self.h5_df["filepath"].dropna():
+            path = Path(str(value))
+            try:
+                self.h5_file_states[str(path.resolve())] = self._h5_state(path)
+            except OSError:
+                continue
+
+    def _upsert_h5_summaries(self, summaries):
+        if not summaries:
+            return []
+        new_df = self._normalize_dataframe_columns(pd.DataFrame(summaries))
+        if self.h5_df is None or self.h5_df.empty or "filepath" not in self.h5_df.columns:
+            self.h5_df = new_df.reset_index(drop=True)
+            return list(range(len(self.h5_df)))
+
+        self.h5_df = self._normalize_dataframe_columns(self.h5_df)
+        changed_rows = []
+        for _idx, row in new_df.iterrows():
+            filepath = str(row.get("filepath", ""))
+            matches = self.h5_df.index[self.h5_df["filepath"].astype(str) == filepath].tolist()
+            if matches:
+                target = matches[0]
+                for key, value in row.items():
+                    self.h5_df.loc[target, self._column_name(key)] = value
+                changed_rows.append(int(target))
+            else:
+                self.h5_df = pd.concat([self.h5_df, pd.DataFrame([row])], ignore_index=True, sort=False)
+                changed_rows.append(len(self.h5_df) - 1)
+        return changed_rows
+
+    def auto_refresh_h5_table(self):
+        if not hasattr(self, "h5_folder") or not hasattr(self, "h5_table"):
+            return
+        if self.h5_auto_loading:
+            return
+        if hasattr(self, "lyse_auto_load") and not self.lyse_auto_load.isChecked():
+            self._update_lyse_auto_load_status()
+            return
+        folder = self.h5_folder.text().strip()
+        if not folder:
+            self._update_lyse_auto_load_status()
+            return
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            self._update_lyse_auto_load_status()
+            return
+        self.h5_auto_loading = True
+        try:
+            recursive = self.h5_recursive.isChecked() if hasattr(self, "h5_recursive") else False
+            summaries = []
+            now = time.time()
+            for path in iter_h5_paths(folder_path, recursive=recursive):
+                try:
+                    state = self._h5_state(path)
+                    if now - path.stat().st_mtime < 0.5:
+                        continue
+                    key = str(path.resolve())
+                    if self.h5_file_states.get(key) == state:
+                        continue
+                    summary = read_shot_summary(path)
+                    if summary.get("error"):
+                        previous = self.h5_read_errors.get(key)
+                        if previous != summary["error"]:
+                            self.h5_read_errors[key] = summary["error"]
+                            self.log(f"Lyse auto load waiting for readable H5: {path.name}: {summary['error']}")
+                        continue
+                    summaries.append(summary)
+                    self.h5_file_states[key] = state
+                    self.h5_read_errors.pop(key, None)
+                except OSError:
+                    continue
+            changed_rows = self._upsert_h5_summaries(summaries)
+            if changed_rows:
+                self._refresh_h5_table_after_analysis()
+                self._run_auto_single_analysis(changed_rows)
+                self._update_lyse_auto_load_status()
+                self.log(f"Lyse auto-loaded/updated {len(changed_rows)} H5 shot(s).")
+        except Exception as exc:
+            self._show_error("Lyse auto load failed", exc, modal=False)
+        finally:
+            self.h5_auto_loading = False
+
     def _normalize_dataframe_columns(self, df):
         if df is None:
             return df
@@ -3249,6 +4535,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.h5_df = self._normalize_dataframe_columns(load_h5_folder(self.h5_folder.text().strip(), recursive=recursive))
             self._fill_dataframe(self.h5_table, self.h5_df)
             self._update_column_combos()
+            self._remember_h5_states()
+            self._update_lyse_auto_load_status()
             self.log(f"loaded h5 files: {len(self.h5_df)}")
         except Exception as exc:
             self._show_error("load h5 failed", exc)
@@ -3261,6 +4549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         new_df = self._normalize_dataframe_columns(pd.DataFrame(rows))
         self.h5_df = pd.concat([self.h5_df, new_df], ignore_index=True, sort=False) if self.h5_df is not None else new_df
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log(f"Added H5 files: {len(paths)}")
 
     def remove_selected_h5_rows(self):
@@ -3277,11 +4566,13 @@ class MainWindow(QtWidgets.QMainWindow):
         index_labels = [self.h5_df.index[row] for row in rows if row < len(self.h5_df)]
         self.h5_df = self.h5_df.drop(index_labels).reset_index(drop=True)
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log(f"Removed {len(index_labels)} H5 row(s) from table only; files were not deleted.")
 
     def clear_h5_table(self):
         self.h5_df = pd.DataFrame()
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log("Cleared H5 table; files were not deleted.")
 
     def reload_selected_h5_rows(self):
@@ -3301,6 +4592,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for key, value in summary.items():
                 self.h5_df.loc[self.h5_df.index[row], self._column_name(key)] = value
         self._refresh_h5_table_after_analysis()
+        self._remember_h5_states()
         self.log(f"Reloaded {len(rows)} selected H5 row(s).")
 
     def _fill_dataframe(self, table, df):
@@ -3310,6 +4602,7 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setRowCount(len(visible))
         table.setColumnCount(len(df.columns))
         table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        configure_table_columns(table, stretch_last=False)
         for row in range(len(visible)):
             for col, name in enumerate(df.columns):
                 table.setItem(row, col, QtWidgets.QTableWidgetItem(str(visible.iloc[row, col])))
@@ -3319,14 +4612,77 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_h5_column_visibility()
 
     def _update_column_combos(self):
-        cols = [str(c) for c in (self.h5_df.columns if self.h5_df is not None else [])]
-        for combo in [self.x_col, self.y_col, self.z_col]:
-            combo.clear()
-            combo.addItems(cols)
-            completer = QtWidgets.QCompleter(cols, combo)
-            completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
-            completer.setFilterMode(QtCore.Qt.MatchContains)
-            combo.setCompleter(completer)
+        self.plot_column_candidates = numeric_varying_columns(self.h5_df)
+        self._sync_plot_controls(preserve=True)
+
+    def _combo_value(self, combo):
+        value = combo.currentData()
+        return str(value) if value is not None else combo.currentText()
+
+    def _current_plot_type(self):
+        return self._combo_value(self.plot_type) if hasattr(self, "plot_type") else "scatter_line"
+
+    def _fill_combo_preserving(self, combo, values, preferred=""):
+        current = preferred or combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(list(values))
+        if current and combo.findText(current) >= 0:
+            combo.setCurrentText(current)
+        elif combo.count():
+            combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        completer = QtWidgets.QCompleter(list(values), combo)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        completer.setFilterMode(QtCore.Qt.MatchContains)
+        combo.setCompleter(completer)
+
+    def _on_plot_type_changed(self):
+        self._sync_plot_controls(preserve=True)
+
+    def _sync_plot_controls(self, preserve=True):
+        if not all(hasattr(self, attr) for attr in ["plot_type", "fit_model", "x_col", "y_col", "z_col"]):
+            return
+        plot_type = self._current_plot_type()
+        cols = list(getattr(self, "plot_column_candidates", []))
+        defaults = default_plot_columns(plot_type, cols)
+        old_values = {
+            "x": self.x_col.currentText(),
+            "y": self.y_col.currentText(),
+            "z": self.z_col.currentText(),
+        } if preserve else {}
+        x_default = old_values.get("x") if old_values.get("x") in cols else defaults.get("x", "")
+        y_default = old_values.get("y") if old_values.get("y") in cols else defaults.get("y", "")
+        z_default = old_values.get("z") if old_values.get("z") in cols else defaults.get("z", "")
+        combo_values = [""] + cols
+        self._fill_combo_preserving(self.x_col, combo_values, x_default)
+        self._fill_combo_preserving(self.y_col, combo_values, y_default)
+        self._fill_combo_preserving(self.z_col, combo_values, z_default)
+        models = valid_fit_models(plot_type)
+        current_model = self.fit_model.currentText()
+        self.fit_model.blockSignals(True)
+        self.fit_model.clear()
+        self.fit_model.addItems(models)
+        self.fit_model.setCurrentText(current_model if current_model in models else models[0])
+        self.fit_model.blockSignals(False)
+        required = set(required_columns(plot_type))
+        self.x_col.setEnabled("x" in required)
+        self.y_col.setEnabled("y" in required or "value" in required)
+        self.z_col.setEnabled("z" in required)
+        if plot_type == "histogram":
+            self.x_col.setCurrentText("")
+            self.z_col.setCurrentText("")
+
+    def _validate_plot_columns(self, plot_type, x, y, z):
+        mapping = {"x": x, "y": y, "z": z, "value": y}
+        missing = [key for key in required_columns(plot_type) if not mapping.get(key)]
+        if missing:
+            raise RuntimeError(f"{plot_type} requires column(s): {', '.join(missing)}")
+        candidates = set(getattr(self, "plot_column_candidates", []))
+        for key in required_columns(plot_type):
+            name = mapping.get(key)
+            if name and candidates and name not in candidates:
+                raise RuntimeError(f"{name!r} is not a numeric varying column. Select a plottable column with at least two distinct values.")
 
     def _apply_h5_column_visibility(self):
         if not hasattr(self, "h5_table") or self.h5_df is None:
@@ -3441,34 +4797,43 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             combo.setEditText(text)
 
+    def _set_plot_type(self, key):
+        index = self.plot_type.findData(key)
+        if index >= 0:
+            self.plot_type.setCurrentIndex(index)
+        else:
+            self.plot_type.setCurrentText(key)
+
     def send_selected_columns_to_plot(self):
-        names = self.selected_h5_column_names()
+        candidates = set(getattr(self, "plot_column_candidates", []) or numeric_varying_columns(self.h5_df))
+        names = [name for name in self.selected_h5_column_names() if name in candidates]
         if not names:
-            self.log("No H5 columns selected.")
+            self.log("No plottable H5 columns selected. Select numeric columns with at least two distinct values.")
             return
         if len(names) == 1:
             self._set_combo_text(self.y_col, names[0])
-            self.plot_type.setCurrentText("histogram")
+            self._set_plot_type("histogram")
         elif len(names) == 2:
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
-            self.plot_type.setCurrentText("scatter_line")
+            self._set_plot_type("scatter_line")
         else:
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
             self._set_combo_text(self.z_col, names[2])
-            self.plot_type.setCurrentText("scatter2d")
+            self._set_plot_type("scatter2d")
         self.log("Selected columns sent to Plot: " + ", ".join(names[:3]))
 
     def send_selected_columns_to_fit(self):
-        names = self.selected_h5_column_names()
+        candidates = set(getattr(self, "plot_column_candidates", []) or numeric_varying_columns(self.h5_df))
+        names = [name for name in self.selected_h5_column_names() if name in candidates]
         if not names:
-            self.log("No H5 columns selected.")
+            self.log("No plottable H5 columns selected. Select numeric columns with at least two distinct values.")
             return
         if len(names) == 1:
             self._set_combo_text(self.y_col, names[0])
             self.fit_model.setCurrentText("gaussian")
-            self.plot_type.setCurrentText("histogram")
+            self._set_plot_type("histogram")
         elif len(names) == 2:
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
@@ -3477,6 +4842,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_combo_text(self.x_col, names[0])
             self._set_combo_text(self.y_col, names[1])
             self._set_combo_text(self.z_col, names[2])
+            self._set_plot_type("heatmap2d")
             self.fit_model.setCurrentText("gaussian2d")
         self.log("Selected columns sent to Fit: " + ", ".join(names[:3]))
 
@@ -3505,29 +4871,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log(f"Opened analysis output folder: {path}")
 
     def _fill_module_lists(self):
-        self.single_modules.clear()
-        self.multi_modules.clear()
-        for name, cfg in sorted((self.lyse_registry.get("single_modules", {}) or {}).items(), key=lambda item: item[1].get("order", 1000)):
-            item = QtWidgets.QListWidgetItem(name)
-            item.setCheckState(QtCore.Qt.Checked if cfg.get("enabled_by_default") else QtCore.Qt.Unchecked)
-            self.single_modules.addItem(item)
-        for name, cfg in sorted((self.lyse_registry.get("multi_modules", {}) or {}).items(), key=lambda item: item[1].get("order", 1000)):
-            item = QtWidgets.QListWidgetItem(name)
-            item.setCheckState(QtCore.Qt.Checked if cfg.get("enabled_by_default") else QtCore.Qt.Unchecked)
-            self.multi_modules.addItem(item)
+        self._loading_lyse_modules = True
+        self.single_modules.setRowCount(0)
+        self.multi_modules.setRowCount(0)
+        try:
+            self._fill_module_table("single_modules", self.single_modules)
+            self._fill_module_table("multi_modules", self.multi_modules)
+        finally:
+            self._loading_lyse_modules = False
+
+    def _fill_module_table(self, group, table):
+        modules = sorted(
+            (self.lyse_registry.get(group, {}) or {}).items(),
+            key=lambda item: int((item[1] or {}).get("order", 1000)),
+        )
+        table.setRowCount(len(modules))
+        for row, (name, cfg) in enumerate(modules):
+            cfg = cfg or {}
+            path_text = str(cfg.get("path", ""))
+            candidate = Path(path_text) if path_text else None
+            if candidate and not candidate.is_absolute():
+                candidate = self.settings.project_dir / candidate
+            exists = bool(candidate and candidate.exists())
+            status = "ready" if path_text and exists else ("missing path" if path_text else "no path")
+            items = [
+                self._make_table_item("", editable=False, checkable=True, checked=bool(cfg.get("enabled_by_default")) and status == "ready", user_data=name),
+                self._make_table_item(name, user_data=name),
+                self._make_table_item(cfg.get("mode", "lyse_script"), user_data=name),
+                self._make_table_item(path_text, user_data=name),
+                self._make_table_item(cfg.get("order", row * 10 + 10), user_data=name),
+                self._make_table_item(status, editable=False, user_data=name),
+            ]
+            if status != "ready":
+                for item in items:
+                    item.setBackground(QtGui.QColor("#fff3cd"))
+            for col, item in enumerate(items):
+                table.setItem(row, col, item)
 
     def _active_module_group_and_list(self):
-        if self.multi_modules.hasFocus() or self.multi_modules.currentItem():
-            if self.multi_modules.currentItem() and not self.single_modules.hasFocus():
+        if self.multi_modules.hasFocus() or self.multi_modules.currentRow() >= 0:
+            if self.multi_modules.currentRow() >= 0 and not self.single_modules.hasFocus():
                 return "multi_modules", self.multi_modules
         return "single_modules", self.single_modules
 
-    def _selected_module(self):
-        group, widget = self._active_module_group_and_list()
-        item = widget.currentItem()
-        if not item:
+    def _module_widget_for_group(self, group):
+        if group == "multi_modules":
+            return self.multi_modules
+        return self.single_modules
+
+    def _selected_module(self, group=None):
+        if group:
+            widget = self._module_widget_for_group(group)
+        else:
+            group, widget = self._active_module_group_and_list()
+        row = widget.currentRow()
+        if row < 0:
             return group, widget, None, None
-        return group, widget, item.text(), (self.lyse_registry.get(group, {}) or {}).get(item.text(), {})
+        item = widget.item(row, 1)
+        if item is None:
+            return group, widget, None, None
+        name = str(item.text()).strip()
+        return group, widget, name, (self.lyse_registry.get(group, {}) or {}).get(name, {})
 
     def _safe_module_name(self, path):
         import re
@@ -3544,13 +4948,108 @@ class MainWindow(QtWidgets.QMainWindow):
             return "lyse_script"
         return "labpilot_module" if "def run(" in text else "lyse_script"
 
-    def _save_lyse_registry_and_refresh(self):
+    def _refresh_lyse_module_tables(self, select_group=None, select_names=None):
+        if not hasattr(self, "single_modules") or not hasattr(self, "multi_modules"):
+            return
+        self._fill_module_lists()
+        if select_group and select_names:
+            for name in select_names:
+                if self._select_module_row(select_group, name):
+                    break
+        for table in [self.single_modules, self.multi_modules]:
+            table.resizeRowsToContents()
+            table.viewport().update()
+            table.repaint()
+
+    def _save_lyse_registry_and_refresh(self, select_group=None, select_names=None):
         self.settings.save_lyse_registry(self.lyse_registry)
-        self.reload_runtime()
+        self.reload_runtime_config()
+        self._refresh_lyse_module_tables(select_group, select_names or [])
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
         self.log("Lyse registry saved and runtime refreshed.")
 
-    def add_lyse_module_file(self):
-        group, _, _, _ = self._selected_module()
+    def _on_lyse_module_table_item_changed(self, item):
+        if getattr(self, "_loading_lyse_modules", False) or item is None:
+            return
+        table = item.tableWidget()
+        group = table.property("module_group")
+        row = item.row()
+        old_name = item.data(QtCore.Qt.UserRole) or (table.item(row, 1).text() if table.item(row, 1) else "")
+        if not group or not old_name:
+            return
+        modules = self.lyse_registry.setdefault(group, {})
+        cfg = dict(modules.get(old_name, {}) or {})
+        try:
+            if item.column() == 0:
+                cfg["enabled_by_default"] = item.checkState() == QtCore.Qt.Checked
+                modules[old_name] = cfg
+                self.settings.save_lyse_registry(self.lyse_registry)
+                self.log(f"{group}.{old_name} enabled={cfg['enabled_by_default']}")
+                return
+            if item.column() == 1:
+                new_name = item.text().strip()
+                if not new_name:
+                    raise ValueError("module name cannot be empty")
+                if new_name != old_name and new_name in modules:
+                    raise ValueError(f"module name already exists: {new_name}")
+                if new_name != old_name:
+                    modules[new_name] = modules.pop(old_name, cfg)
+                    self.settings.save_lyse_registry(self.lyse_registry)
+                    self._fill_module_lists()
+                    self._select_module_row(group, new_name)
+                    self.log(f"Renamed lyse routine {group}.{old_name} -> {new_name}")
+                return
+            if item.column() == 2:
+                cfg["mode"] = item.text().strip() or "lyse_script"
+            elif item.column() == 3:
+                cfg["path"] = item.text().strip()
+            elif item.column() == 4:
+                cfg["order"] = int(item.text().strip())
+            else:
+                return
+            modules[old_name] = cfg
+            self.settings.save_lyse_registry(self.lyse_registry)
+            if item.column() in {3, 4}:
+                self._fill_module_lists()
+                self._select_module_row(group, old_name)
+            self.log(f"Updated lyse routine {group}.{old_name}")
+        except Exception as exc:
+            self._show_error("Update lyse routine failed", exc)
+            self._fill_module_lists()
+            self._select_module_row(group, old_name)
+
+    def _select_module_row(self, group, name):
+        table = self._module_widget_for_group(group)
+        for row in range(table.rowCount()):
+            item = table.item(row, 1)
+            if item and item.text() == name:
+                table.selectRow(row)
+                table.setCurrentCell(row, 1)
+                return True
+        return False
+
+    def _update_lyse_module_buttons(self, group):
+        return None
+
+    def _module_action_names(self, group, *, fallback_checked=True):
+        table = self._module_widget_for_group(group)
+        names = []
+        if isinstance(table, QtWidgets.QTableWidget):
+            selected_rows = sorted({index.row() for index in table.selectedIndexes()})
+            for row in selected_rows:
+                item = table.item(row, 1)
+                if item and item.text().strip():
+                    names.append(item.text().strip())
+            if not names and fallback_checked:
+                names = self._checked_names(table)
+            if not names and table.currentRow() >= 0:
+                item = table.item(table.currentRow(), 1)
+                if item and item.text().strip():
+                    names.append(item.text().strip())
+        return list(dict.fromkeys(names))
+
+    def add_lyse_module_file(self, group=None):
+        group, _, _, _ = self._selected_module(group)
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add lyse routine .py", "", "Python files (*.py);;All files (*.*)")
         if not path:
             return
@@ -3570,65 +5069,102 @@ class MainWindow(QtWidgets.QMainWindow):
             "description": "Added from Lyse page.",
             "params": {},
         }
-        self._save_lyse_registry_and_refresh()
+        self._save_lyse_registry_and_refresh(group, [name])
         self.log(f"Added lyse routine {group}.{name}: {path}")
 
-    def add_lyse_module_folder(self):
-        group, _, _, _ = self._selected_module()
+    def add_lyse_module_folder(self, group=None):
+        group, _, _, _ = self._selected_module(group)
         key = "single_modules_dir" if group == "single_modules" else "multi_modules_dir"
-        self.load_lyse_modules_folder(key)
-        self.auto_scan_lyse_modules_ui()
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose single analysis folder" if group == "single_modules" else "Choose multi analysis folder",
+            str(self.project_settings.get(key, "") or ""),
+        )
+        if not folder:
+            return
+        settings = dict(self.project_settings or {})
+        settings[key] = folder
+        self.project_settings = settings
+        self.settings.save_project_settings(settings)
+        kwargs = {
+            "single_dir": folder if group == "single_modules" else None,
+            "multi_dir": folder if group == "multi_modules" else None,
+            "project_root": self.settings.project_dir,
+        }
+        registry, report = merge_autoscanned_lyse_modules(self.lyse_registry, **kwargs)
+        self.lyse_registry = registry
+        added_names = [item.split(".", 1)[1] for item in report.get("added", []) if item.startswith(f"{group}.")]
+        self._save_lyse_registry_and_refresh(group, added_names)
+        self.log(
+            f"Added lyse folder for {group}: {folder}; "
+            f"added={len(report.get('added', []))}, updated={len(report.get('updated', []))}, skipped={len(report.get('skipped', []))}"
+        )
 
-    def remove_selected_lyse_module(self):
-        group, _, name, _ = self._selected_module()
-        if not name:
-            self.log("No lyse routine selected.")
+    def remove_selected_lyse_module(self, group=None):
+        group, _widget, _name, _ = self._selected_module(group)
+        names = self._module_action_names(group, fallback_checked=True)
+        if not names:
+            self.log("No lyse routine selected or checked.")
             return
         answer = QtWidgets.QMessageBox.question(
             self,
             "Remove lyse routine",
-            f"Remove {group}.{name} from the registry? The .py file on disk will not be deleted.",
+            f"Remove {len(names)} routine(s) from {group}? This removes them from LabPilot only; .py files on disk are kept.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
         if answer != QtWidgets.QMessageBox.Yes:
             return
-        self.lyse_registry.get(group, {}).pop(name, None)
-        self._save_lyse_registry_and_refresh()
-        self.log(f"Removed lyse routine from registry only: {group}.{name}")
+        for item_name in names:
+            self.lyse_registry.get(group, {}).pop(item_name, None)
+        self._save_lyse_registry_and_refresh(group)
+        self.log(f"Removed lyse routine(s) from registry only: {group}: {', '.join(names)}")
 
-    def toggle_selected_lyse_module(self):
-        group, _, name, cfg = self._selected_module()
+    def toggle_selected_lyse_module(self, group=None):
+        group, _, name, cfg = self._selected_module(group)
         if not name:
             self.log("No lyse routine selected.")
             return
         cfg["enabled_by_default"] = not bool(cfg.get("enabled_by_default", False))
         self.lyse_registry[group][name] = cfg
-        self._save_lyse_registry_and_refresh()
+        self._save_lyse_registry_and_refresh(group, [name])
         self.log(f"{group}.{name} enabled_by_default={cfg['enabled_by_default']}")
 
-    def move_selected_lyse_module(self, direction):
-        group, widget, name, cfg = self._selected_module()
-        if not name:
-            self.log("No lyse routine selected.")
+    def move_selected_lyse_module(self, direction, group=None):
+        group, _widget, _name, _cfg = self._selected_module(group)
+        names = self._module_action_names(group, fallback_checked=True)
+        if not names:
+            self.log("No lyse routine selected or checked.")
             return
         modules = self.lyse_registry.get(group, {}) or {}
         ordered = [item[0] for item in sorted(modules.items(), key=lambda item: int(item[1].get("order", 1000)))]
-        index = ordered.index(name)
-        new_index = max(0, min(len(ordered) - 1, index + int(direction)))
-        if new_index == index:
+        selected = [name for name in names if name in ordered]
+        if not selected:
+            self.log("Selected lyse routine is not in the registry.")
             return
-        other = ordered[new_index]
-        modules[name]["order"], modules[other]["order"] = int(modules[other].get("order", 1000)), int(modules[name].get("order", 1000))
-        self._save_lyse_registry_and_refresh()
-        for row in range(widget.count()):
-            if widget.item(row).text() == name:
-                widget.setCurrentRow(row)
-                break
-        self.log(f"Moved lyse routine: {group}.{name}")
+        remaining = [name for name in ordered if name not in set(selected)]
+        if int(direction) <= -9999:
+            new_order = selected + remaining
+        elif int(direction) >= 9999:
+            new_order = remaining + selected
+        else:
+            new_order = ordered[:]
+            step = -1 if int(direction) < 0 else 1
+            iterable = selected if step < 0 else list(reversed(selected))
+            for name in iterable:
+                index = new_order.index(name)
+                new_index = max(0, min(len(new_order) - 1, index + step))
+                other = new_order[new_index]
+                if other in selected:
+                    continue
+                new_order[index], new_order[new_index] = new_order[new_index], new_order[index]
+        for index, name in enumerate(new_order):
+            modules[name]["order"] = (index + 1) * 10
+        self._save_lyse_registry_and_refresh(group, [selected[0]])
+        self.log(f"Reordered lyse routine(s): {group}: {', '.join(selected)}")
 
-    def _selected_lyse_module_path(self):
-        _, _, name, cfg = self._selected_module()
+    def _selected_lyse_module_path(self, group=None):
+        _, _, name, cfg = self._selected_module(group)
         if not name:
             raise RuntimeError("No lyse routine selected.")
         path = Path(str(cfg.get("path", "")))
@@ -3636,16 +5172,16 @@ class MainWindow(QtWidgets.QMainWindow):
             path = self.settings.project_dir / path
         return path
 
-    def open_selected_lyse_module_file(self):
+    def open_selected_lyse_module_file(self, group=None):
         try:
-            path = self._selected_lyse_module_path()
+            path = self._selected_lyse_module_path(group)
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.resolve())))
         except Exception as exc:
             self._show_error("Open lyse routine failed", exc)
 
-    def open_selected_lyse_module_folder(self):
+    def open_selected_lyse_module_folder(self, group=None):
         try:
-            path = self._selected_lyse_module_path()
+            path = self._selected_lyse_module_path(group)
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.parent.resolve())))
         except Exception as exc:
             self._show_error("Open lyse routine folder failed", exc)
@@ -3666,17 +5202,67 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _checked_names(self, list_widget):
         names = []
+        if isinstance(list_widget, QtWidgets.QTableWidget):
+            for row in range(list_widget.rowCount()):
+                use = list_widget.item(row, 0)
+                name = list_widget.item(row, 1)
+                if use is not None and name is not None and use.checkState() == QtCore.Qt.Checked:
+                    names.append(name.text())
+            return names
         for row in range(list_widget.count()):
             item = list_widget.item(row)
             if item.checkState() == QtCore.Qt.Checked:
                 names.append(item.text())
         return names
 
+    def _selected_h5_rows(self):
+        if self.h5_df is None or self.h5_df.empty:
+            return []
+        rows = sorted({index.row() for index in self.h5_table.selectedIndexes()})
+        if not rows and self.h5_table.currentRow() >= 0:
+            rows = [self.h5_table.currentRow()]
+        return [row for row in rows if row < len(self.h5_df)]
+
+    def _run_auto_single_analysis(self, rows):
+        if not getattr(self, "lyse_analysis_running", None) or not self.lyse_analysis_running.isChecked():
+            return {}
+        names = self._checked_names(self.single_modules)
+        if not names:
+            return {}
+        results = {}
+        for row in rows:
+            if row >= len(self.h5_df):
+                continue
+            h5_path = self.h5_df.iloc[row]["filepath"]
+            for name in names:
+                try:
+                    results.setdefault(name, []).append(
+                        self.run_single_by_name(name, {}, h5_path=h5_path, row_index=row, refresh_table=False)
+                    )
+                except Exception as exc:
+                    self._show_error(f"lyse single module failed: {name} {h5_path}", exc, modal=False)
+        if results:
+            self._refresh_h5_table_after_analysis()
+            self._remember_h5_states()
+        return results
+
+    def mark_selected_h5_not_done(self):
+        rows = self._selected_h5_rows()
+        if not rows:
+            self.log("No H5 rows selected.")
+            return {}
+        results = self._run_auto_single_analysis(rows)
+        if not results:
+            self.log("Selected H5 row(s) marked not done; no checked singleshot routines to run.")
+        else:
+            self.log(f"Re-ran checked singleshot routines for {len(rows)} selected H5 row(s).")
+        return results
+
     def run_selected_single(self):
-        item = self.single_modules.currentItem()
-        if item:
+        _group, _widget, name, _cfg = self._selected_module("single_modules")
+        if name:
             try:
-                self.run_single_by_name(item.text(), {})
+                self.run_single_by_name(name, {})
             except Exception as exc:
                 self._show_error("lyse single module failed", exc)
 
@@ -3731,10 +5317,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return result
 
     def run_selected_multi(self):
-        item = self.multi_modules.currentItem()
-        if item:
+        _group, _widget, name, _cfg = self._selected_module("multi_modules")
+        if name:
             try:
-                self.run_multi_by_name(item.text(), {})
+                self.run_multi_by_name(name, {})
             except Exception as exc:
                 self._show_error("lyse multi module failed", exc)
 
@@ -3771,13 +5357,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_column_combos()
 
     def draw_plot_from_ui(self):
+        plot_type = self._current_plot_type()
+        x = self.x_col.currentText()
+        y = self.y_col.currentText()
+        z = self.z_col.currentText()
+        self._validate_plot_columns(plot_type, x, y, z)
         action = {
             "type": "plot",
-            "plot_type": self.plot_type.currentText(),
-            "x": self.x_col.currentText(),
-            "y": self.y_col.currentText(),
-            "z": self.z_col.currentText(),
-            "value": self.y_col.currentText(),
+            "plot_type": plot_type,
+            "x": x,
+            "y": y,
+            "z": z,
+            "value": y,
         }
         self.draw_plot_action(action)
 
@@ -3790,6 +5381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         x = action.get("x")
         y = action.get("y") or action.get("value")
         z = action.get("z") or action.get("value")
+        self._validate_plot_columns(plot_type, x, y, z)
         if plot_type == "scatter_line":
             fig = plotting.scatter_line(self.h5_df, x, y, out_path=out_path)
         elif plot_type == "mean_errorbar":
@@ -3805,7 +5397,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             raise RuntimeError(f"Unsupported plot type: {plot_type}")
         self.figure_paths.append(str(out_path))
-        self._show_figure(fig)
+        self._show_figure(fig, title=f"LabPilot plot: {plot_type}", image_path=out_path)
         self._record_analysis_result(
             "plot",
             plot_type,
@@ -3814,7 +5406,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.log(f"plot saved: {out_path}")
 
-    def _show_figure(self, fig):
+    def _show_figure(self, fig, title="LabPilot figure", image_path=None):
         while self.figure_layout.count():
             item = self.figure_layout.takeAt(0)
             if item.widget():
@@ -3823,37 +5415,196 @@ class MainWindow(QtWidgets.QMainWindow):
                     plt.close(old_widget.figure)
                 old_widget.deleteLater()
         self.figure_layout.addWidget(FigureCanvas(fig))
+        if image_path:
+            self._open_figure_window(image_path, title=title)
         plt.close(fig)
 
+    def _open_figure_window(self, image_path, title="LabPilot figure"):
+        path = Path(image_path)
+        if not path.exists():
+            return None
+        window = QtWidgets.QDialog(self)
+        window.setWindowTitle(title)
+        window.resize(920, 700)
+        layout = QtWidgets.QVBoxLayout(window)
+        toolbar = QtWidgets.QHBoxLayout()
+        path_label = QtWidgets.QLineEdit(str(path))
+        path_label.setReadOnly(True)
+        open_folder = QtWidgets.QPushButton("Open folder")
+        open_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.parent.resolve()))))
+        toolbar.addWidget(path_label, 1)
+        toolbar.addWidget(open_folder)
+        layout.addLayout(toolbar)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        label = QtWidgets.QLabel()
+        pixmap = QtGui.QPixmap(str(path))
+        if not pixmap.isNull():
+            label.setPixmap(pixmap)
+            label.setAlignment(QtCore.Qt.AlignCenter)
+        else:
+            label.setText(f"Could not load image: {path}")
+        scroll.setWidget(label)
+        layout.addWidget(scroll, 1)
+        window.finished.connect(lambda _code, w=window: self._forget_figure_window(w))
+        self.figure_windows.append(window)
+        window.show()
+        return window
+
+    def _forget_figure_window(self, window):
+        try:
+            self.figure_windows.remove(window)
+        except ValueError:
+            pass
+
     def fit_from_ui(self):
+        plot_type = self._current_plot_type()
+        model = self.fit_model.currentText()
+        if model == "none":
+            self.log("Fit model is 'none'; no fit was run.")
+            return None
+        x = self.x_col.currentText()
+        y = self.y_col.currentText()
+        z = self.z_col.currentText()
+        self._validate_plot_columns(plot_type, x, y, z)
         action = {
             "type": "fit",
-            "model": self.fit_model.currentText(),
-            "x": self.x_col.currentText(),
-            "y": self.y_col.currentText(),
-            "z": self.z_col.currentText(),
+            "model": model,
+            "plot_type": plot_type,
+            "x": x,
+            "y": y,
+            "z": z,
         }
-        self.fit_action(action)
+        return self.fit_action(action)
 
     def fit_action(self, action):
         if self.h5_df is None:
             raise RuntimeError("Load an h5 table first.")
         model = action.get("model", "linear")
+        if model == "none":
+            return {"model": "none", "status": "skipped", "params": {}}
         x = action.get("x")
         y = action.get("y") or action.get("value")
         z = action.get("z") or action.get("value")
+        plot_type = action.get("plot_type") or self._current_plot_type()
+        if model not in valid_fit_models(plot_type):
+            raise RuntimeError(f"Fit model {model!r} is not compatible with plot type {plot_type!r}.")
         if model in {"gaussian2d", "double_gaussian2d"}:
             if not (x and y and z):
                 raise RuntimeError("2D fitting requires x, y, and z/value columns.")
             result = fit_xyz(self.h5_df[x], self.h5_df[y], self.h5_df[z], model=model)
-        elif self.plot_type.currentText() == "histogram" or not x:
+        elif plot_type == "histogram" or not x:
             result = fit_histogram(self.h5_df[y], model=model)
         else:
             result = fit_xy(self.h5_df[x], self.h5_df[y], model=model)
         self.fit_results.append(result)
+        fit_figure_path = self._draw_fit_result(action, result)
+        if fit_figure_path:
+            result = dict(result)
+            result["figure_path"] = str(fit_figure_path)
         self._record_analysis_result("fit", model, result, metadata=action)
         self.log("fit result: " + dumps(result))
         return result
+
+    def _numeric_plot_data(self, columns):
+        data = pd.DataFrame({name: pd.to_numeric(self.h5_df[name], errors="coerce") for name in columns})
+        return data.replace([np.inf, -np.inf], np.nan).dropna()
+
+    def _evaluate_fit_y(self, model, x_values, params):
+        if model == "linear":
+            return MODEL_FUNCS[model](x_values, params["a"], params["b"])
+        if model in MODEL_FUNCS:
+            names = {
+                "gaussian": ["amp", "x0", "sigma", "offset"],
+                "logarithmic": ["a", "b"],
+                "exponential": ["amp", "tau", "offset"],
+                "lorentzian": ["amp", "x0", "gamma", "offset"],
+            }[model]
+            return MODEL_FUNCS[model](x_values, *[params[name] for name in names])
+        raise RuntimeError(f"Unsupported 1D fit model for drawing: {model}")
+
+    def _evaluate_fit_z(self, model, x_values, y_values, params):
+        if model == "gaussian2d":
+            names = ["amp", "x0", "y0", "sigma_x", "sigma_y", "offset"]
+            return gaussian2d((x_values, y_values), *[params[name] for name in names])
+        if model == "double_gaussian2d":
+            names = [
+                "amp1",
+                "x01",
+                "y01",
+                "sigma_x1",
+                "sigma_y1",
+                "amp2",
+                "x02",
+                "y02",
+                "sigma_x2",
+                "sigma_y2",
+                "offset",
+            ]
+            return double_gaussian2d((x_values, y_values), *[params[name] for name in names])
+        raise RuntimeError(f"Unsupported 2D fit model for drawing: {model}")
+
+    def _draw_fit_result(self, action, result):
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return None
+        params = result.get("params") or {}
+        model = action.get("model", "")
+        plot_type = action.get("plot_type") or self._current_plot_type()
+        x = action.get("x")
+        y = action.get("y") or action.get("value")
+        z = action.get("z") or action.get("value")
+        out_dir = Path.cwd() / "labpilot_outputs" / "figures"
+        out_path = out_dir / f"fit_{model}_{len(self.figure_paths) + 1}.png"
+        try:
+            if model in {"gaussian2d", "double_gaussian2d"}:
+                data = self._numeric_plot_data([x, y, z])
+                fig, ax = plt.subplots(figsize=(7, 5))
+                sc = ax.scatter(data[x], data[y], c=data[z], cmap="viridis", label="raw")
+                x_grid = np.linspace(float(data[x].min()), float(data[x].max()), 80)
+                y_grid = np.linspace(float(data[y].min()), float(data[y].max()), 80)
+                xx, yy = np.meshgrid(x_grid, y_grid)
+                zz = self._evaluate_fit_z(model, xx.ravel(), yy.ravel(), params).reshape(xx.shape)
+                contour = ax.contour(xx, yy, zz, colors="white", linewidths=1.0)
+                ax.clabel(contour, inline=True, fontsize=8)
+                ax.set_xlabel(x)
+                ax.set_ylabel(y)
+                ax.set_title(f"{model} fit, R2={result.get('r2', 0):.4g}")
+                fig.colorbar(sc, ax=ax, label=z)
+            elif plot_type == "histogram" or not x:
+                data = self._numeric_plot_data([y])
+                fig, ax = plt.subplots(figsize=(7, 4.5))
+                counts, edges, _patches = ax.hist(data[y], bins=30, alpha=0.55, label="histogram")
+                centers = (edges[:-1] + edges[1:]) / 2
+                x_fit = np.linspace(float(centers.min()), float(centers.max()), 400)
+                y_fit = self._evaluate_fit_y(model, x_fit, params)
+                ax.plot(x_fit, y_fit, color="#bf1d2d", linewidth=2.0, label=f"{model} fit")
+                ax.set_xlabel(y)
+                ax.set_ylabel("count")
+                ax.set_title(f"{model} fit, R2={result.get('r2', 0):.4g}")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+            else:
+                data = self._numeric_plot_data([x, y]).sort_values(x)
+                fig, ax = plt.subplots(figsize=(7, 4.5))
+                ax.scatter(data[x], data[y], alpha=0.75, label="raw")
+                ax.plot(data[x], data[y], alpha=0.25)
+                x_fit = np.linspace(float(data[x].min()), float(data[x].max()), 500)
+                if model == "logarithmic":
+                    x_fit = x_fit[x_fit > 0]
+                y_fit = self._evaluate_fit_y(model, x_fit, params)
+                ax.plot(x_fit, y_fit, color="#bf1d2d", linewidth=2.0, label=f"{model} fit")
+                ax.set_xlabel(x)
+                ax.set_ylabel(y)
+                ax.set_title(f"{model} fit, R2={result.get('r2', 0):.4g}")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+            plotting.save_figure(fig, out_path)
+            self.figure_paths.append(str(out_path))
+            self._show_figure(fig, title=f"LabPilot fit: {model}", image_path=out_path)
+            return out_path
+        except Exception as exc:
+            self.log(f"fit figure drawing failed: {exc}")
+            return None
 
     def generate_report_from_ui(self, title="LabPilot analysis report", include_errors=True, include_knowledge_context=True, include_optimizer_history=True):
         if not isinstance(title, str):
@@ -3879,11 +5630,29 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             row = self.result_store.append(kind, name, result, metadata=metadata)
             self.analysis_records.append(row)
+            if kind in {"plot", "fit"}:
+                self._store_lyse_multi_parameter(kind, name, result, metadata or {})
             self._fill_analysis_records()
             return row
         except Exception as exc:
             self.log(f"analysis result store failed: {exc}")
             return None
+
+    def _store_lyse_multi_parameter(self, kind, name, result, metadata):
+        try:
+            bucket = self.lyse_registry.setdefault("multi_parameters", {})
+            safe_name = re.sub(r"[^0-9A-Za-z_]+", "_", str(name or kind)).strip("_") or kind
+            key = f"{time.strftime('%Y%m%d_%H%M%S')}_{kind}_{safe_name}"
+            bucket[key] = {
+                "kind": kind,
+                "name": str(name),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "result": result or {},
+                "metadata": metadata or {},
+            }
+            self.settings.save_lyse_registry(self.lyse_registry)
+        except Exception as exc:
+            self.log(f"Could not store lyse multi parameter record: {exc}")
 
     def _fill_analysis_records(self):
         if not hasattr(self, "analysis_results_table"):
@@ -4094,6 +5863,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         h5_folder = self.h5_folder.text().strip() if hasattr(self, "h5_folder") else ""
         dry_run = self.dry_run.isChecked() if hasattr(self, "dry_run") else True
+        if self.rm.uses_local_gateway and not dry_run:
+            QtWidgets.QMessageBox.warning(self, "Review each Engage", "Use Dry run or prepare and confirm each batch separately in local gateway mode.")
+            return
         if not dry_run and not h5_folder:
             QtWidgets.QMessageBox.warning(self, "Missing H5 folder", "Choose an H5 output folder before starting a real supervised loop.")
             return
@@ -4448,12 +6220,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError("Selected sequence or connection table file does not exist.")
             context = self.project_context_for_query(instruction, purpose="co_sequence")
             self.co_sequence_context.setPlainText(context or "No Knowledge snippets retrieved.")
-            client = LLMClient(
-                api_key=self.api_key.text().strip(),
-                base_url=self.base_url.text().strip(),
-                model=self.model.text().strip(),
-                mock=False,
-            )
+            client = self._make_llm_client()
             max_chars = int(self.project_settings.get("co_sequence", {}).get("max_file_chars_for_ai", 60000))
             self.co_sequence_plan = client.propose_co_sequence_patch(
                 instruction,
@@ -4641,7 +6408,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if field["kind"] == "sqlite":
                 path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f"Choose {field['label']}", "", "SQLite database (*.sqlite *.db);;All files (*.*)")
             else:
-                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", "Python files (*.py);;YAML files (*.yaml *.yml);;All files (*.*)")
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", field_file_filter(key, field["label"]))
+        elif field["kind"] == "hdf5":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Choose {field['label']}", "", field_file_filter(key, field["label"]))
         else:
             path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Choose {field['label']}")
         if path:
@@ -4704,6 +6473,114 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("Directory active files detected.")
         except Exception as exc:
             self._show_error("Directory active file detection failed", exc)
+
+    def detect_directory_from_labscript_apps(self, silent=False):
+        try:
+            values = self.directory_values_from_table() if hasattr(self, "directory_table") else dict(self.project_settings)
+            values, messages = detect_labscript_paths(values, runmanager_backend=getattr(self, "rm", None), project_dir=self.settings.project_dir)
+            self.project_settings.update(values)
+            if hasattr(self, "directory_table"):
+                self._fill_directory_table()
+            if hasattr(self, "h5_folder"):
+                self.h5_folder.setText(str(values.get("h5_output_dir", "")))
+            if hasattr(self, "co_sequence_sequence_path"):
+                self.co_sequence_sequence_path.setText(str(values.get("active_sequence_file", "")))
+            if hasattr(self, "co_sequence_connection_path"):
+                self.co_sequence_connection_path.setText(str(values.get("active_connection_table", "")))
+            detail = "\n".join(messages + ["Detected labscript/runmanager paths and updated the UI."])
+            if hasattr(self, "directory_detail"):
+                self.directory_detail.setPlainText(detail)
+            self.log(detail)
+            if not silent:
+                self.statusBar().showMessage("Detected labscript/runmanager paths.", 8000)
+            return values, messages
+        except Exception as exc:
+            if silent:
+                self.log(f"Labscript path detection failed: {exc}")
+                return {}, [str(exc)]
+            self._show_error("Detect labscript paths failed", exc)
+            return {}, [str(exc)]
+
+    def apply_directory_paths_to_running_apps(self):
+        try:
+            values = default_directory_settings(self.directory_values_from_table(), project_dir=self.settings.project_dir)
+            messages = []
+            sequence = values.get("active_sequence_file") or ""
+            output_dir = values.get("h5_output_dir") or ""
+            globals_h5 = values.get("runmanager_globals_path") or ""
+            connection_table = values.get("active_connection_table") or values.get("connection_table") or ""
+
+            if sequence:
+                seq_path = self._project_path(sequence)
+                if seq_path.suffix.lower() != ".py":
+                    messages.append(f"Skipped runmanager sequence: expected .py, got {seq_path}")
+                elif not seq_path.exists():
+                    messages.append(f"Skipped runmanager sequence: file does not exist: {seq_path}")
+                else:
+                    if self.rm.uses_local_gateway:
+                        request = self.rm.prepare_configuration("set_sequence", {"sequence": str(seq_path)})
+                        if not self._confirm_local_change("Set Runmanager sequence", dumps(request["plan"]["diff"])):
+                            return
+                        self.rm.set_labscript_file(str(seq_path), prepared=request)
+                    else:
+                        self.rm.set_labscript_file(str(seq_path))
+                    values["active_sequence_file"] = str(seq_path)
+                    values["sequence_dir"] = str(seq_path.parent)
+                    messages.append(f"Applied runmanager active sequence: {seq_path}")
+
+            if output_dir:
+                out_path = self._project_path(output_dir)
+                if self.rm.uses_local_gateway:
+                    if not out_path.is_dir():
+                        raise ValueError("Choose an existing shot output directory.")
+                    request = self.rm.prepare_configuration("set_output", {"output": str(out_path)})
+                    if not self._confirm_local_change("Set Runmanager output folder", dumps(request["plan"]["diff"])):
+                        return
+                    self.rm.set_shot_output_folder(str(out_path), prepared=request)
+                else:
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    self.rm.set_shot_output_folder(str(out_path))
+                values["h5_output_dir"] = str(out_path)
+                if hasattr(self, "h5_folder"):
+                    self.h5_folder.setText(str(out_path))
+                messages.append(f"Applied runmanager H5 output folder: {out_path}")
+
+            if globals_h5:
+                g_path = self._project_path(globals_h5)
+                if g_path.suffix.lower() not in {".h5", ".hdf5"}:
+                    messages.append(f"Runmanager globals path is not HDF5 and was not applied: {g_path}")
+                else:
+                    messages.append(
+                        "Runmanager globals H5 path saved for display/context. "
+                        "runmanager.remote has no public method to switch the open globals H5; "
+                        "LabPilot changes values through set_globals()."
+                    )
+
+            if connection_table:
+                c_path = self._project_path(connection_table)
+                if c_path.suffix.lower() != ".py":
+                    messages.append(f"Connection table should normally be .py for Co-Sequence: {c_path}")
+                else:
+                    values["active_connection_table"] = str(c_path)
+                    values["connection_table"] = str(c_path)
+                    messages.append(
+                        "Connection table path saved for LabPilot/BLACS context. "
+                        "Changing the live BLACS connection table may require BLACS/labscript reload."
+                    )
+
+            self.project_settings.update(values)
+            saved = self.settings.save_project_settings(self.project_settings)
+            self._fill_directory_table()
+            if hasattr(self, "project_paths_editor"):
+                self.project_paths_editor.set_settings(self.project_settings)
+            self.refresh_co_sequence_paths()
+            detail = "\n".join(messages + [f"Saved Directory settings: {saved}"])
+            if hasattr(self, "directory_detail"):
+                self.directory_detail.setPlainText(detail)
+            self.log(detail)
+            self.statusBar().showMessage("Directory paths applied to supported running apps.", 8000)
+        except Exception as exc:
+            self._show_error("Apply Directory paths failed", exc)
 
     def open_selected_directory_path(self):
         row = self.directory_table.currentRow()
@@ -4840,6 +6717,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if context:
             advice += "\n\nRelated project context:\n" + context[:1400]
         self.log(msg + "\n" + advice)
+        if title != "Text-to-speech failed":
+            self.speak_event("error", f"{title}。请查看 Error Center。", priority=True)
         popups = self.project_settings.get("ui", {}).get("error_popups", True)
         if modal and popups:
             QtWidgets.QMessageBox.critical(self, title, f"{exc}\n\nSuggestions:\n{advice}")
@@ -4878,6 +6757,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         if self.wake_worker:
             self.wake_worker.stop()
+        if self.speech_worker:
+            self.speech_worker.stop()
+        if self.tts:
+            self.tts.release()
         if self.auto_loop_worker:
             self.auto_loop_worker.request_stop()
         event.accept()

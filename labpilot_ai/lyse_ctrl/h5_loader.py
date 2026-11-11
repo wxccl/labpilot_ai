@@ -43,8 +43,17 @@ def read_shot_summary(path):
     return row
 
 
-def load_h5_folder(folder, recursive=False):
+def iter_h5_paths(folder, recursive=False):
     folder = Path(folder)
-    pattern = "**/*.h5" if recursive else "*.h5"
-    rows = [read_shot_summary(p) for p in sorted(folder.glob(pattern))]
+    if not folder.exists():
+        return []
+    patterns = ["**/*.h5", "**/*.hdf5"] if recursive else ["*.h5", "*.hdf5"]
+    paths = []
+    for pattern in patterns:
+        paths.extend(folder.glob(pattern))
+    return sorted({path.resolve() for path in paths})
+
+
+def load_h5_folder(folder, recursive=False):
+    rows = [read_shot_summary(p) for p in iter_h5_paths(folder, recursive=recursive)]
     return pd.DataFrame(rows)
