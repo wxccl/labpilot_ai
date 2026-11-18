@@ -41,6 +41,7 @@ LYSE_FIELDS = [
     "group",
     "name",
     "path",
+    "routine_sha256",
     "mode",
     "enabled_by_default",
     "order",

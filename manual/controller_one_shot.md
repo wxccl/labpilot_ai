@@ -1,4 +1,4 @@
-# 控制机单发验收（0.3.3）
+# 控制机单发验收（0.3.4）
 
 以下命令在 Anaconda Prompt / CMD 中运行。脚本随 pip 包安装，不需要下载源码。
 
@@ -16,7 +16,7 @@ conda activate labscript
 where python
 python -c "import sys; from importlib.metadata import version; print(sys.executable); print({n:version(n) for n in ('labscript','labscript-utils','runmanager','blacs','lyse')})"
 python -m pip show labpilot-ai
-python -m pip install --no-deps "labpilot-ai==0.3.3"
+python -m pip install --no-deps "labpilot-ai==0.3.4"
 python -c "from importlib.metadata import version; print(version('labpilot-ai'))"
 python -c "from labscript_profile import default_labconfig_path; print(default_labconfig_path())"
 ```

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.3.3"
+version = "0.3.4"
 description = "Industrial AI copilot for labscript-suite experiments: voice commands, runmanager/BLACS/lyse control, optimization, Knowledge, Co-Sequence, and supervised logs."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -52,7 +52,7 @@ include = ["labpilot_ai*"]
 exclude = ["configs*", "plugins*", "tests*", "examples*"]
 
 [tool.setuptools.data-files]
-"share/labpilot" = ["tools/controller_one_shot.ps1", "manual/controller_one_shot.md"]
+"share/labpilot" = ["tools/controller_one_shot.ps1", "manual/controller_one_shot.md", "manual/HARNESS_RETEST_ZH.md"]
 
 [tool.setuptools.package-data]
 labpilot_ai = [

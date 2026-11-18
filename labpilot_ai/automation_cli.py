@@ -20,6 +20,9 @@ def parser():
     for name in ("init", "discover", "list", "run-next", "ui"):
         commands.add_parser(name)
     doctor = commands.add_parser("doctor")
+    preflight = commands.add_parser("preflight", help="Read this profile's device inventory and advertised actions")
+    preflight.add_argument("--require", action="append", default=[], metavar="TARGET.ACTION",
+                           help="Return nonzero if this exact target action is not advertised")
     doctor.add_argument("--labconfig", type=Path)
     for name in ("install-host", "uninstall-host"):
         install = commands.add_parser(name)
@@ -132,6 +135,10 @@ def dispatch(args):
             file.write("\n")
         return {"profile": str(profile), "simulate": True}
     app = Automation(args.profile)
+    if command == "preflight":
+        from .host.preflight import capability_report
+
+        return capability_report(app.host.call("discover", {}), args.require)
     if command == "doctor":
         environment = app.host.configuration("doctor", args.labconfig)
         capabilities = app.host.call("discover", {})

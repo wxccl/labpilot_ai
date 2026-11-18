@@ -149,9 +149,20 @@ def verify_compatibility(native):
         raise Refused("Installed Runmanager lacks the verified managed-batch hooks")
 
 
+def listener_port(profile, config, native_default):
+    active = config.getint("ports", "runmanager", fallback=native_default)
+    if type(active) is not int or not 1 <= active <= 65535 or profile.runmanager.get("port", active) != active:
+        raise Refused("Active Runmanager LabConfig port differs from the reviewed host profile")
+    return active
+
+
 def launch(profile):
     if profile.simulate or not profile.runmanager.get("enabled") or not profile.runmanager.get("batch_root"):
         raise Refused("Managed Runmanager requires a native profile with Runmanager enabled and batch_root configured")
+    from labscript_utils.labconfig import LabConfig
+    from runmanager.remote import DEFAULT_PORT
+
+    expected_port = listener_port(profile, LabConfig(), DEFAULT_PORT)
     import labscript_utils.h5_lock
     import labscript_utils.excepthook
     import runmanager.__main__ as native
@@ -161,6 +172,8 @@ def launch(profile):
     class ManagedRemote(native.RemoteServer):
         def __init__(self, app):
             self.app = app
+            if listener_port(profile, app.exp_config, DEFAULT_PORT) != expected_port:
+                raise Refused("Runmanager application configuration changed before binding")
             # Released Runmanager 3.3.0 uses the module's app; newer source accepts it.
             if inspect.signature(native.RemoteServer).parameters:
                 super().__init__(app)
@@ -168,7 +181,7 @@ def launch(profile):
                 super().__init__()
 
         def handle_labpilot_batch_capabilities(self):
-            return {"protocol": BATCH_PROTOCOL, "profile_sha256": profile.sha256}
+            return {"protocol": BATCH_PROTOCOL, "profile_sha256": profile.sha256, "port": self.port}
 
         def handle_labpilot_engage_batch(self, params, profile_sha256, deadline):
             try:
@@ -201,6 +214,9 @@ def launch(profile):
     app.send_to_BLACS = send_with_evidence
     native.splash.update_text("Starting managed Runmanager remote server")
     server = ManagedRemote(app)
+    if getattr(server, "port", None) != expected_port:
+        server.shutdown()
+        raise Refused("Managed Runmanager did not bind the reviewed port")
     native.remote_server = server
     native.splash.hide()
     timer = native.QtCore.QTimer()

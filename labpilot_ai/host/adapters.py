@@ -208,16 +208,18 @@ class Runmanager:
         actions = set(self.config["allow"])
         managed = bool(self.config.get("batch_root")) and self._managed_capable()
         if self.config.get("batch_root") and not managed:
-            actions.discard("engage")
+            actions.clear()
         return {"available": True, "actions": sorted(actions), "version": version,
-                "endpoint": "localhost", "managed_batches": managed}
+                "endpoint": "localhost", "port": getattr(self.client, "port", None), "managed_batches": managed}
 
     def _managed_capable(self):
         try:
             result = self._connect().request("labpilot_batch_capabilities")
         except (AttributeError, RuntimeError, ValueError):
             return False
-        return result == {"protocol": BATCH_PROTOCOL, "profile_sha256": self.profile.sha256}
+        port = getattr(self.client, "port", None)
+        return (type(port) is int and 1 <= port <= 65535 and self.config.get("port", port) == port
+                and result == {"protocol": BATCH_PROTOCOL, "profile_sha256": self.profile.sha256, "port": port})
 
     def _managed_engage(self, params, before):
         if not self._managed_capable():
@@ -274,6 +276,8 @@ class Runmanager:
         if action not in self.config["allow"]:
             raise Refused("Runmanager action is disabled in the host profile")
         rm = self._connect()
+        if self.config.get("batch_root") and not self._managed_capable():
+            raise Refused("Managed Runmanager profile or endpoint binding could not be verified before writing")
         before = self.snapshot(params)
         require_snapshot(params, before)
         values = run_values(action, params, before, self.config.get("max_shots", 10000))
