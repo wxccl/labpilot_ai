@@ -7,8 +7,8 @@ from typing import Callable
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .catalog import MAX_ARGUMENT_BYTES, ToolCatalog, ToolError, decode_json, encode_json
+from ..ai.endpoints import DEEPSEEK, PARATERA, binding
 
-_ENDPOINT = "https://api.deepseek.com/chat/completions"
 _MAX_RESPONSE = 1024 * 1024
 _MAX_CONTEXT = 1024 * 1024
 _MAX_TOOL_CALLS = 16
@@ -29,9 +29,12 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class DeepSeekHTTP:
-    """Use the official endpoint only. Inject an opener for local tests."""
+    """Use a named endpoint with redirects disabled. Inject an opener for tests."""
 
-    def __init__(self, api_key: str, *, timeout: float = 40.0, opener=None):
+    def __init__(self, api_key: str, *, timeout: float = 40.0, opener=None, base_url=DEEPSEEK):
+        if base_url not in (DEEPSEEK, DEEPSEEK + "/v1", PARATERA):
+            raise ProviderError("Unsupported provider endpoint")
+        self.endpoint = base_url + "/chat/completions"
         if not isinstance(api_key, str) or not api_key.strip() or "\r" in api_key or "\n" in api_key:
             raise ProviderError("Set DEEPSEEK_API_KEY before invoking DeepSeek")
         if not 0 < timeout <= 120:
@@ -41,12 +44,15 @@ class DeepSeekHTTP:
         self._opener = opener if opener is not None else build_opener(_NoRedirect()).open
 
     @classmethod
-    def from_env(cls):
-        return cls(os.getenv("DEEPSEEK_API_KEY", ""))
+    def from_env(cls, provider=None):
+        url, key_name = binding(os.getenv("DEEPSEEK_BASE_URL") or DEEPSEEK)
+        if key_name != "DEEPSEEK_API_KEY" or (provider is not None and provider != ("paratera" if url == PARATERA else "deepseek")):
+            raise ProviderError("Selected provider does not match DEEPSEEK_BASE_URL")
+        return cls(os.getenv(key_name, ""), base_url=url)
 
     def __call__(self, payload: dict) -> dict:
         request = Request(
-            _ENDPOINT, data=encode_json(payload).encode("ascii"), method="POST",
+            self.endpoint, data=encode_json(payload).encode("ascii"), method="POST",
             headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
         )
         try:

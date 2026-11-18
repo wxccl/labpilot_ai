@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
+from .routine_source import checked_source
 
 
 def _safe_name(path: Path) -> str:
@@ -108,6 +109,7 @@ def _make_entry(
 
     entry = {
         "path": _path_text(path, project_root),
+        "routine_sha256": existing["routine_sha256"] if "routine_sha256" in existing else checked_source(path)[1],
         "mode": existing.get("mode") or _detect_mode(path),
         "enabled_by_default": existing.get("enabled_by_default", True),
         "order": int(existing.get("order", (index + 1) * 10)),

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import errno
+import getpass
 import hashlib
 import json
 import os
@@ -56,6 +57,11 @@ CREATE TABLE IF NOT EXISTS task_events (
     detail TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS task_events_by_task ON task_events(task_id, event_id);
+CREATE TABLE IF NOT EXISTS policy_events (
+    event_id INTEGER PRIMARY KEY, policy_id TEXT NOT NULL REFERENCES policies(policy_id),
+    kind TEXT NOT NULL, at TEXT NOT NULL, detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS policy_events_by_policy ON policy_events(policy_id, event_id);
 """
 
 
@@ -300,7 +306,19 @@ class TaskStore:
         _count(policy["max_shots"], "max_shots")
         with self._write() as connection:
             connection.execute("INSERT INTO policies(policy_id, spec) VALUES (?, ?)", (policy_id, _json(policy)))
+            self._policy_event(connection, policy_id, "CREATED", now, {"spec": policy})
             return self._policy(connection, policy_id)
+
+    @staticmethod
+    def _policy_event(connection, policy_id, kind, now, detail):
+        connection.execute("INSERT INTO policy_events(policy_id, kind, at, detail) VALUES (?, ?, ?, ?)",
+                           (policy_id, kind, now, _json(dict(detail, process_user=getpass.getuser(), pid=os.getpid()))))
+
+    def policy_events(self, policy_id):
+        with closing(self._connect()) as connection:
+            self._policy(connection, policy_id)
+            rows = connection.execute("SELECT event_id, kind, at, detail FROM policy_events WHERE policy_id=? ORDER BY event_id", (policy_id,))
+            return [dict(row, detail=json.loads(row["detail"])) for row in rows]
 
     def get_policy(self, policy_id):
         with closing(self._connect()) as connection:
@@ -326,7 +344,8 @@ class TaskStore:
 
     def revoke_policy(self, policy_id):
         with self._write() as connection:
-            self._policy(connection, policy_id)
+            if not self._policy(connection, policy_id)["revoked"]:
+                self._policy_event(connection, policy_id, "REVOKED", self._now(), {})
             connection.execute("UPDATE policies SET revoked = 1 WHERE policy_id = ?", (policy_id,))
             return self._policy(connection, policy_id)
 
@@ -384,6 +403,7 @@ class TaskStore:
                     "updated_at = ? WHERE task_id = ?", (token, now, task["task_id"]),
                 )
                 self._event(connection, task["task_id"], "EFFECT_INTENT", now, {**authority,
+                            "process_user": getpass.getuser(), "pid": os.getpid(),
                             "request_id": task["request_id"], "plan_digest": task["plan_digest"],
                             "expected_config_digest": task["expected_config_digest"], "expected_shots": task["expected_shots"]})
                 return self._task(self._row(connection, task["task_id"])), token, authority["expires_at"]
@@ -407,10 +427,12 @@ class TaskStore:
             return None, "A3_BUDGET_EXHAUSTED"
         connection.execute("UPDATE policies SET used_actions = used_actions + 1, used_shots = used_shots + ? WHERE policy_id = ?",
                            (shots, policy["policy_id"]))
+        self._policy_event(connection, policy["policy_id"], "BUDGET_RESERVED", now,
+                           {"task_id": task["task_id"], "request_id": task["request_id"], "shots": shots, "actions": 1})
         return {"mode": "A3", "approver": policy["approver"], "policy_id": policy["policy_id"],
                 "expires_at": policy["expires_at"]}, None
 
-    def _record_receipt(self, task_id, token, status, receipt):
+    def _record_receipt(self, task_id, token, status, receipt, *, never_dispatched=False):
         with self._write() as connection:
             row = self._row(connection, task_id)
             if row["claim_token"] != token or row["receipt"] is not None:
@@ -420,6 +442,14 @@ class TaskStore:
             elif row["status"] == "OBSERVING" and status == "UNKNOWN":
                 status = "OBSERVING"
             now = self._now()
+            if never_dispatched and row["policy_id"] and row["approval"] is None:
+                if receipt["state"] != "REFUSED":
+                    raise ValueError("Cannot refund a possibly dispatched request")
+                shots = json.loads(row["spec"])["expected_shots"]
+                connection.execute("UPDATE policies SET used_actions=used_actions-1, used_shots=used_shots-? WHERE policy_id=?",
+                                   (shots, row["policy_id"]))
+                self._policy_event(connection, row["policy_id"], "BUDGET_REFUNDED", now,
+                                   {"task_id": task_id, "request_id": row["request_id"], "shots": shots, "actions": 1, "reason": receipt["reason"]})
             connection.execute(
                 "UPDATE tasks SET status = ?, receipt = ?, version = version + 1, updated_at = ? WHERE task_id = ?",
                 (status, _json(receipt), now, task_id),

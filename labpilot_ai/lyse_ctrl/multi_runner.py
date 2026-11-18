@@ -1,4 +1,5 @@
 from .module_manager import ModuleManager
+from .private_inputs import PrivateInputs
 from .lyse_script_runner import run_lyse_script
 
 
@@ -13,10 +14,12 @@ def run_multi_module(registry: dict, name: str, dataframe, params=None):
             dataframe=dataframe,
             meta_h5_path=cfg.get("meta_h5_path", ""),
             params=params or cfg.get("params", {}),
+            routine_sha256=cfg.get("routine_sha256"), timeout_s=cfg.get("timeout_s", 300),
         )
         return result.get("results", result)
     module, cfg = manager.load("multi_modules", name)
-    result = module.run(dataframe, params or cfg.get("params", {}))
+    with PrivateInputs() as inputs:
+        result = module.run(inputs.frame(dataframe), params or cfg.get("params", {}))
     if not isinstance(result, dict):
         raise TypeError("multi lyse module run() must return a dict")
     return result

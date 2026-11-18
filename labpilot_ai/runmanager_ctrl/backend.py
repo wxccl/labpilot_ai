@@ -51,7 +51,7 @@ class RunmanagerBackend:
         return self._client.say_hello()
 
     @property
-    def client(self):
+    def _read_client(self):
         if self.mock:
             return None
         if self._local is not None:
@@ -67,53 +67,38 @@ class RunmanagerBackend:
             from .local_gateway import evaluated_globals
 
             return evaluated_globals(self.local_snapshot())
-        return self.client.get_globals()
+        return self._read_client.get_globals()
 
     def get_labscript_file(self):
         if self.mock:
             return self._labscript_file
         if self._local is not None:
             return self.local_snapshot()["sequence"]
-        return self.client.get_labscript_file()
+        return self._read_client.get_labscript_file()
 
     def set_labscript_file(self, value, *, prepared=None):
-        value = str(value or "")
-        if self._local is not None or prepared is not None:
-            return self._apply_configuration("set_sequence", {"sequence": value}, prepared)
-        if self.mock:
-            self._labscript_file = value
-            return True
-        return self.client.set_labscript_file(value)
+        if self.mock is not True:
+            raise PermissionError("Live Runmanager writes require a managed labpilot A2/A3 task")
+        self._labscript_file = str(value or "")
+        return True
 
     def get_shot_output_folder(self):
         if self.mock:
             return self._shot_output_folder
         if self._local is not None:
             return self.local_snapshot()["output"]
-        return self.client.get_shot_output_folder()
+        return self._read_client.get_shot_output_folder()
 
     def set_shot_output_folder(self, value, *, prepared=None):
-        value = str(value or "")
-        if self._local is not None or prepared is not None:
-            return self._apply_configuration("set_output", {"output": value}, prepared)
-        if self.mock:
-            self._shot_output_folder = value
-            return True
-        return self.client.set_shot_output_folder(value)
+        if self.mock is not True:
+            raise PermissionError("Live Runmanager writes require a managed labpilot A2/A3 task")
+        self._shot_output_folder = str(value or "")
+        return True
 
     def prepare_configuration(self, operation, changes):
         if self._local is None:
             raise RuntimeError("Local Runmanager gateway is not selected")
         return self._local.prepare(operation, changes)
-
-    def _apply_configuration(self, operation, changes, prepared):
-        if prepared is None:
-            prepared = self.prepare_configuration(operation, changes)
-        if self._local is None:
-            raise ValueError("Prepared configuration requests require local gateway mode")
-        if prepared.get("action") != operation or prepared.get("plan", {}).get("changes") != changes:
-            raise ValueError("The prepared configuration no longer matches the requested values")
-        return self._local.execute(prepared)
 
     def prepare_globals(self, values):
         if self._local is None:
@@ -121,27 +106,11 @@ class RunmanagerBackend:
         return self._local.prepare_globals(values)
 
     def set_globals(self, values: dict, *, prepared=None):
-        if self._local is not None:
-            from .local_gateway import raw_expression
-
-            if prepared is None:
-                request = self.prepare_globals(values)
-            else:
-                requested = {name: raw_expression(value) for name, value in values.items()}
-                if prepared.get("action") != "apply_globals" or prepared.get("plan", {}).get("changes") != requested:
-                    raise ValueError("The prepared global changes no longer match the requested values")
-                request = prepared
-            self._last_local_write = None
-            receipt = self._local.execute(request)
-            self._last_local_write = {"request": request, "receipt": receipt}
-            return receipt
-        if prepared is not None:
-            raise ValueError("Prepared globals requests require local gateway mode")
+        if self.mock is not True:
+            raise PermissionError("Live Runmanager writes require a managed labpilot A2/A3 task")
         self._last_snapshot = self.snapshot_values(values.keys())
-        if self.mock:
-            self._mock_globals.update(values)
-            return True
-        return self.client.set_globals(values)
+        self._mock_globals.update(values)
+        return True
 
     def snapshot_values(self, names):
         current = self.get_globals()
@@ -165,23 +134,10 @@ class RunmanagerBackend:
         }
 
     def rollback_last(self):
-        if self._local is not None:
-            previous = self._last_local_write
-            if previous is None:
-                return {}
-            self._last_local_write = None
-            receipt = self._local._restore_globals(previous)
-            return {
-                name: receipt["after"]["globals_raw"][name]
-                for name in previous["request"]["plan"]["changes"]
-            }
-        if not self._last_snapshot:
-            return {}
-        values = dict(self._last_snapshot)
-        if self.mock:
-            self._mock_globals.update(values)
-        else:
-            self.client.set_globals(values)
+        if self.mock is not True:
+            raise PermissionError("Live Runmanager writes require a managed labpilot A2/A3 task")
+        values = self._last_snapshot
+        self._mock_globals.update(values)
         self._last_snapshot = {}
         return values
 
@@ -194,25 +150,19 @@ class RunmanagerBackend:
             return n
         if self._local is not None:
             return self.local_snapshot()["n_shots"]
-        return self.client.n_shots()
+        return self._read_client.n_shots()
 
     def set_run_shots(self, value: bool, *, prepared=None):
-        if self._local is not None or prepared is not None:
-            return self._apply_configuration("set_flags", {"run": bool(value)}, prepared)
-        if self.mock:
-            self._run_shots = bool(value)
-            return True
-        return self.client.set_run_shots(bool(value))
+        if self.mock is not True:
+            raise PermissionError("Live Runmanager writes require a managed labpilot A2/A3 task")
+        self._run_shots = bool(value)
+        return True
 
     def prepare_engage(self):
         snapshot = self.local_snapshot()
         return self._local.prepare("engage_once", snapshot=snapshot, expected_n_shots=snapshot["n_shots"])
 
     def engage(self, prepared=None):
-        if self.mock:
-            return {"mock_engaged": True, "n_shots": self.n_shots()}
-        if self._local is not None:
-            if not isinstance(prepared, dict) or prepared.get("action") != "engage_once":
-                raise ValueError("Prepare and review a concrete Engage request first")
-            return self._local.execute(prepared)
-        return self.client.engage()
+        if self.mock is not True:
+            raise PermissionError("Live Runmanager writes require a managed labpilot A2/A3 task")
+        return {"mock_engaged": True, "n_shots": self.n_shots()}

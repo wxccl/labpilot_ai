@@ -5,7 +5,6 @@ import contextlib
 import importlib.util
 import json
 import os
-import runpy
 import sys
 import traceback
 import types
@@ -15,6 +14,7 @@ import pandas as pd
 
 from labpilot_ai.bootstrap_labscript import install_h5_lock
 from labpilot_ai.utils.json_utils import to_jsonable
+from .routine_source import checked_source
 
 
 class WorkerRun:
@@ -232,6 +232,7 @@ def _write_payload(path, payload):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--script", required=True)
+    parser.add_argument("--routine-sha256", required=True)
     parser.add_argument("--mode", choices=["single", "multi"], required=True)
     parser.add_argument("--h5-path", default="")
     parser.add_argument("--meta-h5-path", default="")
@@ -252,6 +253,7 @@ def main(argv=None):
     payload = {"ok": False, "results": results, "script": str(script)}
 
     try:
+        source, _ = checked_source(script, args.routine_sha256)
         _install_runtime_control_fallback()
         lyse_module = _make_lyse_module(path_value, dataframe, script_name, results)
         sys.modules["lyse"] = lyse_module
@@ -267,7 +269,14 @@ def main(argv=None):
         try:
             os.chdir(script.parent)
             with contextlib.redirect_stdout(sys.stderr):
-                runpy.run_path(str(script), init_globals=globals_for_script, run_name="__main__")
+                main = types.ModuleType("__main__")
+                main.__dict__.update(globals_for_script, __file__=str(script))
+                previous = sys.modules["__main__"]
+                sys.modules["__main__"] = main
+                try:
+                    exec(compile(source, str(script), "exec"), main.__dict__)
+                finally:
+                    sys.modules["__main__"] = previous
         finally:
             os.chdir(old_cwd)
         payload.update({"ok": True, "results": results})

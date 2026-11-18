@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 from labpilot_ai.utils.paths import project_root
+from .routine_source import checked_source
 
 
 class LyseModuleError(RuntimeError):
@@ -39,7 +40,8 @@ class ModuleManager:
         if spec is None or spec.loader is None:
             raise LyseModuleError(f"cannot import module from {path}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        source, _ = checked_source(path, cfg.get("routine_sha256"))
+        exec(compile(source, str(path), "exec"), module.__dict__)
         if not hasattr(module, "run"):
             raise LyseModuleError(f"{path} does not define run()")
         return module, cfg

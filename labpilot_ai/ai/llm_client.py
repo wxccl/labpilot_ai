@@ -4,6 +4,7 @@ import os
 import re
 
 from .co_sequence_prompt import build_co_sequence_prompt, mock_co_sequence_plan
+from .endpoints import binding
 from .json_parser import extract_json_object
 from .prompt_builder import build_command_prompt
 
@@ -16,30 +17,12 @@ class LLMClient:
         environment at construction time.  It never writes the secret key to a
         repository or YAML file.
         """
-        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
-        openai_key = os.getenv("OPENAI_API_KEY")
-
-        if api_key:
-            self.api_key = api_key
-            self.api_key_source = "argument"
-        elif deepseek_key:
-            self.api_key = deepseek_key
-            self.api_key_source = "DEEPSEEK_API_KEY"
-        elif openai_key:
-            self.api_key = openai_key
-            self.api_key_source = "OPENAI_API_KEY"
-        else:
-            self.api_key = None
-            self.api_key_source = "missing"
-
-        if base_url:
-            self.base_url = base_url
-        elif self.api_key_source == "DEEPSEEK_API_KEY":
-            self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        elif self.api_key_source == "OPENAI_API_KEY":
-            self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        else:
-            self.base_url = os.getenv("DEEPSEEK_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.deepseek.com"
+        self.base_url, key_name = binding(base_url)
+        other_key = "OPENAI_API_KEY" if key_name == "DEEPSEEK_API_KEY" else "DEEPSEEK_API_KEY"
+        if api_key and api_key == os.getenv(other_key) and api_key != os.getenv(key_name):
+            raise ValueError("Credential belongs to a different provider")
+        self.api_key = api_key or os.getenv(key_name)
+        self.api_key_source = "argument" if api_key else (key_name if self.api_key else "missing")
 
         if model:
             self.model = model
@@ -74,7 +57,8 @@ class LLMClient:
         except ImportError as exc:
             raise RuntimeError("OpenAI-compatible SDK is not installed. Install the project dependencies or enable Mock LLM.") from exc
 
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=60.0)
+        import httpx
+        client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=60.0, http_client=httpx.Client(follow_redirects=False))
         kwargs = dict(
             model=self.model,
             messages=[
@@ -88,7 +72,8 @@ class LLMClient:
         if self.use_thinking:
             kwargs["reasoning_effort"] = "high"
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        response = client.chat.completions.create(**kwargs)
+        with client:
+            response = client.chat.completions.create(**kwargs)
         return extract_json_object(response.choices[0].message.content)
 
     def _mock_parse(self, text: str, global_registry: dict, blacs_registry: dict | None = None) -> dict:
@@ -218,7 +203,8 @@ class LLMClient:
         except ImportError as exc:
             raise RuntimeError("OpenAI-compatible SDK is not installed. Install the project dependencies or enable Mock LLM.") from exc
 
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=90.0)
+        import httpx
+        client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=90.0, http_client=httpx.Client(follow_redirects=False))
         prompt = build_co_sequence_prompt(
             instruction,
             sequence_path,
@@ -239,5 +225,6 @@ class LLMClient:
         if self.use_thinking:
             kwargs["reasoning_effort"] = "high"
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        response = client.chat.completions.create(**kwargs)
+        with client:
+            response = client.chat.completions.create(**kwargs)
         return extract_json_object(response.choices[0].message.content)

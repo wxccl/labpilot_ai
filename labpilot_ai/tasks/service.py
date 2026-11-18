@@ -52,7 +52,7 @@ class TaskService:
         if current["cancel_requested"]:
             receipt = {"schema": HOST_SCHEMA, "state": "REFUSED", "request_id": task["request_id"],
                        "reason": "Cancelled before host dispatch"}
-            return self.store._record_receipt(task["task_id"], token, "CANCELLED", receipt)
+            return self.store._record_receipt(task["task_id"], token, "CANCELLED", receipt, never_dispatched=True)
         if current["status"] in TERMINAL:
             return current
         request = {**task["params"], "action": task["action"], "request_id": task["request_id"],
@@ -62,7 +62,7 @@ class TaskService:
         if self.store._now() >= expires_at:
             receipt = {"schema": HOST_SCHEMA, "state": "REFUSED", "request_id": task["request_id"],
                        "reason": "Approval expired before host dispatch"}
-            return self.store._record_receipt(task["task_id"], token, "FAILED", receipt)
+            return self.store._record_receipt(task["task_id"], token, "FAILED", receipt, never_dispatched=True)
         receipt = _call(self.host.execute, request)
         state = receipt["state"]
         if state == "APPLIED":

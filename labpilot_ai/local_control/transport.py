@@ -70,6 +70,8 @@ class LocalGateway:
     def call(self, target, request):
         if target not in READ_ACTIONS or not isinstance(request, dict):
             raise ValueError("Invalid gateway request")
+        if target == "runmanager" and request.get("action") not in READ_ACTIONS["runmanager"]:
+            raise PermissionError("Runmanager writes require a managed labpilot A2/A3 task")
         if not self.gateway_path.is_file() or not self.python_path.is_file():
             raise FileNotFoundError("Local gateway or Labscript Python missing. Check LABPILOT_LOCAL_GATEWAY and LABPILOT_LABSCRIPT_PYTHON.")
         raw = json.dumps({"target": target, "request": request}, ensure_ascii=True,

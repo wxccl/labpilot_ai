@@ -62,15 +62,14 @@ def enable_labconfig(*, allow_write: bool | None = None, host: str | None = None
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Install LabPilot real BLACS bridge plugin shim into the active labscript environment.")
-    ap.add_argument("--allow-write", action="store_true", help="Enable real BLACS manual writes in labconfig. Use only after /channels and /values are verified.")
     ap.add_argument("--disable-write", action="store_true", help="Explicitly disable real BLACS manual writes in labconfig.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--token", default=None, help="Optional token required by LabPilot client via X-LabPilot-Token.")
+    ap.add_argument("--token", default=None, help="Site token (prefer LABPILOT_BLACS_TOKEN supplied to BLACS and client instead of command-line secrets).")
     args = ap.parse_args()
 
     shim = install_plugin_shim()
-    allow_write = True if args.allow_write else False if args.disable_write else None
+    allow_write = False
     cfg = enable_labconfig(allow_write=allow_write, host=args.host, port=args.port, token=args.token)
 
     print("Installed BLACS plugin shim:", shim)
@@ -80,7 +79,7 @@ def main() -> int:
     print("  2. Restart BLACS")
     print(f"  3. Test: curl.exe http://{args.host}:{args.port}/status")
     print("  4. Expected service: labpilot-real-blacs-bridge")
-    print("  5. Then test /channels and /values before enabling writes.")
+    print("  5. Test authenticated /channels and /values. HTTP writes are disabled.")
     return 0
 
 

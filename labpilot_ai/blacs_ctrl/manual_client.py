@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
+from ipaddress import IPv4Address
 from urllib import error, request
 
 from labpilot_ai.local_control.transport import local_gateway_enabled
 
 from .local_gateway import LocalBlacs
+
+
+class _NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class BlacsBridgeConnectionError(ConnectionError):
@@ -21,10 +28,12 @@ class BlacsManualClient:
     """
 
     def __init__(self, host="127.0.0.1", port=8765, mock=True, token=None, *, local_gateway=None):
-        self.host = host
+        if not mock and str(host).lower() != "localhost" and not IPv4Address(host).is_loopback:
+            raise ValueError("Legacy BLACS HTTP requires IPv4 loopback")
+        self.host = "127.0.0.1" if str(host).lower() == "localhost" else host
         self.port = int(port)
         self.mock = bool(mock)
-        self.token = token
+        self.token = os.getenv("LABPILOT_BLACS_TOKEN", "") if token is None else token
         self.values = {}
         self.local = None
         if not self.mock and (local_gateway is not None or local_gateway_enabled()):
@@ -61,7 +70,7 @@ class BlacsManualClient:
     def _get_json(self, path: str, timeout=10):
         try:
             req = request.Request(f"{self.base_url}{path}", headers=self._headers(), method="GET")
-            with request.urlopen(req, timeout=timeout) as resp:
+            with request.build_opener(request.ProxyHandler({}), _NoRedirect()).open(req, timeout=timeout) as resp:
                 text = resp.read().decode("utf-8")
         except error.URLError as exc:
             raise BlacsBridgeConnectionError(f"Cannot connect to BLACS bridge at {self.base_url}: {exc}") from exc
@@ -69,25 +78,6 @@ class BlacsManualClient:
             return json.loads(text)
         except Exception:
             return {"ok": True, "raw": text}
-
-    def _post_json(self, path: str, payload: dict, timeout=10):
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        try:
-            req = request.Request(f"{self.base_url}{path}", data=data, headers=self._headers(), method="POST")
-            with request.urlopen(req, timeout=timeout) as resp:
-                text = resp.read().decode("utf-8")
-        except error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8")
-                payload = json.loads(body)
-                raise RuntimeError(payload.get("error") or body) from exc
-            except RuntimeError:
-                raise
-            except Exception:
-                raise RuntimeError(str(exc)) from exc
-        except error.URLError as exc:
-            raise BlacsBridgeConnectionError(f"Cannot connect to BLACS bridge at {self.base_url}: {exc}") from exc
-        return json.loads(text)
 
     def status(self):
         if self.mock:
@@ -164,57 +154,7 @@ class BlacsManualClient:
             return self.local.set_manual(name, value, program=program,
                                          **{key: extra[key] for key in fields if key in extra})
 
-        last_error = None
-        attempted = []
-        for candidate in _manual_name_candidates(name, extra):
-            payload = _manual_payload_for_candidate(candidate, value, program, extra)
-            attempted.append(candidate)
-            try:
-                result = self._post_json("/set_manual", payload, timeout=10)
-            except RuntimeError as exc:
-                last_error = exc
-                if _channel_lookup_refused(str(exc)):
-                    continue
-                raise
-            if isinstance(result, dict) and result.get("ok") is False:
-                message = result.get("error") or "BLACS bridge manual write failed"
-                last_error = RuntimeError(message)
-                if _channel_lookup_refused(message):
-                    continue
-                raise last_error
-            if isinstance(result, dict):
-                result.setdefault("attempted_names", attempted)
-                result.setdefault("requested_name", name)
-            return result
-        if last_error is not None:
-            available = self._available_channel_names_for_error()
-            raise RuntimeError(f"{last_error}; attempted BLACS names: {attempted}; available BLACS names: {available}") from last_error
-        payload = {"name": name, "value": value, "program": bool(program)}
-        payload.update(extra)
-        result = self._post_json("/set_manual", payload, timeout=10)
-        if isinstance(result, dict) and result.get("ok") is False:
-            raise RuntimeError(result.get("error") or "BLACS bridge manual write failed")
-        return result
-
-
-    def _available_channel_names_for_error(self):
-        try:
-            channels = self.discover_channels()
-        except Exception as exc:
-            return f"unavailable ({exc})"
-        names = []
-        for channel in channels:
-            if isinstance(channel, dict):
-                for key in ("name", "labscript_name", "channel"):
-                    value = channel.get(key)
-                    if value and str(value) not in names:
-                        names.append(str(value))
-        return names[:50]
-
-
-def _channel_lookup_refused(message):
-    # Only a documented pre-write lookup error permits trying an older alias.
-    return str(message).startswith("BLACS manual channel not found:")
+        raise PermissionError("Legacy HTTP is read-only; use a managed labpilot A2/A3 task")
 
 
 def _manual_name_candidates(name, extra):
@@ -239,26 +179,3 @@ def _manual_name_candidates(name, extra):
         if device and alias and "." not in str(alias):
             add(f"{device}.{alias}")
     return candidates or [str(name)]
-
-
-def _manual_payload_for_candidate(candidate, value, program, extra):
-    payload = {"name": candidate, "value": value, "program": bool(program)}
-    payload.update(extra)
-    payload["name"] = candidate
-    if payload.get("unit") in {None, ""}:
-        payload.pop("unit", None)
-
-    device = str(extra.get("device", "") or "").strip()
-    channel = str(extra.get("channel", "") or "").strip()
-    device_channel = f"{device}.{channel}" if device and channel else ""
-
-    # Older bridge versions prioritise device/channel over name. When trying a
-    # labscript object name such as rf_switch or LabPilotVirtualDevice.rf_switch,
-    # remove the stale connection-string fields so the candidate name is used.
-    if candidate != device_channel:
-        payload.pop("device", None)
-        payload.pop("channel", None)
-        payload.pop("subchannel", None)
-    elif candidate == channel:
-        payload.pop("device", None)
-    return payload

@@ -81,13 +81,11 @@ def test_legacy_bridge_refuses_non_loopback_binding(make_bridge, host):
         make_bridge(host=host)
 
 
-def test_missing_token_leaves_discovery_and_values_read_only(make_bridge):
+@pytest.mark.parametrize("method,path", [("GET","/status"),("GET","/values"),("GET","/channels"),("GET","/debug"),("POST","/set_manual")])
+def test_missing_configured_token_fails_closed(make_bridge, method, path):
     instance = make_bridge(token="  ", allow_write=True)
-    assert instance.server.server_address == ("127.0.0.1", 8765)
-    assert request(instance, "GET", "/status")[0][1]["allow_write"] is False
-    assert request(instance, "GET", "/channels")[0][1]["channels"] == [{"name": "Example.ao0"}]
-    assert request(instance, "GET", "/values")[0][1]["values"] == {"Example.ao0": 1.5}
-    assert request(instance, "POST", "/set_manual")[0][0] == 403
+    assert request(instance, method, path)[0][0] == 401
+    assert request(instance, method, path, [("X-LabPilot-Token", "arbitrary")])[0][0] == 401
     assert instance.accessor.writes == []
 
 
@@ -99,20 +97,7 @@ def test_only_an_exact_single_header_token_authenticates(make_bridge):
     assert request(instance, "GET", "/status", [token])[0][0] == 200
     body = b'{"name":"Example.ao0","value":1.5}'
     headers = [token, ("Content-Length", str(len(body)))]
-    assert request(instance, "POST", "/set_manual", headers, body)[0][0] == 200
-    assert instance.accessor.writes == [({"name": "Example.ao0", "value": 1.5}, True)]
-
-
-def test_oversize_body_is_rejected_before_reading(make_bridge):
-    instance = make_bridge(token="example-token", allow_write=True)
-    headers = [("X-LabPilot-Token", "example-token"), ("Content-Length", str(bridge.MAX_REQUEST_BYTES + 1))]
-    (status, _), bytes_read = request(instance, "POST", "/set_manual", headers, b"unread")
-    assert (status, bytes_read, instance.accessor.writes) == (413, 0, [])
-
-
-@pytest.mark.parametrize("body", [b"[]", b"{", b'{"value":NaN}', b'{"value":1e999}'])
-def test_invalid_manual_payload_never_reaches_accessor(make_bridge, body):
-    instance = make_bridge(token="example-token", allow_write=True)
-    headers = [("X-LabPilot-Token", "example-token"), ("Content-Length", str(len(body)))]
-    assert request(instance, "POST", "/set_manual", headers, body)[0][0] == 400
+    assert request(instance, "GET", "/values", [token])[0][1]["values"] == {"Example.ao0": 1.5}
+    assert request(instance, "GET", "/status", [token])[0][1]["allow_write"] is False
+    assert request(instance, "POST", "/set_manual", headers, body) == ((403, {"ok": False, "error": "Legacy bridge is read-only; use managed A2/A3 tasks"}), 0)
     assert instance.accessor.writes == []

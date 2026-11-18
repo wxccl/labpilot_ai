@@ -1,8 +1,12 @@
-# 控制机单发验收（0.3.1）
+# 控制机单发验收（0.3.2）
 
 以下命令在 Anaconda Prompt / CMD 中运行。脚本随 pip 包安装，不需要下载源码。
 
 ## 一、核对安装
+
+升级前先关闭占用 labpilot.exe 的 Harness MCP 服务。DSH 接入：在 Settings 的 MCP 编辑器创建 stdio 服务，命令使用 where labpilot 输出的完整 exe 路径，三个参数分别为 --profile、已审 profile.json 的绝对路径、mcp。保存、重启 Harness 并验证 discover / snapshot；不要编辑会被覆盖的 cordis.patch.yml。停用或删除同一服务即可回退。MCP 服务无需模型密钥。
+
+现场单发前请验证系统盘可用空间 ≥10%、日志有轮转、Andor 连续 24 小时无意外断电；若站点仍有 230 shots 或 MemoryError，先停止验收。安装确认输入 INSTALL；卸载输入 UNINSTALL；本脚本 A2 授权有效期 5 分钟。
 
 在控制机激活原 Labscript 环境，核对解释器，再安装指定版本。
 
@@ -12,7 +16,7 @@ conda activate labscript
 where python
 python -c "import sys; from importlib.metadata import version; print(sys.executable); print({n:version(n) for n in ('labscript','labscript-utils','runmanager','blacs','lyse')})"
 python -m pip show labpilot-ai
-python -m pip install --no-deps "labpilot-ai==0.3.1"
+python -m pip install --no-deps "labpilot-ai==0.3.2"
 python -c "from importlib.metadata import version; print(version('labpilot-ai'))"
 python -c "from labscript_profile import default_labconfig_path; print(default_labconfig_path())"
 ```
@@ -40,7 +44,7 @@ powershell.exe -NoProfile -File "%LP%" -Step start-rm
 
 ## 三、审阅、单次执行和验收
 
-另开 Anaconda Prompt，进入**同一个源码目录**。下面头三条只准备任务：
+另开 Anaconda Prompt，激活同一环境。以下命令只准备任务，不需要源码目录：
 
 ```bat
 conda activate labscript
@@ -62,6 +66,6 @@ powershell.exe -NoProfile -File "%LP%" -Step observe
 powershell.exe -NoProfile -File "%LP%" -Step events
 ```
 
-验收须同时看到 `COMPLETED`；`compiled_count / queued_count / executed_count / analyzed_count` 均为 `1`；原生观测内 `blacs_execution_verified=true`；`analysis_state=COMPLETE` 且 `quality=PASS`。对照 `evidence.report_dir` 里的 `manifest.json`、`shot_000000.json`（索引、原 H5 路径及哈希、例程和数值结果），检查 Runmanager 原输出目录恢复。BLACS 软件确认与质量判定并不能代替独立传感器对每个物理输出的校验。
+验收须同时看到 `COMPLETED`；`evidence` 中 compiled_count、queued_count、executed_count、analyzed_count 全部为 1，analysis_state=COMPLETE 且 quality=PASS；`observation.value.evidence.blacs_execution_verified=true`。原 H5 路径及哈希见 `evidence.report_dir` 内的 `manifest.json`，每发分析值见 `shot_000000.json`。检查原输出目录已恢复。
 
 `UNKNOWN` / `OBSERVING` 只能继续看原任务；`FAILED` 区分编译、设备错误或质量规则失败。即使文件已出现、队列显示 Idle，也不能据此认定 PASS。中断后不要删除 `dispatch-intent.json` 或数据库，不要新建任务规避未知状态。要恢复原启动：先核实原任务及队列已处理，正常退出两个程序，执行 `powershell.exe -NoProfile -File "%LP%" -Step uninstall` 并审核预览，再从原快捷方式启动；保留数据和验收目录。

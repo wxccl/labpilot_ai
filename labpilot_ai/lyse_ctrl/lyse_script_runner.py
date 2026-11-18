@@ -10,6 +10,9 @@ from pathlib import Path
 import pandas as pd
 
 from .lyse_results_reader import read_results_group
+from .h5_loader import _get_h5py
+from .private_inputs import PrivateInputs
+from .routine_source import checked_source
 
 
 class LyseScriptError(RuntimeError):
@@ -31,11 +34,26 @@ def _dataframe_payload(dataframe):
     )
 
 
-def run_lyse_script(script_path, *, mode, h5_path=None, dataframe=None, meta_h5_path=None, params=None, timeout_s=300):
-    """Run an original lyse-style top-level .py routine in a subprocess."""
+def run_lyse_script(script_path, *, mode, h5_path=None, dataframe=None, meta_h5_path=None, params=None, timeout_s=300,
+                    routine_sha256=None):
+    _, digest = checked_source(script_path, routine_sha256)
+    if type(timeout_s) not in (int, float) or not 0 < timeout_s <= 600:
+        raise ValueError("Lyse subprocess timeout must be positive and at most 600 seconds")
+    with PrivateInputs() as inputs:
+        return _run_staged(script_path, mode=mode, h5_path=inputs.shot(h5_path) if h5_path else None,
+                           dataframe=inputs.frame(dataframe), meta_h5_path=inputs.shot(meta_h5_path) if meta_h5_path else None,
+                           params=params, timeout_s=timeout_s, digest=digest)
+
+
+def _run_staged(script_path, *, mode, h5_path, dataframe, meta_h5_path, params, timeout_s, digest):
     script = Path(script_path).expanduser().resolve()
     if not script.exists():
         raise LyseScriptError(f"lyse script does not exist: {script}")
+    if mode == "single" and h5_path:
+        with _get_h5py().File(h5_path, "r+") as private:
+            group_name = "results/" + script.stem
+            if group_name in private:
+                del private[group_name]
 
     with tempfile.TemporaryDirectory(prefix="labpilot_lyse_script_") as temp_dir:
         result_json = Path(temp_dir) / "result.json"
@@ -47,6 +65,7 @@ def run_lyse_script(script_path, *, mode, h5_path=None, dataframe=None, meta_h5_
             "labpilot_ai.lyse_ctrl.lyse_script_worker",
             "--script",
             str(script),
+            "--routine-sha256", digest,
             "--mode",
             str(mode),
             "--h5-path",

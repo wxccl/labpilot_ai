@@ -48,7 +48,7 @@ def parser():
     authorize = commands.add_parser("authorize-policy")
     authorize.add_argument("task_id")
     authorize.add_argument("policy_id")
-    for name in ("policy-status", "revoke-policy"):
+    for name in ("policy-status", "policy-events", "revoke-policy"):
         policy_command = commands.add_parser(name)
         policy_command.add_argument("policy_id")
     runner = commands.add_parser("serve")
@@ -57,6 +57,7 @@ def parser():
     mcp.add_argument("--project-sources", action="store_true")
     deepseek = commands.add_parser("deepseek")
     deepseek.add_argument("--model", required=True)
+    deepseek.add_argument("--provider", choices=("deepseek", "paratera"))
     deepseek.add_argument("--project-sources", action="store_true")
     deepseek.add_argument("prompt")
     draft = commands.add_parser("draft-code")
@@ -161,6 +162,8 @@ def dispatch(args):
         return app.store.authorize_policy(args.task_id, args.policy_id)
     if command == "policy-status":
         return app.store.get_policy(args.policy_id)
+    if command == "policy-events":
+        return app.store.policy_events(args.policy_id)
     if command == "revoke-policy":
         return app.store.revoke_policy(args.policy_id)
     if command == "run-next":
@@ -191,17 +194,18 @@ def dispatch(args):
         if hasattr(sys.stdin, "reconfigure"):
             sys.stdin.reconfigure(encoding="utf-8")
             sys.stdout.reconfigure(encoding="utf-8", newline="\n")
-        serve(catalog, sys.stdin, sys.stdout)
-        return None
+        return serve(catalog, sys.stdin, sys.stdout)
     from .harness.deepseek import DeepSeekHTTP, DeepSeekProvider
 
-    return DeepSeekProvider(DeepSeekHTTP.from_env(), model=args.model).run(args.prompt, catalog)
+    return DeepSeekProvider(DeepSeekHTTP.from_env(args.provider), model=args.model).run(args.prompt, catalog)
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
         result = dispatch(args)
+        if args.command == "mcp":
+            return result
         if result is not None:
             print_json(result)
         if isinstance(result, dict) and result.get("state") in {"UNKNOWN", "REFUSED"}:

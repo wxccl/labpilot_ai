@@ -71,6 +71,7 @@ def _handle(request, catalog, initialized):
 def serve(catalog: ToolCatalog, stdin: TextIO, stdout: TextIO) -> int:
     """Process one UTF-8 text line per JSON-RPC message until input closes."""
     initialized = False
+    exit_code = 0
     while line := stdin.readline(MAX_LINE + 1):
         if len(line) > MAX_LINE:
             stdout.write(encode_json(_response(None, code=-32700, message="Message too large")) + "\n")
@@ -83,6 +84,8 @@ def serve(catalog: ToolCatalog, stdin: TextIO, stdout: TextIO) -> int:
         else:
             response, initialized = _handle(request, catalog, initialized)
         if response is not None:
+            if response.get("error", {}).get("code") in (-32700, -32600):
+                exit_code = 2
             stdout.write(encode_json(response) + "\n")
             stdout.flush()
-    return 0
+    return exit_code

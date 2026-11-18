@@ -1,12 +1,12 @@
 # LabPilot AI
 
-**LabPilot automation** runs persistent experiment tasks through a packaged Labscript host. Start with `python -m pip install labpilot-ai` and `labpilot init` for a simulated station. The new `labpilot` CLI and optional task UI share the task database with Codex MCP and DeepSeek. See the [automation guide](labpilot_ai/AUTOMATION.md) for simulation, site setup, approval, evidence, and compatibility.
+**LabPilot automation** runs persistent experiment tasks through a packaged Labscript host. Start with `python -m pip install labpilot-ai` and `labpilot init` for a simulated station. The new `labpilot` CLI and optional task UI share the task database with Codex MCP and DeepSeek. See the [automation guide](https://github.com/wxccl/labpilot_ai/blob/v0.3.2/labpilot_ai/AUTOMATION.md) for simulation, site setup, approval, evidence, and compatibility.
 
 LabPilot AI is an industrial-style local AI copilot for labscript-suite experiments. It does not modify labscript, runmanager, BLACS, or lyse internals. Instead, it wraps stable boundaries: registry whitelists, local safety validation, runmanager/BLACS/lyse adapters, HDF5-compatible data, SQLite/JSONL logs, and a PyQt5 desktop UI.
 
 The first release is designed to be safe by default: Mock LLM, Mock runmanager/BLACS, and Dry-run workflows can demonstrate the full loop before any real hardware action is enabled.
 
-For a Windows PC running both LabPilot and Labscript Suite, see the [中文同机部署与 Codex 控制手册](manual/00_local_control.md). The optional local gateway mode uses the installed Labscript host gateway through local Python and provides the `labpilot-control` JSON CLI. Mock mode remains available without Labscript.
+For a Windows PC running both LabPilot and Labscript Suite, see the [中文同机部署与 Codex 控制手册](https://github.com/wxccl/labpilot_ai/blob/v0.3.2/manual/00_local_control.md). The optional local gateway mode uses the installed Labscript host gateway through local Python and provides the `labpilot-control` JSON CLI. Mock mode remains available without Labscript.
 
 ## Main Features
 

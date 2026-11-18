@@ -72,6 +72,33 @@ def test_a2_freezes_reviewed_plan_and_dispatches_exact_bindings(store):
     ]
 
 
+@pytest.mark.parametrize("state", ["cancel-before-send", "UNKNOWN", "REFUSED"])
+def test_policy_audit_and_conservative_debit(store, monkeypatch, state):
+    spec = specification(batch=True)
+    store.create_policy({"policy_id": "budget", "approver": "operator", "expires_at": END,
+                         "scope_digests": [policy_scope_digest(spec)], "max_actions": 1, "max_shots": 4})
+    task = store.submit(dict(spec, policy_id="budget"))
+    host = Host()
+    host.state = state
+    if state == "cancel-before-send":
+        original = store._claim
+        def cancelled_claim():
+            claimed = original()
+            store.cancel(task["task_id"])
+            return claimed
+        monkeypatch.setattr(store, "_claim", cancelled_claim)
+    TaskService(store, host).run_next()
+    store.revoke_policy("budget")
+    store.revoke_policy("budget")
+    ledger = store.policy_events("budget")
+    never_sent = state == "cancel-before-send"
+    assert [event["kind"] for event in ledger] == ["CREATED", "BUDGET_RESERVED"] + (["BUDGET_REFUNDED"] if never_sent else []) + ["REVOKED"]
+    assert ledger[1]["detail"]["request_id"] == task["request_id"]
+    assert all(event["detail"]["process_user"] for event in ledger)
+    assert store.get_policy("budget")["used_shots"] == (0 if never_sent else 4)
+    assert len(host.executions) == (0 if never_sent else 1)
+
+
 def test_expired_a2_is_not_dispatched(tmp_path):
     clock = [NOW]
     store = TaskStore(tmp_path / "tasks.sqlite3", clock=lambda: clock[0])

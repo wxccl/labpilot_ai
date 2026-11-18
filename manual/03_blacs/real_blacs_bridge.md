@@ -32,10 +32,12 @@ python tools\install_real_blacs_bridge.py --disable-write --host 127.0.0.1
 labpilot-blacs-real-bridge-info
 ```
 
+提前通过站点凭据管理方式为 BLACS 进程和客户端设置相同的 `LABPILOT_BLACS_TOKEN`。未配置令牌或未提供正确请求头均返回 401。即使旧配置中有 `allow_write=true`，本插件也拒绝 HTTP 写入。真实操作使用 `labpilot` 的 A2/A3 受管任务。
+
 ```powershell
-curl.exe http://127.0.0.1:8765/status
-curl.exe http://127.0.0.1:8765/channels
-curl.exe http://127.0.0.1:8765/values
+Invoke-RestMethod -Headers @{ "X-LabPilot-Token" = $env:LABPILOT_BLACS_TOKEN } -Uri http://127.0.0.1:8765/status
+Invoke-RestMethod -Headers @{ "X-LabPilot-Token" = $env:LABPILOT_BLACS_TOKEN } -Uri http://127.0.0.1:8765/channels
+Invoke-RestMethod -Headers @{ "X-LabPilot-Token" = $env:LABPILOT_BLACS_TOKEN } -Uri http://127.0.0.1:8765/values
 ```
 
 检查 `/status` 中 `service` 为 `labpilot-real-blacs-bridge`、`has_blacs` 为 `true`、`allow_write` 为 `false`。已有站点令牌的客户端通过单个 `X-LabPilot-Token` 请求头认证。若 `service` 为 `labpilot-blacs-manual-bridge`，当前端口由模拟服务占用。BLACS 正常加载插件后再验收真实读回。

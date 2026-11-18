@@ -25,9 +25,12 @@ if ($Step -eq 'init') {
     if (Test-Path -LiteralPath $Directory) { throw 'Directory exists. Resume existing steps, or choose another -Directory deliberately.' }
     if (!$env:CONDA_PREFIX) { throw 'Activate the original Labscript conda environment.' }
     $python = Join-Path $env:CONDA_PREFIX 'python.exe'
-    & $python -c "import sys; from importlib.metadata import version; print(sys.executable); print({n:version(n) for n in ('labscript','blacs','runmanager','lyse','labscript-utils','labpilot-ai')}); sys.exit(version('labpilot-ai')!='0.3.1')"
-    if ($LASTEXITCODE -ne 0) { throw 'Check interpreter, installed packages and LabPilot 0.3.1.' }
+    & $python -c "import sys; from importlib.metadata import version; print(sys.executable); print({n:version(n) for n in ('labscript','blacs','runmanager','lyse','labscript-utils','labpilot-ai')}); sys.exit(version('labpilot-ai')!='0.3.2')"
+    if ($LASTEXITCODE -ne 0) { throw 'Check interpreter, installed packages and LabPilot 0.3.2.' }
     $labconfig = ExistingPath 'Existing LabConfig INI used by BLACS / Runmanager' Leaf
+    $iniHash = (Get-FileHash -LiteralPath $labconfig).Hash
+    $port = & $python -c "import configparser,sys; c=configparser.ConfigParser(interpolation=None); c.read(sys.argv[1],encoding='utf-8-sig'); p=c.getint('ports','runmanager'); assert 1<=p<=65535; print(p)" $labconfig
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot read Runmanager port from selected LabConfig.' }
     $sequence = ExistingPath 'Existing authorized sequence .py' Leaf
     $routine = ExistingPath 'Existing trusted Lyse single-shot routine .py' Leaf
     $data = ExistingPath 'Existing writable LOCAL data directory' Container
@@ -39,14 +42,16 @@ if ($Step -eq 'init') {
     $batch = Join-Path $data ('labpilot-acceptance-' + [guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($batch)
     [void][IO.Directory]::CreateDirectory($Directory)
-    NewJson $profile @{schema_version=1;simulate=$false;python=$python;host=@{runmanager=@{enabled=$true;allow=@('engage');max_shots=1;sequence_root=(Split-Path $sequence);output_root=$data;batch_root=$batch};blacs=@{enabled=$true;allow=@{}}};analysis=@{routine=$routine;routine_sha256=(Get-FileHash -LiteralPath $routine).Hash.ToLowerInvariant();quality_rules=@(@{result=$result;type='number';min=$minimum;max=$maximum});timeout_s=120}}
-    NewJson $settings @{python=$python;labconfig=$labconfig;sequence=$sequence;sequence_sha256=(Get-FileHash -LiteralPath $sequence).Hash.ToLowerInvariant();profile_sha256=(Get-FileHash -LiteralPath $profile).Hash}
+    NewJson $profile @{schema_version=1;simulate=$false;python=$python;host=@{runmanager=@{enabled=$true;allow=@('engage');port=[int]$port;max_shots=1;sequence_root=(Split-Path $sequence);output_root=$data;batch_root=$batch};blacs=@{enabled=$true;allow=@{}}};analysis=@{routine=$routine;routine_sha256=(Get-FileHash -LiteralPath $routine).Hash.ToLowerInvariant();quality_rules=@(@{result=$result;type='number';min=$minimum;max=$maximum});timeout_s=120}}
+    NewJson $settings @{python=$python;labconfig=$labconfig;labconfig_sha256=$iniHash;port=[int]$port;sequence=$sequence;sequence_sha256=(Get-FileHash -LiteralPath $sequence).Hash.ToLowerInvariant();profile_sha256=(Get-FileHash -LiteralPath $profile).Hash}
     NewJson (Join-Path $Directory 'engage.json') @{target='runmanager';action='engage';expected_n_shots=1}
     Write-Host "Prepared $Directory. No device action."
     return
 }
 $site = Get-Content -LiteralPath $settings -Raw -Encoding UTF8 | ConvertFrom-Json
 if ((Get-FileHash -LiteralPath $profile).Hash -ne $site.profile_sha256) { throw 'Profile changed since init.' }
+if ($Step -in @('preview','install') -and (Get-FileHash -LiteralPath $site.labconfig).Hash -ne $site.labconfig_sha256) { throw 'LabConfig changed since init. Review before installation.' }
+if ($Step -in @('run','observe','events') -and !(Test-Path -LiteralPath $review)) { throw 'Missing review.json: prepare and review a task first.' }
 $scripts = Join-Path (Split-Path $site.python) 'Scripts'
 $cli = Join-Path $scripts 'labpilot.exe'
 switch ($Step) {
@@ -72,6 +77,7 @@ switch ($Step) {
         NewJson $review $task
         if ($task.expected_config_digest -ne $snap.snapshot_sha256) { throw 'Configuration changed during prepare. Do not approve.' }
         NewJson (Join-Path $Directory 'snapshot.json') $snap
+        Write-Host "Runmanager localhost:$($site.port), shots=$($snap.n_shots), sequence=$($snap.sequence), SHA256=$($snap.sequence_sha256)"
         Write-Host "Review snapshot.json, profile.json and review.json in $Directory. No Engage sent."
     }
     'run' {

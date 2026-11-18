@@ -38,14 +38,14 @@ def test_main_window_llm_client_uses_ui_runtime_fields():
     window.runtime_api_key = ""
     window.runtime_api_key_source = "missing"
     window.api_key = Edit("sk-ui-test")
-    window.base_url = Edit("https://api.example.test/v1")
+    window.base_url = Edit("https://api.deepseek.com")
     window.model = Edit("example-model")
 
     client = MainWindow._make_llm_client(window)
 
     assert client.api_key == "sk-ui-test"
     assert client.api_key_source == "UI field"
-    assert client.base_url == "https://api.example.test/v1"
+    assert client.base_url == "https://api.deepseek.com"
     assert client.model == "example-model"
 
 

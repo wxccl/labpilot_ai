@@ -194,3 +194,9 @@ def test_cli_prepares_then_applies_exact_plan_once(fake_gateway, tmp_path, monke
     assert json.loads(first.stdout)["state"] == "APPLIED"
     assert json.loads(second.stdout) == json.loads(first.stdout)
     assert invocations(fake_gateway) == [snapshot_call, envelope]
+
+@pytest.mark.parametrize("action", ["apply_globals", "set_sequence", "set_output", "set_flags", "engage_once"])
+def test_raw_legacy_runmanager_write_refused_before_starting_subprocess(fake_gateway, action):
+    with pytest.raises(PermissionError, match="A2/A3"):
+        fake_gateway.call("runmanager", {"action": action, "request_id": REQUEST_ID})
+    assert not (fake_gateway.gateway_path.parent / "calls.jsonl").exists()

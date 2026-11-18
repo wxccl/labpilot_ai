@@ -163,19 +163,11 @@ def test_mismatched_applied_receipt_is_unknown_without_resending(monkeypatch):
     assert gateway.writes == [("blacs", request)]
 
 
-def test_legacy_transport_fault_stops_without_alias_replay(monkeypatch):
+def test_legacy_http_never_attempts_alias_replay(monkeypatch):
     monkeypatch.delenv("LABPILOT_CONTROL_MODE", raising=False)
     client = BlacsManualClient(mock=False)
-    calls = []
-
-    def fault(*args, **kwargs):
-        calls.append(args)
-        raise RuntimeError("Serial response not found after write")
-
-    monkeypatch.setattr(client, "_post_json", fault)
-    with pytest.raises(RuntimeError, match="Serial response not found"):
-        client.set_manual("channel", 1.2, device="device", channel="ao0")
-    assert len(calls) == 1
+    with pytest.raises(PermissionError, match="read-only"):
+        client.set_manual("former-name", 42, aliases=["other-name"])
 
 
 def test_mock_precedes_explicit_local_mode(monkeypatch):

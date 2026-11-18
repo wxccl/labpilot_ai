@@ -1,3 +1,5 @@
+import pytest
+
 from labpilot_ai.bootstrap_labscript import install_h5_lock
 from labpilot_ai.runmanager_ctrl.globals_h5 import (
     read_runmanager_globals_h5,
@@ -94,7 +96,7 @@ class _FakeRunmanager:
         self.current.update(values)
 
 
-def test_runmanager_write_router_remote_then_h5(tmp_path):
+def test_live_router_never_writes_remote_or_h5(tmp_path):
     install_h5_lock(verbose=False)
     import h5py
 
@@ -108,15 +110,9 @@ def test_runmanager_write_router_remote_then_h5(tmp_path):
         group.create_group("expansion")
 
     backend = _FakeRunmanager({"do_camera": True})
-    report = write_runmanager_globals(
-        backend,
-        {"do_camera": False, "ct_probe_voltage_min_V": 1.0},
-        globals_h5_path=path,
-        direct_h5_write=True,
-    )
-
-    assert report.remote_written == {"do_camera": False}
-    assert report.h5_written == {"ct_probe_voltage_min_V": 1.0}
-    assert not report.missing
-    assert backend.writes == [{"do_camera": False}]
-    assert read_runmanager_globals_h5(path).values["ct_probe_voltage_min_V"] == 1.0
+    baseline = path.read_bytes()
+    with pytest.raises(PermissionError, match="A2/A3"):
+        write_runmanager_globals(backend, {"do_camera": False, "ct_probe_voltage_min_V": 1.0},
+                                 globals_h5_path=path, direct_h5_write=True)
+    assert not backend.writes
+    assert path.read_bytes() == baseline

@@ -57,6 +57,7 @@ from labpilot_ai.lyse_ctrl.h5_loader import iter_h5_paths, load_h5_folder, read_
 from labpilot_ai.lyse_ctrl.multi_runner import run_multi_module
 from labpilot_ai.lyse_ctrl.result_store import JsonlResultStore, default_result_store_path, merge_result_columns
 from labpilot_ai.lyse_ctrl.single_runner import run_single_module
+from labpilot_ai.lyse_ctrl.routine_source import checked_source
 from labpilot_ai.lyse_ctrl.registry_autoscan import merge_autoscanned_lyse_modules
 from labpilot_ai.optimizer.auto_loop import AutoLoopConfig, SupervisedOptimizerAutoLoop
 from labpilot_ai.optimizer.experiment_loop import OptimizerLoop
@@ -390,7 +391,7 @@ class OptimizerAutoLoopWorker(QtCore.QObject):
                 high_risk_approved=self.high_risk_approved,
                 history_path=str(history_path),
             )
-            if self.runmanager.uses_local_gateway and not config.dry_run:
+            if not config.dry_run and self.runmanager.mock is not True:
                 raise RuntimeError("Local gateway experiments require a reviewed Engage request for each batch.")
             db = LabPilotDatabase(output_dir / "labpilot.sqlite")
 
@@ -1174,10 +1175,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return settings, ai
 
     def _environment_api_key(self):
-        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
-            value = os.getenv(name)
-            if value:
-                return value, name
+        from ..ai.endpoints import binding
+        _, name = binding(self._current_ai_base_url())
+        value = os.getenv(name)
+        if value:
+            return value, name
         return "", "missing"
 
     def _configured_api_key(self):
@@ -1207,13 +1209,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _make_llm_client(self):
         key, source = self._current_api_key()
+        url = self._current_ai_base_url().rstrip("/")
+        previous = self.__dict__.get("_bound_llm_credential")
+        if key and previous and previous[0] == key and previous[1] != url:
+            raise ValueError("Select the credential for the new provider before changing endpoints")
         client = LLMClient(
             api_key=key or None,
-            base_url=self._current_ai_base_url(),
+            base_url=url,
             model=self._current_ai_model(),
             mock=False,
         )
         if key:
+            self._bound_llm_credential = (key, url)
             client.api_key_source = source
         return client
 
@@ -1245,10 +1252,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.runtime_api_key_source = source
             base_url = self._current_ai_base_url()
             model = self._current_ai_model()
-            if key:
-                env_name = "OPENAI_API_KEY" if "openai" in base_url.lower() else "DEEPSEEK_API_KEY"
-                os.environ[env_name] = key
-                self.runtime_api_key_source = f"UI/{env_name}" if source == "UI field" else source
             self.llm = self._make_llm_client()
             if save:
                 settings, ai = self._ai_config()
@@ -3343,6 +3346,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.record_command_event("dry_run", payload={"safe": safe, "force_run": force_run})
                 self.speak_event("dry_run", "这是 dry-run 模式，不会控制硬件。")
                 return
+            if (engage or safe.get("globals")) and self.rm.mock is not True:
+                raise PermissionError("Use labpilot prepare, A2/A3 approval and run-next for live Runmanager tasks.")
             self.speak_event("before_execute", summarize_safe_actions(safe, max_chars=self.tts.max_chars), priority=True)
             if safe.get("confirmations") and not self._confirm_high_risk(safe["confirmations"]):
                 self.log("Execution cancelled by user.")
@@ -3404,23 +3409,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     include_knowledge_context=item.get("include_knowledge_context", True),
                     include_optimizer_history=item.get("include_optimizer_history", True),
                 )
-            if engage and self.rm.uses_local_gateway:
-                prepared = self.rm.prepare_engage()
-                n = prepared["expected_n_shots"]
-                ans = QtWidgets.QMessageBox.question(
-                    self, "Confirm Engage",
-                    f"Submit {n} shot(s) using the current Runmanager configuration?\n"
-                    f"Configuration SHA-256: {prepared['expected_config_digest']}",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No,
-                )
-                engage = ans == QtWidgets.QMessageBox.Yes
-                if engage:
-                    receipt = self.rm.engage(prepared=prepared)
-                    self.log("Runmanager acknowledged Engage: " + dumps(receipt))
-                else:
-                    self.log("Engage cancelled by user; earlier write actions were already applied.")
-            elif engage:
+            if engage:
                 n = self.rm.n_shots()
                 if confirm_engage:
                     ans = QtWidgets.QMessageBox.question(
@@ -5003,6 +4992,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 cfg["mode"] = item.text().strip() or "lyse_script"
             elif item.column() == 3:
                 cfg["path"] = item.text().strip()
+                cfg["routine_sha256"] = checked_source(cfg["path"])[1]
             elif item.column() == 4:
                 cfg["order"] = int(item.text().strip())
             else:
@@ -5064,6 +5054,7 @@ class MainWindow(QtWidgets.QMainWindow):
         modules[name] = {
             "path": str(Path(path)),
             "mode": self._detect_lyse_module_mode(path),
+            "routine_sha256": checked_source(path)[1],
             "enabled_by_default": True,
             "order": order,
             "description": "Added from Lyse page.",
@@ -5863,7 +5854,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         h5_folder = self.h5_folder.text().strip() if hasattr(self, "h5_folder") else ""
         dry_run = self.dry_run.isChecked() if hasattr(self, "dry_run") else True
-        if self.rm.uses_local_gateway and not dry_run:
+        if not dry_run and self.rm.mock is not True:
             QtWidgets.QMessageBox.warning(self, "Review each Engage", "Use Dry run or prepare and confirm each batch separately in local gateway mode.")
             return
         if not dry_run and not h5_folder:

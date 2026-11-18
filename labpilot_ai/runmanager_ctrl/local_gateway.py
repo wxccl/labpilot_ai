@@ -113,7 +113,7 @@ def evaluated_globals(snapshot):
 
 
 class LocalRunmanager:
-    """Prepare concrete requests and submit them once through one local gateway."""
+    """Read state and preview changes using the legacy local gateway."""
 
     def __init__(self, gateway=None, port=None):
         self._gateway = gateway
@@ -195,73 +195,4 @@ class LocalRunmanager:
         return request
 
     def execute(self, request):
-        return self._execute(request)
-
-    def _execute(self, request, *, restore=False):
-        if not isinstance(request, dict):
-            raise ValueError("Expected an explicit prepared request for this local Runmanager")
-        action = request.get("action")
-        if (
-            request.get("schema") != REQUEST_SCHEMA
-            or request.get("execute") is not True
-            or request.get("expected_endpoint") != self.endpoint
-            or action not in CONFIG_ACTIONS | {"engage_once"}
-            or not request.get("request_id")
-        ):
-            raise ValueError("Expected an explicit prepared request for this local Runmanager")
-        if action == "apply_globals" and not restore:
-            for expression in request["plan"]["changes"].values():
-                _check_raw_expression(expression)
-        receipt = self.gateway.call("runmanager", request)
-        if not isinstance(receipt, dict) or not (
-            receipt.get("schema") == SNAPSHOT_SCHEMA
-            and receipt.get("request_id") == request["request_id"]
-            and receipt.get("operation") == action
-        ):
-            raise RunmanagerGatewayError("Runmanager returned an unbound receipt. Reconcile before retrying.", receipt)
-        expected_state = ENGAGE_ACK if action == "engage_once" else APPLIED
-        if receipt.get("state") != expected_state:
-            raise RunmanagerGatewayError(
-                f"Runmanager returned {receipt.get('state')}. Check the receipt before retrying.", receipt
-            )
-        try:
-            before = _checked_snapshot(receipt.get("before"))
-            if action == "engage_once":
-                valid = self._engage_receipt_matches(request, receipt, before)
-            else:
-                after = _checked_snapshot(receipt.get("after"))
-                valid = (
-                    receipt.get("engage_calls") == 0
-                    and before["config_digest"] == request["plan"]["baseline_digest"]
-                    and _config(after) == request["plan"]["target"]
-                    and not after["error_in_globals"]
-                )
-        except RunmanagerGatewayError:
-            valid = False
-        if not valid:
-            raise RunmanagerGatewayError("Runmanager readback differs from the plan. Reconcile before retrying.", receipt)
-        return receipt
-
-    @staticmethod
-    def _engage_receipt_matches(request, receipt, before):
-        return (
-            receipt.get("engage_calls") == 1
-            and receipt.get("expected_n_shots") == request["expected_n_shots"]
-            and before["n_shots"] == request["expected_n_shots"]
-            and before["config_digest"] == request["expected_config_digest"]
-            and before["run"] is True
-            and not before["error_in_globals"]
-        )
-
-    def _restore_globals(self, verified_write):
-        """Restore original expressions read from Runmanager during a verified write."""
-        prior = verified_write["request"]["plan"]
-        after = verified_write["receipt"]["after"]
-        restore = {}
-        for item in prior["diff"]:
-            suffix = item["expected_after"][len(item["submitted_raw"]):]
-            restore[item["name"]] = item["before"][:-len(suffix)] if suffix else item["before"]
-        request = self._prepare("apply_globals", restore, snapshot=after, restore=True)
-        if request["plan"]["target"] != prior["baseline"]:
-            raise ValueError("Runmanager rollback did not reproduce the exact previous configuration")
-        return self._execute(request, restore=True)
+        raise PermissionError("Legacy Runmanager plans cannot execute; use a managed labpilot A2/A3 task")
