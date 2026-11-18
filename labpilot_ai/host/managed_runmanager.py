@@ -131,6 +131,7 @@ def manage_engage(server, profile, params, deadline=None):
         raise Refused("Managed Engage request expired before native queue submission")
     batches.phase(key, "RESTORED_AWAITING_QUEUE")
     put(payload[0])
+    app.ui.pushButton_abort.setEnabled(True)
     batches.phase(key, "ACCEPTED_AND_RESTORED")
     return {"protocol": BATCH_PROTOCOL, "batch_id": key, "config_digest": batch["config_digest"],
             "batch_root": output, "expected_n_shots": batch["expected_n_shots"],

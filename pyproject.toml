@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.3.0"
+version = "0.3.1"
 description = "Industrial AI copilot for labscript-suite experiments: voice commands, runmanager/BLACS/lyse control, optimization, Knowledge, Co-Sequence, and supervised logs."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -50,6 +50,9 @@ labpilot-blacs-real-bridge-info = "labpilot_ai.blacs_bridge.plugin:diagnostic_ma
 [tool.setuptools.packages.find]
 include = ["labpilot_ai*"]
 exclude = ["configs*", "plugins*", "tests*", "examples*"]
+
+[tool.setuptools.data-files]
+"share/labpilot" = ["tools/controller_one_shot.ps1", "manual/controller_one_shot.md"]
 
 [tool.setuptools.package-data]
 labpilot_ai = [

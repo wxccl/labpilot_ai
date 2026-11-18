@@ -138,6 +138,7 @@ def complete_shot(path):
 def test_native_managed_output_is_restored_before_compile_payload(managed):
     profile, server, params = managed
     accepted = manage_engage(server, profile, params)
+    assert server.app.ui.pushButton_abort.isEnabled()
     assert accepted["configuration_restored"] is True
     assert server.app.ui.lineEdit_shot_output_folder.text() == server.app.get_default_output_folder()
     _, outputs, count, *_ = server.app.compile_queue.get_nowait()
@@ -171,6 +172,7 @@ def test_restore_failure_never_enqueues_native_payload(managed, monkeypatch):
     with pytest.raises(RuntimeError, match="restoration"):
         manage_engage(server, profile, params)
     assert server.app.compile_queue.empty()
+    assert not server.app.ui.pushButton_abort.isEnabled()
     evidence = NativeBatches(profile).observe(params["request_id"])
     assert evidence["native_batch_phase"] == "CAPTURE_OR_RESTORE_FAILED"
     assert "batch_execution_complete" not in evidence

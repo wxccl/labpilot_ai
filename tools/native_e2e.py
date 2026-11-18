@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack, closing
 import hashlib
-from importlib import metadata, util
+from importlib import metadata
 import inspect
 import json
 import os
@@ -24,7 +24,14 @@ def ports(count, fixed=()):
     with ExitStack() as stack:
         sockets = [stack.enter_context(closing(socket.socket())) for _ in range(count + len(fixed))]
         for index, sock in enumerate(sockets):
-            sock.bind(("127.0.0.1", fixed[index] if index < len(fixed) else 0))
+            port = fixed[index] if index < len(fixed) else 0
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError as exc:
+                if port:
+                    raise RuntimeError(f"Native test requires free loopback port {port} for its own zlog server; "
+                                       "use a separate idle test machine or VM") from exc
+                raise
         return [sock.getsockname()[1] for sock in sockets[len(fixed):]]
 
 
@@ -77,19 +84,24 @@ def setup(root):
 
     if Path(LABSCRIPT_SUITE_PROFILE).resolve() != expected_suite:
         raise RuntimeError("Native test requires the interpreter to select the isolated Labscript profile")
-    spec = util.find_spec("blacs")
-    if spec is None or not spec.submodule_search_locations:
-        raise RuntimeError("Native test requires a packaged BLACS installation")
+    zlock_port, blacs_port, rm_port, lyse_port, viewer_port, process_port = ports(6, (log_port,))
     isolated = root / "application-packages"
-    shutil.copytree(next(iter(spec.submodule_search_locations)), isolated / "blacs",
-                    ignore=shutil.ignore_patterns("__pycache__", "labpilot_host"))
+    distribution = metadata.distribution("blacs")
+    for entry in distribution.files or ():
+        if (entry.parts[0] != "blacs" or ".." in entry.parts or "__pycache__" in entry.parts
+                or entry.parts[:3] == ("blacs", "plugins", "labpilot_host")):
+            continue
+        destination = isolated / entry
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(distribution.locate_file(entry), destination)
+    if not (isolated / "blacs" / "__main__.py").is_file():
+        raise RuntimeError("Native test requires BLACS with a packaged file inventory")
     sys.path.insert(0, str(isolated))
     os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, (str(isolated), os.environ.get("PYTHONPATH"))))
     if "apparatus_name" in inspect.signature(create_profile).parameters:
         create_profile(apparatus_name="labpilot_virtual", compile_table=False)
     else:
         create_profile()
-    zlock_port, blacs_port, rm_port, lyse_port, viewer_port, process_port = ports(6, (log_port,))
     labconfig = default_labconfig_path()
     import configparser
 
@@ -278,6 +290,14 @@ def main():
     parser.add_argument("--timeout", default=90, type=float)
     args = parser.parse_args()
     directory = args.directory.resolve()
+    isolated_env = {"LABSCRIPT_SUITE_PROFILE": str(directory / "labscript-suite"), "PYTHONNOUSERSITE": "1"}
+    if os.name == "nt":
+        isolated_env["USERPROFILE"] = str(directory)
+    if any(os.environ.get(key) != value for key, value in isolated_env.items()):
+        return subprocess.run([sys.executable, "-X", "utf8", str(Path(__file__).resolve()), *sys.argv[1:]],
+                              env={**os.environ, **isolated_env}).returncode
+    if directory.exists():
+        parser.error("Choose a new directory; a previous test directory is never reused")
     directory.mkdir()
     if not args.installed:
         source_root = str(Path(__file__).resolve().parents[1])
