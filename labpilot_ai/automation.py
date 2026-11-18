@@ -13,7 +13,7 @@ import uuid
 from .local_control.transport import load_json
 
 ACTION_NAMES = {
-    "runmanager": {"set_globals", "set_sequence", "set_output", "set_flags", "engage"},
+    "runmanager": {"set_globals", "restore_globals", "set_sequence", "set_output", "set_flags", "engage"},
     "blacs": {"set_manual"},
 }
 
@@ -121,6 +121,14 @@ class Automation:
         self.service = TaskService(self.store, self.host, analysis=analysis)
         root = config.get("project_root")
         self.project_root = path_setting(self.profile, root) if root else None
+
+    def prepare_engage(self, expected_n_shots):
+        return self.dispatch("prepare", {"target": "runmanager", "action": "engage",
+                                         "expected_n_shots": expected_n_shots})
+
+    def prepare_restore_globals(self, original_request_id):
+        return self.dispatch("prepare", {"target": "runmanager", "action": "restore_globals",
+                                         "values": {"original_request_id": original_request_id}})
 
     def dispatch(self, operation, args):
         if operation == "status":

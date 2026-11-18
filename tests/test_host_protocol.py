@@ -68,6 +68,50 @@ def test_simulation_rejects_stale_or_untyped_blacs_changes(simulated):
     }
 
 
+def test_restore_requires_original_success_and_exact_poststate(simulated):
+    before = simulated("snapshot", target="runmanager")["value"]
+    result = simulated("execute", target="runmanager", action="set_globals", request_id="source",
+                       expected_snapshot_sha256=before["snapshot_sha256"], values={"dummy": 3})
+    after = result["value"]["after"]
+    params = dict(target="runmanager", action="restore_globals", expected_snapshot_sha256=after["snapshot_sha256"])
+    assert simulated("execute", **params, request_id="invented", values={"dummy": "np.arange(5)"})["state"] == "REFUSED"
+    assert simulated("execute", **params, request_id="missing", values={"original_request_id": "other"})["state"] == "REFUSED"
+    restored = simulated("execute", **params, request_id="undo", values={"original_request_id": "source"})
+    assert restored["value"]["after"] == before
+    drift = simulated("execute", **{**params, "expected_snapshot_sha256": before["snapshot_sha256"]},
+                      request_id="drifted", values={"original_request_id": "source"})
+    assert drift["state"] == "REFUSED"
+
+
+def test_native_restore_preserves_scan_and_one_trailing_comment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from labpilot_ai.host.protocol import Journal, receipt
+    monkeypatch.setitem(sys.modules, "runmanager", SimpleNamespace(
+        find_comments=lambda text: [(text.index("#"), len(text))] if "#" in text else []))
+    config = tmp_path / "profile.json"
+    config.write_text('{"host":{"runmanager":{"enabled":true,"allow":["set_globals","restore_globals"]}}}')
+    profile = Profile(config)
+
+    class Scan(FakeRunmanager):
+        expression = "np.arange(5) # scan"
+        def get_globals(self, raw=False):
+            return {"dummy": self.expression} if raw else dict(dummy=list(range(5)) if "arange" in self.expression else 0)
+        def set_globals(self, values, raw=False):
+            self.expression = (values["dummy"] if raw else repr(values["dummy"])) + "# scan"
+
+    client = Scan(tmp_path)
+    adapter = Runmanager(profile, client=client)
+    before = adapter.snapshot({})
+    params = dict(action="set_globals", values={"dummy": 0}, expected_snapshot_sha256=before["snapshot_sha256"])
+    journal = Journal(profile.state_db)
+    journal.reserve("source", "runmanager", params)
+    applied = adapter.execute(params)
+    journal.store("source", receipt("APPLIED", request_id="source", value=applied))
+    restored = adapter.execute(dict(action="restore_globals", values={"original_request_id":"source"},
+                                    expected_snapshot_sha256=applied["after"]["snapshot_sha256"]))
+    assert restored["after"] == before
+
+
 @pytest.mark.parametrize("raw", [b"[main]\r\nkey=1", b"[BLACS/plugins]\r\nold = True\r\n[main]\r\nkey=1\r\n"])
 def test_installer_preview_apply_idempotency_and_exact_uninstall(tmp_path, monkeypatch, raw):
     config = tmp_path / "labconfig.ini"

@@ -25,10 +25,16 @@ def save_plan(path, target, request):
 def parser():
     cli = argparse.ArgumentParser(prog="labpilot-control", description=__doc__)
     commands = cli.add_subparsers(dest="command", required=True)
-    for action in ("discover", "queue", "globals", "metadata"):
+    for action in ("discover", "queue", "preflight", "globals", "metadata"):
         commands.add_parser(action, help=f"Read {action} from the local runtime")
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("device")
+    queue = commands.add_parser("prepare-queue", help="Prepare an idle, empty site queue setting change")
+    queue.add_argument("setting", choices=("pause", "repeat"))
+    queue.add_argument("value", type=load_json)
+    queue.add_argument("--approver", required=True)
+    queue.add_argument("--instruction", required=True)
+    queue.add_argument("--output", type=Path, required=True)
     manual = commands.add_parser("prepare-manual", help="Prepare one BLACS channel change")
     manual.add_argument("device")
     manual.add_argument("channel")
@@ -65,6 +71,11 @@ def dispatch(args, gateway):
         return blacs.discover()
     if command == "queue":
         return blacs.queue_status()
+    if command == "preflight":
+        return blacs.preflight()
+    if command == "prepare-queue":
+        return save_plan(args.output, "blacs", blacs.prepare_queue(
+            args.setting, args.value, approver=args.approver, instruction=args.instruction))
     if command == "snapshot":
         return blacs.snapshot(args.device)
     if command == "globals":
@@ -95,6 +106,8 @@ def dispatch(args, gateway):
     if not isinstance(envelope, dict) or set(envelope) != {"target", "request"} or not isinstance(envelope["request"], dict):
         raise ValueError("Expected a LabPilot plan with target and request")
     if envelope["target"] == "blacs":
+        if envelope["request"].get("action") in ("queue.pause", "queue.repeat"):
+            return blacs.apply_queue(envelope["request"])
         return blacs.apply_manual(envelope["request"])
     if envelope["target"] == "runmanager":
         return runmanager.execute(envelope["request"])

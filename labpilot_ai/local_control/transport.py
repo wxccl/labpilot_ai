@@ -17,6 +17,21 @@ READ_ACTIONS = {
     "runmanager": {"read_all", "snapshot", "plan"},
 }
 
+SITE_CODES = {
+    "OWNER_INSTRUCTION_REFERENCE_REQUIRED", "EXPLICIT_QUEUE_PAUSE_REQUIRED_FOR_STATIC_WRITE",
+    "READBACK_MISMATCH_RECONCILIATION_REQUIRED", "RESULT_REQUEST_BINDING_MISMATCH_NO_REPLAY",
+}
+
+
+def site_diagnostic(result):
+    for name in ("error", "reason"):
+        code = result.get(name)
+        if isinstance(code, str) and code in SITE_CODES:
+            return code
+    if result.get("error_type") == "FileExistsError":
+        return "FileExistsError"
+    return None
+
 
 def local_gateway_enabled():
     return os.getenv("LABPILOT_CONTROL_MODE", "").strip().lower() == MODE
@@ -114,7 +129,24 @@ class LocalGateway:
             return previous_result
         result = self._exchange(raw, request_id)
         if result.get("request_id") != request_id:
-            result = self._unknown(request_id, "Gateway did not bind its response to the write. Reconcile before retrying.")
+            diagnostic = site_diagnostic(result)
+            result = self._unknown(request_id, "Gateway did not bind its response to the write. Reconcile the original operation.")
+            if diagnostic:
+                result["unverified_site_diagnostic"] = diagnostic
+        elif result.get("state") == "UNKNOWN" and result.get("reason") == "RESULT_REQUEST_BINDING_MISMATCH_NO_REPLAY":
+            result["no_automatic_retry"] = True
+            code = self._outbox_diagnostic(request_id)
+            if code:
+                result["unverified_site_diagnostic"] = code
+        elif result.get("state") == "REFUSED":
+            request = load_json(raw)["request"]
+            digest = hashlib.sha256(json.dumps(request, ensure_ascii=True, sort_keys=True,
+                                               separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+            if result.get("request_sha256") != digest:
+                code = site_diagnostic(result)
+                result = self._unknown(request_id, "RESULT_REQUEST_BINDING_MISMATCH_NO_REPLAY")
+                if code:
+                    result["unverified_site_diagnostic"] = code
         try:
             with result_path.open("x", encoding="utf-8") as stream:
                 json.dump(result, stream, ensure_ascii=True, allow_nan=False)
@@ -123,6 +155,20 @@ class LocalGateway:
         except OSError:
             return self._unknown(request_id, "Could not save the gateway result. Reconcile the original operation.")
         return result
+
+    def _outbox_diagnostic(self, request_id):
+        # Only surface a known error code; an unbound outbox never establishes outcome.
+        try:
+            with (self.gateway_path.parent / "outbox" / (request_id + ".json")).open("rb") as stream:
+                raw = stream.read(65537)
+            if len(raw) <= 65536:
+                reply = load_json(raw)
+                if (isinstance(reply, dict) and reply.get("request_id") == request_id
+                        and reply.get("state") in ("REFUSED", "UNKNOWN")):
+                    return site_diagnostic(reply)
+        except (ValueError, OSError, RecursionError):
+            pass
+        return None
 
     @staticmethod
     def _unknown(request_id, reason):

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import os
 import re
 import uuid
 
@@ -13,6 +14,12 @@ _SNAPSHOT_FIELDS = (
     "family", "channels", "front_panel", "last_programmed_values", "register_readback",
 )
 _MANUAL_FAMILIES = {"NI_DAQMX_OUTPUT", "NOVATECH_DDS9M"}
+
+
+def _check_operator(approver):
+    expected = os.getenv("LABPILOT_SITE_APPROVER")
+    if expected and expected != approver:
+        raise ValueError("OWNER_INSTRUCTION_REFERENCE_REQUIRED: approver differs from local site setting")
 
 
 def _digest(value):
@@ -105,6 +112,77 @@ class LocalBlacs:
     def queue_status(self):
         return _observed(self.gateway.read_blacs("queue.status"), "queue.status")
 
+    @staticmethod
+    def _queue_digest(queue):
+        fields = ("host_generation", "queue_generation", "status", "paused", "repeat", "queued_count", "running_shot")
+        if not isinstance(queue, dict) or not all(key in queue for key in fields):
+            raise ValueError("Incomplete site queue snapshot")
+        if (type(queue["queued_count"]) is not int or queue["queued_count"] < 0 or
+                type(queue["paused"]) is not bool or type(queue["repeat"]) is not bool or
+                queue.get("queue_sha256") != _digest({key: queue[key] for key in fields})):
+            raise ValueError("Invalid queue state or digest")
+        return queue["queue_sha256"]
+
+    def preflight(self):
+        site = self.discover()
+        queue = site.get("queue")
+        self._queue_digest(queue)
+        now = datetime.now(timezone.utc)
+        if not -5 <= (now - _timestamp(queue.get("observed_at_utc"))).total_seconds() <= 60:
+            raise ValueError("Queue snapshot expired")
+        if (not re.fullmatch(r"[0-9a-f]{32}", str(site.get("host_generation"))) or
+                site["host_generation"] != queue["host_generation"] or
+                not re.fullmatch(r"[0-9a-f]{64}", str(site.get("connection_sha256")))):
+            raise ValueError("Queue snapshot is not bound to this host and connection table")
+        idle = (queue["queued_count"] == 0 and queue["running_shot"] == "" and
+                queue["status"] in (("Idle", "Queue paused") if queue["paused"] else ("Idle",)))
+        return {"queue": queue, "connection_sha256": site["connection_sha256"], "idle_empty": idle,
+                "static_queue_ready": idle and queue["paused"] and not queue["repeat"],
+                "local_approver_check_configured": bool(os.getenv("LABPILOT_SITE_APPROVER")),
+                "identity_check": "site-enforced at apply; supplied name is not authentication"}
+
+    def prepare_queue(self, setting, value, *, approver, instruction):
+        if setting not in ("pause", "repeat") or type(value) is not bool:
+            raise ValueError("Queue plan needs pause/repeat and a JSON boolean")
+        if any(not isinstance(item, str) or not item.strip() for item in (approver, instruction)):
+            raise ValueError("Site approver and operator instruction required")
+        state = self.preflight()
+        _check_operator(approver)
+        queue = state["queue"]
+        key = "paused" if setting == "pause" else "repeat"
+        if not state["idle_empty"] or queue[key] == value:
+            raise ValueError("Queue change requires an idle empty queue and an actual change")
+        now = datetime.now(timezone.utc)
+        return {"schema": "rbbec-unified/1", "action": "queue." + setting, "request_id": uuid.uuid4().hex,
+                "issued_at_utc": now.isoformat(), "expires_at_utc": (now + timedelta(seconds=60)).isoformat(),
+                "expected_host_generation": queue["host_generation"], "connection_sha256": state["connection_sha256"],
+                "approval_context": {"approver": approver, "instruction": instruction},
+                "payload": {"expected_queue_sha256": queue["queue_sha256"], "expected": queue[key], "value": value}}
+
+    def apply_queue(self, request):
+        action = request.get("action")
+        if action not in ("queue.pause", "queue.repeat") or request.get("schema") != "rbbec-unified/1":
+            raise ValueError("Expected a prepared queue change")
+        payload = request["payload"]
+        _check_operator(request["approval_context"]["approver"])
+        if type(payload.get("value")) is not bool or type(payload.get("expected")) is not bool or payload["expected"] == payload["value"]:
+            raise ValueError("Invalid prepared queue transition")
+        result = self.gateway.call("blacs", request)
+        if result.get("state") == "APPLIED":
+            key = "paused" if action == "queue.pause" else "repeat"
+            after = result.get("value")
+            try:
+                self._queue_digest(after)
+                valid = (result.get("schema") == "rbbec-unified-result/1" and result.get("action") == action and
+                         result.get("request_id") == request["request_id"] and result.get("request_sha256") == _digest(request) and
+                         after["host_generation"] == request["expected_host_generation"] and after[key] is payload["value"])
+            except ValueError:
+                valid = False
+            if not valid:
+                return {"state": "UNKNOWN", "reason": "Queue receipt does not bind the plan and readback",
+                        "request_id": request["request_id"], "no_automatic_retry": True}
+        return result
+
     def snapshot(self, device):
         if type(device) is not str or not device.strip():
             raise ValueError("An exact BLACS device name is required")
@@ -143,6 +221,7 @@ class LocalBlacs:
         """Prepare one request from a fresh exact snapshot without contacting BLACS."""
         if any(type(text) is not str or not text.strip() for text in (approver, instruction)):
             raise ValueError("An explicit approver and actual operator instruction are required")
+        _check_operator(approver)
         if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 120:
             raise ValueError("BLACS request lifetime must be 1 to 120 seconds")
         if type(snapshot) is not dict or not set(_SNAPSHOT_FIELDS).issubset(snapshot):
@@ -191,6 +270,7 @@ class LocalBlacs:
         if (not isinstance(request, dict) or request.get("schema") != "rbbec-unified/1" or
                 request.get("action") != "manual.apply"):
             raise ValueError("A prepared BLACS manual.apply request is required")
+        _check_operator(request["approval_context"]["approver"])
         result = self.gateway.call("blacs", request)
         if result.get("state") == "APPLIED":
             payload = request["payload"]

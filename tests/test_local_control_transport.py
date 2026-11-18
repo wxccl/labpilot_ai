@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -129,6 +130,49 @@ def test_timeout_is_durable_and_never_replayed(fake_gateway):
     assert result["no_automatic_retry"] is True
     assert fake_gateway.call("blacs", request) == result
     assert len(invocations(fake_gateway)) == 1
+
+
+@pytest.mark.parametrize("variant,expected", [
+    ("unbound", "FileExistsError"), ("outbox", "OWNER_INSTRUCTION_REFERENCE_REQUIRED"),
+    ("wrong_outbox", None), ("raw_refusal", "EXPLICIT_QUEUE_PAUSE_REQUIRED_FOR_STATIC_WRITE"),
+])
+def test_preserve_only_diagnostic_not_unbound_outcome(fake_gateway, variant, expected):
+    if variant == "unbound":
+        reply = {"state": "UNKNOWN", "error_type": "FileExistsError", "reason": "private local path"}
+    elif variant == "raw_refusal":
+        reply = {"state": "REFUSED", "request_id": REQUEST_ID, "error": expected}
+    else:
+        reply = {"state": "UNKNOWN", "request_id": REQUEST_ID, "reason": "RESULT_REQUEST_BINDING_MISMATCH_NO_REPLAY"}
+        outbox = fake_gateway.gateway_path.parent / "outbox"
+        outbox.mkdir()
+        (outbox / (REQUEST_ID + ".json")).write_text(json.dumps({
+            "request_id": REQUEST_ID if variant == "outbox" else "b" * 32, "state": "REFUSED",
+            "error": "OWNER_INSTRUCTION_REFERENCE_REQUIRED", "private": "private local path",
+        }))
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess([], 0, b"RBBEC_JSON:" + json.dumps(reply).encode(), b"")
+
+    fake_gateway.runner = runner
+    result = fake_gateway.call("blacs", write_request())
+    assert result["state"] == "UNKNOWN" and result["no_automatic_retry"] is True
+    assert result.get("unverified_site_diagnostic") == expected
+    assert "private local path" not in json.dumps(result)
+    assert fake_gateway.call("blacs", write_request()) == result
+    assert calls == [1]
+
+
+def test_hash_bound_refusal_remains_authoritative(fake_gateway):
+    request = write_request()
+    encoded = json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    refused = {"state": "REFUSED", "request_id": REQUEST_ID, "request_sha256": hashlib.sha256(encoded).hexdigest(),
+               "error": "OWNER_INSTRUCTION_REFERENCE_REQUIRED"}
+    fake_gateway.runner = lambda *args, **kwargs: subprocess.CompletedProcess(
+        [], 0, b"RBBEC_JSON:" + json.dumps(refused).encode(), b""
+    )
+    assert fake_gateway.call("blacs", request) == refused
 
 
 @pytest.mark.parametrize("mode", ["duplicate", "wrong_id", "ambiguous"])

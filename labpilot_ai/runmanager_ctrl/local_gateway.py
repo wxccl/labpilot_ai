@@ -146,6 +146,9 @@ class LocalRunmanager:
             "apply_globals", {name: raw_expression(value) for name, value in values.items()}, snapshot=snapshot
         )
 
+    def prepare_engage(self, expected_n_shots, *, snapshot=None):
+        return self.prepare("engage_once", snapshot=snapshot, expected_n_shots=expected_n_shots)
+
     def prepare(self, operation, changes=None, *, snapshot=None, expected_n_shots=None):
         return self._prepare(operation, changes, snapshot=snapshot, expected_n_shots=expected_n_shots)
 

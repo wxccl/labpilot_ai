@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from .native_batch import BATCH_PROTOCOL
-from .protocol import Refused, RUN_ACTIONS, canonical, require_snapshot, snapshot
+from .protocol import Journal, Refused, RUN_ACTIONS, canonical, request_id, require_snapshot, snapshot
 
 
 FLAGS = {"run": "run_shots", "view": "view_shots", "shuffle": "shuffle"}
@@ -45,6 +45,19 @@ def run_values(action, params, before, max_shots):
         if set(values) != {field} or type(values[field]) is not str or not values[field].strip():
             raise Refused(f"A single {field} path is required")
     return values
+
+
+def restore_record(journal, values, current, profile_sha256=None):
+    if set(values) != {"original_request_id"}:
+        raise Refused("Restore accepts only an original set_globals request ID")
+    key = request_id({"request_id": values["original_request_id"]})
+    original = journal.observe(key, "runmanager") or {}
+    result = original.get("value", {})
+    if (original.get("state") != "APPLIED" or original.get("request_id") != key
+            or not result.get("restore_baseline") or result.get("restore_profile_sha256") != profile_sha256
+            or result.get("after", {}).get("snapshot_sha256") != current["snapshot_sha256"]):
+        raise Refused("No matching recorded set_globals baseline, or configuration has drifted")
+    return result["restore_baseline"]
 
 
 def blacs_values(params, before):
@@ -90,6 +103,11 @@ class Simulator:
             raise Refused("Unsupported simulated action")
         evidence = {"simulated": True}
 
+        baseline = {}
+        restored = None
+        if action == "restore_globals":
+            restored = restore_record(self.journal, action_values(params), self.snapshot(params))
+
         def change(state):
             before = snapshot(state)
             require_snapshot(params, before)
@@ -105,15 +123,18 @@ class Simulator:
                                     quality="UNKNOWN", terminal="COMPLETED")
                 return state
             if action == "set_globals":
+                baseline.update(before)
                 merged = {**state["globals"], **values}
                 return {**state, "globals": merged, "globals_raw": {key: repr(value) for key, value in merged.items()},
                         "n_shots": math.prod(len(value) for value in merged.values() if isinstance(value, list))}
+            if action == "restore_globals":
+                return {key: value for key, value in restored.items() if key != "snapshot_sha256"}
             if action == "set_flags":
                 return {**state, "flags": {**state["flags"], **values}}
             return {**state, **values}
 
         state = self.journal.simulated_state(self.target, self.default, change)
-        return {"after": snapshot(state), "evidence": evidence}
+        return {"after": snapshot(state), "evidence": evidence, **({"restore_baseline": baseline} if baseline else {})}
 
 
 def evaluated(value):
@@ -270,6 +291,22 @@ class Runmanager:
             return {"evidence": {**evidence, "native_acknowledged": True}, "expected_n_shots": before["n_shots"]}
         if action == "set_globals":
             native_ack(rm.set_globals, values, raw=False)
+        elif action == "restore_globals":
+            from runmanager import find_comments
+
+            baseline = restore_record(Journal(self.profile.state_db), values, before, self.profile.sha256)
+            raw = {}
+            for name, previous in baseline["globals_raw"].items():
+                current = before["globals_raw"][name]
+                if current == previous:
+                    continue
+                comments = find_comments(current)
+                suffix = current[comments[-1][0]:] if comments and comments[-1][1] == len(current) else ""
+                if suffix and not previous.endswith(suffix):
+                    raise Refused("Cannot preserve the current Runmanager trailing comment exactly")
+                raw[name] = previous[:-len(suffix)] if suffix else previous
+            if raw:
+                native_ack(rm.set_globals, raw, raw=True)
         elif action == "set_flags":
             for key, value in values.items():
                 native_ack(getattr(rm, f"set_{FLAGS[key]}"), value)
@@ -285,9 +322,14 @@ class Runmanager:
         if action == "set_globals":
             if not verified_globals(before, after, values):
                 raise RuntimeError("Runmanager globals readback differs from the requested values")
+        elif action == "restore_globals":
+            if after["snapshot_sha256"] != baseline["snapshot_sha256"]:
+                raise RuntimeError("Restored configuration differs from its recorded baseline; reconcile without retry")
         elif action == "set_flags":
             if after["flags"] != {**before["flags"], **values}:
                 raise RuntimeError("Runmanager flags readback differs from the requested values")
         elif after[field] != value:
             raise RuntimeError("Runmanager path readback differs from the requested value")
-        return {"after": after, "evidence": {**evidence, "configuration_readback": True}}
+        return {"after": after, "evidence": {**evidence, "configuration_readback": True},
+                **({"restore_baseline": before, "restore_profile_sha256": self.profile.sha256}
+                   if action == "set_globals" else {})}

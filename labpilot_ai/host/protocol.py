@@ -11,7 +11,7 @@ import sqlite3
 
 MAX_BYTES = 4 * 1024 * 1024
 RESULT_SCHEMA = "labpilot-host-result/1"
-RUN_ACTIONS = {"set_globals", "set_sequence", "set_output", "set_flags", "engage"}
+RUN_ACTIONS = {"set_globals", "restore_globals", "set_sequence", "set_output", "set_flags", "engage"}
 
 
 class Refused(ValueError):

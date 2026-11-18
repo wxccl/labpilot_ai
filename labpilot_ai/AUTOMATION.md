@@ -49,7 +49,7 @@ labpilot events TASK_ID
       "sequence_root": "D:/experiment",
       "output_root": "D:/experiment-data",
       "batch_root": "D:/experiment-data/labpilot-batches",
-      "allow": ["set_globals", "set_sequence", "set_output", "set_flags", "engage"],
+      "allow": ["set_globals", "restore_globals", "set_sequence", "set_output", "set_flags", "engage"],
       "max_shots": 100
     },
     "blacs": {
@@ -127,3 +127,20 @@ A2 用 `approve` 批准当前任务。A3 将一个或多个已审阅任务的 `s
 DeepSeek 使用进程环境中的 `DEEPSEEK_API_KEY`。运行 `labpilot deepseek --model YOUR_MODEL "检查实验状态"`，以官方账号实际可用的模型名替换 `YOUR_MODEL`。
 
 `draft-code` 为指定文件范围生成独立 Git worktree 和任务说明。可以将该目录交给 Codex 修改，并使用 `collect-draft` 收集待审核补丁。安装、启用适配器与部署需按实际站点流程处理。
+### Restoring the exact prior Runmanager scan
+
+Use the same reviewed profile and host database throughout. Both `set_globals` and
+`restore_globals` must be allowed before starting. Save the original snapshot and the
+request ID of the managed, successfully applied `set_globals` task. After the shot
+is verified and its output path and other settings are back at that task's post-write
+configuration, prepare a new task using this JSON with the real request ID:
+
+    {"target":"runmanager","action":"restore_globals","values":{"original_request_id":"REPLACE_WITH_REQUEST_ID"}}
+
+Review, approve and run that task through the normal ledger. The host retrieves the
+exact pre-write expressions and comments from its own receipt, verifies the full
+post-write configuration still matches, then verifies the restored snapshot digest.
+An old, missing, ambiguous or mismatched receipt requires reconciliation. Never pass
+a saved expression as a string literal to `set_globals`; it would be quoted.
+Python callers can use `Automation.prepare_engage(expected_n_shots=1)` and
+`Automation.prepare_restore_globals(original_request_id)`; both prepare tasks only.
