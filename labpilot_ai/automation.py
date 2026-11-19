@@ -103,6 +103,7 @@ class Automation:
             raise ValueError(f"Labscript interpreter does not exist: {python}")
         self.simulate = simulate
         self.host = HostClient(self.profile, python, simulate, hashlib.sha256(source).hexdigest())
+        self.batch_root = config.get("host", {}).get("runmanager", {}).get("batch_root")
         mode = "simulation" if simulate else "live"
         db = path_setting(self.profile, config.get("state_db", self.profile.stem + ".tasks.sqlite3"))
         # A changed host profile must not execute plans approved for another configuration.
@@ -131,6 +132,36 @@ class Automation:
                                          "values": {"original_request_id": original_request_id}})
 
     def dispatch(self, operation, args):
+        if operation in {"context", "preflight"}:
+            from .host.preflight import capability_report
+
+            requirements = args.get("require", [])
+            discovery = self.host.call("discover", {})
+            analyzer = self.service.analysis
+            result = capability_report(discovery, [requirements] if isinstance(requirements, str) else requirements,
+                                       quality_rules_configured=bool(analyzer and analyzer.rules))
+            if operation == "preflight":
+                return result
+            rm = self.host.call("snapshot", {"target": "runmanager"})
+            active = rm.get("value", {}) if rm.get("state") == "OBSERVED" else {}
+            follow = self.batch_root == "@runmanager_output"
+            batch_parent = (active.get("output") if follow else
+                            str(path_setting(self.profile, self.batch_root)) if self.batch_root else None)
+            return {"schema": "labpilot-context/1", "state": "OBSERVED" if active and result["state"] == "OBSERVED" else "UNKNOWN",
+                    "profile_sha256": self.host.profile_sha256, "simulated": self.simulate,
+                    "runmanager": {"state": rm.get("state"), "reason": rm.get("reason"),
+                                   **{key: active.get(key) for key in ("sequence", "sequence_sha256", "output",
+                                       "snapshot_sha256", "n_shots", "flags", "errors")}},
+                    "batch_output_policy": "runmanager_output" if follow else "fixed" if batch_parent else "unmanaged",
+                    "configured_batch_root": self.batch_root, "selected_batch_parent": batch_parent,
+                    "analysis": {"backend": "simulation" if self.simulate else "private_copy" if analyzer else "none",
+                                 "routine": str(analyzer.routine) if analyzer else None,
+                                 "routine_sha256": analyzer.routine_sha256 if analyzer else None,
+                                 "quality_rules": analyzer.rules if analyzer else [],
+                                 "native_gui_state": "NOT_OBSERVED"},
+                    "preflight": result}
+        if operation == "events":
+            return self.store.events(args["task_id"])
         if operation == "status":
             return self.store.get(args["task_id"])
         if operation in {"discover", "snapshot"}:

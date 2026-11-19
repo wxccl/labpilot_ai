@@ -134,6 +134,12 @@ def build_catalog(task: Callable[[str, dict], Any], source_root: Path | str | No
              object_schema({"target": target, **device}, "target"))
     add_task("status", "Read the current state and evidence for a task ID.",
              object_schema({"task_id": string}, "task_id"))
+    add_task("context", "Read the active experiment sequence, output, shot count, analysis backend and capabilities.",
+             object_schema({}))
+    add_task("preflight", "Read capabilities, optionally requiring one action or runmanager.managed_binding.",
+             object_schema({"require": string}))
+    add_task("events", "Read recorded task events without submitting or observing a shot.",
+             object_schema({"task_id": string}, "task_id"))
     add_task(
         "prepare",
         "Prepare a concrete experiment plan for operator review. Preparation does not execute it.",

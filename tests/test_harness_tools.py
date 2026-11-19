@@ -25,7 +25,8 @@ def test_catalog_validates_and_exposes_only_read_and_prepare(dispatcher):
     catalog = build_catalog(task)
     names = [tool["name"] for tool in catalog.describe()]
     assert names == [
-        "experiment_discover", "experiment_snapshot", "experiment_status", "experiment_prepare",
+        "experiment_discover", "experiment_snapshot", "experiment_status", "experiment_context",
+        "experiment_preflight", "experiment_events", "experiment_prepare",
     ]
     with pytest.raises(ToolError, match="Unknown tool"):
         catalog.invoke("experiment_execute", {})

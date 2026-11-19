@@ -1,41 +1,12 @@
 # LabPilot AI
 
-**LabPilot automation** runs persistent experiment tasks through a packaged Labscript host. Start with `python -m pip install labpilot-ai` and `labpilot init` for a simulated station. The new `labpilot` CLI and optional task UI share the task database with Codex MCP and DeepSeek. See the [automation guide](https://github.com/wxccl/labpilot_ai/blob/v0.3.4/labpilot_ai/AUTOMATION.md) for simulation, site setup, approval, evidence, and compatibility.
+LabPilot connects an operator or Harness to an existing labscript-suite installation. Inspect the active sequence and output, review a finite experiment, and trace each shot from Runmanager through BLACS to its analysis report.
 
-LabPilot AI is an industrial-style local AI copilot for labscript-suite experiments. It does not modify labscript, runmanager, BLACS, or lyse internals. Instead, it wraps stable boundaries: registry whitelists, local safety validation, runmanager/BLACS/lyse adapters, HDF5-compatible data, SQLite/JSONL logs, and a PyQt5 desktop UI.
+**Start here:** [中文安装、配置、测试和使用指南](https://github.com/wxccl/labpilot_ai/blob/v0.3.5/manual/START_ZH.md) · [CLI and MCP reference](https://github.com/wxccl/labpilot_ai/blob/v0.3.5/labpilot_ai/AUTOMATION.md).
 
-The first release is designed to be safe by default: Mock LLM, Mock runmanager/BLACS, and Dry-run workflows can demonstrate the full loop before any real hardware action is enabled.
+Install with `python -m pip install --no-deps labpilot-ai==0.3.5` in an existing suite environment. Use `labpilot --profile PROFILE context` to inspect a reviewed profile. In a new empty directory, `labpilot init` creates a simulation instead. No model credential, voice service or desktop extension is needed for these commands.
 
-For a Windows PC running both LabPilot and Labscript Suite, see the [中文同机部署与 Codex 控制手册](https://github.com/wxccl/labpilot_ai/blob/v0.3.4/manual/00_local_control.md). The optional local gateway mode uses the installed Labscript host gateway through local Python and provides the `labpilot-control` JSON CLI. Mock mode remains available without Labscript.
-
-## Main Features
-
-- Industrial PyQt5 UI: Command, Runmanager, BLACS Manual, Lyse, Optimizer, Co-Sequence, Experiment Log, Protocol, Knowledge, Directory, Diagnostics, Error Center, and Settings.
-- Voice input and replies: manual recording, standby wake mode, Chinese/English transcription, CPU/GPU faster-whisper backends, scientific-term correction, microphone signal display, optional offline spoken replies, and local action summaries.
-- AI command schema: strict JSON actions using `type`, including `set_global`, `set_blacs_manual`, `engage`, `load_h5`, `run_single_lyse`, `run_multi_lyse`, `plot`, `fit`, `start_optimization`, and `generate_report`.
-- Safety layer: whitelist validation, type/range/array checks, high-risk confirmations, dry-run previews, diffs, rollback hooks, SQLite audit records, and Error Center reporting.
-- runmanager control: globals read/write, float/int/bool/array scan handling, shot preview, and engage through adapters.
-- BLACS manual workflow: mock/localhost bridge client, readonly discovery/readback (`/status`, `/channels`, `/values`), and registered manual actions gated by the SafetyValidator.
-- lyse/HDF5 workflow: H5 folder/file loading, table row/column management, original lyse `.py` script compatibility (`lyse.path`, `Run(path)`, `lyse.data()`), LabPilot module selection, result table merging, JSONL/SQLite cache, plots, fits, and reports.
-- Optimizer: grid and Bayesian ask/tell, plus supervised auto loop: set parameters, engage, wait for new H5, run checked lyse modules, evaluate objective, and continue safely.
-- Knowledge base: local SQLite FTS index over sequence code, connection table, lyse modules, labscript source, manuals, papers, and registries. Remote LLMs only receive short retrieved snippets.
-- Protocol Designer: import text/Markdown/PDF text and image paths to generate experiment-design suggestions without executing them.
-- Co-Sequence: AI-assisted restricted diffs for only the active sequence file and active connection table, with validation, backup, review, color tags, and change logs.
-- Experiment Log: daily Markdown/LaTeX/DokuWiki logs from natural-language commands, run records, optimizer/analysis records, Co-Sequence changes, errors, and Knowledge snippets.
-- Directory: the primary path console for active sequence, connection table, globals, BLACS context, lyse folders, H5 output, Knowledge sources, manuals, papers, and log folders.
-- Package templates: PyPI installs include default configs, example plugins, `label.png`, and the manual templates.
-
-Directory treats labscript path types explicitly: sequence and connection table source files are `.py`; runmanager globals are `.h5/.hdf5`; H5 output is a folder. `Detect from labscript apps` reads runmanager remote state, runmanager autoload config, and LabConfig, while `Apply to running apps` applies supported live changes back to runmanager.
-
-## First-Release Limits
-
-- LabPilot AI does not modify labscript-suite internals.
-- Co-Sequence never edits arbitrary files; it is restricted to the active sequence `.py` and active connection table `.py`.
-- Co-Sequence does not automatically run experiments after code edits.
-- lyse fitting and plotting parameters are stored in LabPilot analysis records, JSONL, SQLite, and reports. The first release does not write fitting results back into original H5 files.
-- Knowledge snippets are short context references only; LabPilot AI does not execute arbitrary source code from the Knowledge database.
-- Real runmanager/BLACS/lyse hardware workflows must be validated in the lab in stages: low-risk globals, one shot, small grid scan, then BLACS single-channel tests.
-- v0.1.3 BLACS integration is intentionally conservative: readonly discovery/readback is the first real-bridge target. Real manual writes should only be enabled after a lab-side BLACS plugin/bridge has been reviewed and staged on low-risk channels.
+Use the same profile for approval and execution. A managed BLACS completion receipt, a validated analysis result, and calibrated evidence of a physical signal are different things. Hardware and custom routines require site acceptance. The optional legacy workbench remains available for existing installations; it is not the production writer.
 
 ## Install
 

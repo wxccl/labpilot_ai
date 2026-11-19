@@ -165,12 +165,21 @@ class LyseBatchAnalysis:
 
     def __init__(self, python, config, *, base_dir, state_dir=None):
         if not isinstance(config, dict) or set(config) - {
-            "routine", "routine_sha256", "quality_rules", "timeout_s", "shots_per_observation", "max_shot_bytes"
+            "routine", "routine_sha256", "quality_rules", "timeout_s", "shots_per_observation", "max_shot_bytes", "sys_path"
         }:
             raise ValueError("Invalid Lyse analysis profile fields")
         base = Path(base_dir).resolve()
         self.python = Path(python).resolve()
         self.routine = _absolute(config.get("routine"), base)
+        paths = config.get("sys_path", [])
+        if type(paths) is not list or len(paths) > 16:
+            raise ValueError("analysis.sys_path must be a list of at most 16 trusted helper directories")
+        self.import_dirs = []
+        for entry in paths:
+            directory = _absolute(entry, base)
+            if not directory.is_dir() or directory.parent == directory or str(directory) in self.import_dirs:
+                raise ValueError("analysis.sys_path contains a missing, root, or duplicate directory")
+            self.import_dirs.append(str(directory))
         self.routine_sha256 = config.get("routine_sha256")
         if self.routine.suffix.lower() != ".py" or not isinstance(self.routine_sha256, str) or not _SHA.fullmatch(self.routine_sha256):
             raise ValueError("Lyse analysis requires a pinned Python routine SHA-256")
@@ -186,7 +195,7 @@ class LyseBatchAnalysis:
             raise ValueError("max_shot_bytes must be a positive integer")
         self.state_dir = Path(state_dir).resolve() if state_dir is not None else base / ".labpilot-analysis"
         self.profile_sha256 = _digest({"routine": str(self.routine), "routine_sha256": self.routine_sha256,
-                                      "quality_rules": self.rules})
+                                      "quality_rules": self.rules, **({"sys_path": self.import_dirs} if self.import_dirs else {})})
 
     def analyze(self, manifest, *, request_id, config_digest, expected_n_shots, prior_manifest_sha256=None):
         result = {"analysis_state": "FAILED", "quality": "UNKNOWN", "analyzed_count": 0,
@@ -273,7 +282,7 @@ class LyseBatchAnalysis:
         worker = Path(__file__).with_name("worker.py")
         params = {"shot": shot, "batch_root": manifest["batch_root"], "expected_n_shots": manifest["expected_n_shots"],
                   "routine": str(self.routine), "result_names": sorted(self.rules), "binding": binding,
-                  "max_shot_bytes": self.max_shot_bytes}
+                  "sys_path": self.import_dirs, "max_shot_bytes": self.max_shot_bytes}
         env = dict(os.environ, MPLBACKEND="Agg")
         env.pop("READTHEDOCS", None)
         completed = subprocess.run([str(self.python), "-I", "-X", "utf8", str(worker)],

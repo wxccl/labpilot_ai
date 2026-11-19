@@ -65,14 +65,21 @@ def _prepare_copy(h5py, params, staging):
         return sequence
 
 
-def _run_routine(lyse, routine, source, staging):
+def _run_routine(lyse, routine, source, staging, import_dirs=()):
     previous_main = sys.modules["__main__"]
     previous_argv = sys.argv
     previous_path = lyse.path
     previous_cwd = Path.cwd()
+    previous_search = sys.path[:]
     namespace = ModuleType("__main__")
     namespace.__file__ = str(routine)
     try:
+        for entry in import_dirs:
+            directory = Path(entry)
+            if not directory.is_dir() or directory.resolve(strict=True) != directory:
+                raise ValueError("Lyse helper directory changed since profile validation")
+            if entry not in sys.path:
+                sys.path.append(entry)
         sys.modules["__main__"] = namespace
         sys.argv = [str(routine), str(staging)]
         lyse.path = str(staging)
@@ -80,6 +87,7 @@ def _run_routine(lyse, routine, source, staging):
         with open(os.devnull, "w", encoding="utf-8") as discard, redirect_stdout(discard), redirect_stderr(discard):
             exec(compile(source, str(routine), "exec"), namespace.__dict__)
     finally:
+        sys.path[:] = previous_search
         os.chdir(previous_cwd)
         lyse.path = previous_path
         sys.argv = previous_argv
@@ -106,7 +114,7 @@ def analyze(params):
         staging = Path(directory) / Path(params["shot"]["path"]).name
         _copy_shot(h5py, params, staging)
         sequence = _prepare_copy(h5py, params, staging)
-        _run_routine(lyse, routine, source, staging)
+        _run_routine(lyse, routine, source, staging, params.get("sys_path", []))
         run = lyse.Run(str(staging), no_write=True)
         results = {name: _scalar(run.get_result(group, name)) for name in params["result_names"]}
     return {**params["binding"], "status": "COMPLETE", "results": results, "sequence_id": sequence,

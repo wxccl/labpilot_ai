@@ -4,7 +4,7 @@ from datetime import datetime
 import hashlib
 from pathlib import Path
 
-from .protocol import Journal, Refused, canonical, digest, loads
+from .protocol import Journal, Refused, canonical, digest, loads, request_id
 
 
 BATCH_PROTOCOL = "labpilot-native-batch/1"
@@ -99,7 +99,8 @@ class NativeBatches:
         self.profile = profile
         self.journal = Journal(profile.state_db)
         value = profile.runmanager.get("batch_root")
-        self.root = profile.resolve(value) if value else None
+        self.follow_output = value == "@runmanager_output"
+        self.root = profile.resolve(value) if value and not self.follow_output else None
 
     def _tables(self, db):
         db.execute("CREATE TABLE IF NOT EXISTS native_batches (id TEXT PRIMARY KEY, data TEXT NOT NULL, "
@@ -109,17 +110,23 @@ class NativeBatches:
                    "run_time TEXT, PRIMARY KEY (batch, idx))")
 
     def reserve(self, params, current):
-        key = params["request_id"]
-        if self.root is None or not self.root.is_dir():
+        key = request_id(params)
+        root = self.root
+        if self.follow_output:
+            selected = current.get("output")
+            if not isinstance(selected, str) or not Path(selected).is_absolute():
+                raise Refused("Runmanager must select an absolute output directory")
+            root = Path(selected).resolve()
+        if root is None or not root.is_dir():
             raise Refused("The managed batch_root must be an existing directory")
         output = self.profile.runmanager.get("output_root")
-        if output is None or not self.root.is_relative_to(self.profile.resolve(output)):
+        if output is None or not root.is_relative_to(self.profile.resolve(output)):
             raise Refused("Managed batch_root must be inside the approved output_root")
-        if str(self.root).startswith(("\\\\", "//")):
+        if str(root).startswith(("\\\\", "//")):
             raise Refused("Use a same-machine batch_root accessible to Runmanager and BLACS")
         sequence_path = Path(current["sequence"])
         batch = {"batch_id": key, "config_digest": current["snapshot_sha256"],
-                 "batch_root": str(self.root / key), "expected_n_shots": current["n_shots"],
+                 "batch_root": str(root / key), "expected_n_shots": current["n_shots"],
                  "script_basename": sequence_path.stem, "sequence_name": sequence_path.name,
                  "sequence_text_sha256": source_text_hash(sequence_path),
                  "globals_sha256": digest(current["globals_raw"])}
@@ -132,7 +139,7 @@ class NativeBatches:
             if db.execute("SELECT 1 FROM native_batches WHERE id=?", (key,)).fetchone():
                 raise Refused("The managed batch is already reserved")
             try:
-                (self.root / key).mkdir()
+                (root / key).mkdir()
             except FileExistsError as exc:
                 raise Refused("The dedicated batch directory already exists") from exc
             db.execute("INSERT INTO native_batches VALUES (?, ?, 'RESERVED', NULL)", (key, canonical(batch)))
@@ -149,13 +156,17 @@ class NativeBatches:
         return (loads(row[0]), row[1], row[2]) if row else (None, None, None)
 
     def _match_path(self, raw_path):
-        if self.root is None:
+        if not self.follow_output and self.root is None:
             return None, None
         raw = Path(raw_path)
         if raw.suffix.lower() != ".h5" or raw.is_symlink():
             return None, None
         path = raw.resolve()
-        if path.parent.parent != self.root:
+        if self.follow_output:
+            approved = self.profile.runmanager.get("output_root")
+            if not approved or not path.parent.parent.is_relative_to(self.profile.resolve(approved)):
+                return None, None
+        elif path.parent.parent != self.root:
             return None, None
         return path.parent.name, path
 
@@ -169,7 +180,7 @@ class NativeBatches:
         try:
             for raw_path in raw_paths:
                 matched, path = self._match_path(raw_path)
-                if matched != key or path is None:
+                if matched != key or path is None or path.parent != Path(batch["batch_root"]):
                     raise ValueError("Runmanager generated a path outside the reserved batch")
                 index, sequence, _, _ = inspect_shot(path, batch)
                 with self.journal._connect() as db:
@@ -191,7 +202,7 @@ class NativeBatches:
             return False
         with self.journal._connect() as db:
             batch, _, _ = self._get(db, key)
-            return batch is not None
+            return batch is not None and path.parent == Path(batch["batch_root"])
 
     def record(self, raw_path, stage):
         key, path = self._match_path(raw_path)
@@ -199,7 +210,7 @@ class NativeBatches:
             return
         with self.journal._connect() as db:
             batch, _, ambiguity = self._get(db, key)
-        if batch is None or ambiguity:
+        if batch is None or ambiguity or path.parent != Path(batch["batch_root"]):
             return
         try:
             index, sequence, run_time, _ = inspect_shot(path, batch, compiled=True, completed=stage == "executed")
@@ -223,7 +234,7 @@ class NativeBatches:
             raise
 
     def observe(self, key):
-        if self.root is None or not self.journal.path.is_file():
+        if (not self.follow_output and self.root is None) or not self.journal.path.is_file():
             return {}
         with self.journal._connect() as db:
             batch, phase, ambiguity = self._get(db, key)

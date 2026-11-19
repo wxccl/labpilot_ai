@@ -25,8 +25,8 @@ if ($Step -eq 'init') {
     if (Test-Path -LiteralPath $Directory) { throw 'Directory exists. Resume existing steps, or choose another -Directory deliberately.' }
     if (!$env:CONDA_PREFIX) { throw 'Activate the original Labscript conda environment.' }
     $python = Join-Path $env:CONDA_PREFIX 'python.exe'
-    & $python -c "import sys; from importlib.metadata import version; print(sys.executable); print({n:version(n) for n in ('labscript','blacs','runmanager','lyse','labscript-utils','labpilot-ai')}); sys.exit(version('labpilot-ai')!='0.3.4')"
-    if ($LASTEXITCODE -ne 0) { throw 'Check interpreter, installed packages and LabPilot 0.3.4.' }
+    & $python -c "import sys; from importlib.metadata import version; print(sys.executable); print({n:version(n) for n in ('labscript','blacs','runmanager','lyse','labscript-utils','labpilot-ai')}); sys.exit(version('labpilot-ai')!='0.3.5')"
+    if ($LASTEXITCODE -ne 0) { throw 'Check interpreter, installed packages and LabPilot 0.3.5.' }
     $labconfig = ExistingPath 'Existing LabConfig INI used by BLACS / Runmanager' Leaf
     $iniHash = (Get-FileHash -LiteralPath $labconfig).Hash
     $port = & $python -c "import configparser,sys; c=configparser.ConfigParser(interpolation=None); c.read(sys.argv[1],encoding='utf-8-sig'); p=c.getint('ports','runmanager'); assert 1<=p<=65535; print(p)" $labconfig

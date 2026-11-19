@@ -53,7 +53,7 @@ class TaskWindow(QtWidgets.QWidget):
         root.addLayout(commands)
         self.buttons = []
         for label, callback in (
-            ("刷新", self.refresh), ("设备与接口", self.discover), ("准备任务", self.prepare),
+            ("刷新", self.refresh), ("当前实验与设备", self.discover), ("准备任务", self.prepare),
             ("批准所选", self.approve), ("执行下一项", self.run_next),
             ("核对进度", self.observe), ("取消所选", self.cancel),
         ):
@@ -116,7 +116,7 @@ class TaskWindow(QtWidgets.QWidget):
             self.display(task)
 
     def discover(self):
-        self.submit(lambda app: app.dispatch("discover", {}), self.display)
+        self.submit(lambda app: app.dispatch("context", {}), self.display)
 
     def prepare(self):
         example = json.dumps({"target": "runmanager", "action": "engage", "expected_n_shots": 1}, indent=2)

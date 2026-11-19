@@ -17,7 +17,7 @@ def parser():
     cli = argparse.ArgumentParser(prog="labpilot")
     cli.add_argument("--profile", default=default_profile(), help="JSON site profile")
     commands = cli.add_subparsers(dest="command", required=True)
-    for name in ("init", "discover", "list", "run-next", "ui"):
+    for name in ("init", "discover", "context", "list", "run-next", "ui"):
         commands.add_parser(name)
     doctor = commands.add_parser("doctor")
     preflight = commands.add_parser("preflight", help="Read this profile's device inventory and advertised actions")
@@ -136,9 +136,9 @@ def dispatch(args):
         return {"profile": str(profile), "simulate": True}
     app = Automation(args.profile)
     if command == "preflight":
-        from .host.preflight import capability_report
-
-        return capability_report(app.host.call("discover", {}), args.require)
+        return app.dispatch("preflight", {"require": args.require})
+    if command == "context":
+        return app.dispatch("context", {})
     if command == "doctor":
         environment = app.host.configuration("doctor", args.labconfig)
         capabilities = app.host.call("discover", {})
