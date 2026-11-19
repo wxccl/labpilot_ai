@@ -1,3 +1,4 @@
+from labpilot_ai.language_data import ZH
 import os
 import json
 import queue
@@ -97,14 +98,14 @@ NO_SHOT_TOKENS = (
     "not run",
     "dry run",
     "preview only",
-    "不运行",
-    "不要运行",
-    "别运行",
-    "不跑",
-    "不要跑",
-    "别跑",
-    "不提交",
-    "不要提交",
+    ZH['no_run'],
+    ZH['do_not_run'],
+    ZH['skip_run'],
+    ZH['no_shot'],
+    ZH['do_not_shoot'],
+    ZH['skip_shot'],
+    ZH['no_submit'],
+    ZH['do_not_submit'],
 )
 
 
@@ -117,15 +118,15 @@ SHOT_REQUEST_RE = re.compile(
 
 
 SHOT_REQUEST_TOKENS = (
-    "运行",
-    "跑一次",
-    "跑实验",
-    "跑时序",
-    "开始实验",
-    "提交shot",
-    "提交 shot",
-    "提交时序",
-    "提交实验",
+    ZH['run'],
+    ZH['run_once'],
+    ZH['run_experiment'],
+    ZH['run_sequence'],
+    ZH['start_experiment'],
+    ZH['submit_shot'],
+    ZH['submit_spaced_shot'],
+    ZH['submit_sequence'],
+    ZH['submit_experiment'],
     "engage",
 )
 
@@ -2366,7 +2367,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Initialize project templates failed", exc)
     def auto_scan_lyse_modules_ui(self):
         try:
-            # 先读取最新 project_settings，避免 UI 中刚保存的路径没同步
+            # Reload project settings to pick up recently saved paths.
             self.project_settings = self.settings.load_project_settings()
 
             single_dir = self.project_settings.get("single_modules_dir", "")
@@ -2844,7 +2845,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_voice_reply_enabled_changed(self, checked):
         self.apply_tts_settings()
         if checked:
-            self.speak_event("reply_enabled", "语音回复已开启。", priority=True)
+            self.speak_event("reply_enabled", 'Voice replies enabled.', priority=True)
         else:
             self.stop_speaking()
         self.log(f"spoken replies enabled: {bool(checked)}")
@@ -2895,7 +2896,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.tts.enabled:
             self.voice_reply_enabled.setChecked(True)
             self.apply_tts_settings()
-        if not self.speak_event("test", "LabPilot AI 语音回复测试。", priority=True):
+        if not self.speak_event("test", 'LabPilot voice test.', priority=True):
             self._show_error("Text-to-speech unavailable", RuntimeError("Speaker is disabled or unavailable."), modal=False)
 
     def stop_speaking(self):
@@ -3000,7 +3001,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose audio file", "", "Audio files (*.wav *.mp3 *.m4a *.flac);;All files (*.*)")
         if not path:
             return
-        self.speak_event("recording_stop", "正在转写音频文件。")
+        self.speak_event("recording_stop", 'Transcribing audio.')
         self.start_transcription(path)
 
     def toggle_voice_recording(self, checked=False):
@@ -3015,7 +3016,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def start_voice_recording(self):
         try:
-            self.speak_event("recording_start", "开始录音。", priority=True)
+            self.speak_event("recording_start", 'Recording started.', priority=True)
             self.voice_recorder.start()
             self.voice_recording = True
             self.voice_toggle_button.setChecked(True)
@@ -3042,7 +3043,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.voice_status.setText(f"Recorded audio: {path}")
                 self.log(f"Voice recording saved: {path}, stats={stats}")
-            self.speak_event("recording_stop", "录音结束，正在转写。", priority=True)
+            self.speak_event("recording_stop", 'Recording finished. Transcribing.', priority=True)
             self.start_transcription(path)
         except Exception as exc:
             self.voice_recording = False
@@ -3113,7 +3114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.command_text.setPlainText((current + "\n" + corrected).strip())
         self.voice_status.setText("Transcription corrected and added to command box.")
         self.log(f"Audio transcription added from {audio_path}: raw={text} corrected={corrected}")
-        self.speak_event("transcription_finished", "已识别指令。")
+        self.speak_event("transcription_finished", 'Command recognized.')
         action = self.voice_after_transcribe.currentData()
         if action == "parse":
             self.parse_command(allow_auto=False)
@@ -3124,7 +3125,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_transcription_failed(self, message):
         self.voice_status.setText("Transcription failed.")
-        self.speak_event("error", "语音识别失败。", priority=True)
+        self.speak_event("error", 'Speech recognition failed.', priority=True)
         self._show_error("Speech-to-text failed", RuntimeError(message))
 
     def toggle_wake_standby(self):
@@ -3198,7 +3199,7 @@ class MainWindow(QtWidgets.QMainWindow):
         text = str(message or "")
         self.voice_status.setText(text)
         if "Wake word accepted" in text:
-            self.speak_event("wake", "你好，我在听，请说实验指令。", priority=True)
+            self.speak_event("wake", 'Listening for an experiment command.', priority=True)
 
     def _on_wake_standby_stopped(self):
         self.voice_standby.blockSignals(True)
@@ -3224,7 +3225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             client = self._make_llm_client()
             user_text = self.command_text.toPlainText()
-            self.speak_event("before_parse", "正在解析指令并进行安全检查。")
+            self.speak_event("before_parse", 'Parsing and checking the command.')
             project_context = self.project_context_for_query(user_text, purpose="command")
             command = client.parse_command(
                 user_text,
@@ -3251,7 +3252,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.execute_last(force_run=run_requested, confirm_engage=True)
         except Exception as exc:
             self.record_command_event("parse_failed", user_text, {"error": str(exc)})
-            self.speak_event("error", "指令解析或安全检查失败。", priority=True)
+            self.speak_event("error", 'Command parsing or validation failed.', priority=True)
             self._show_error("Parse/safety failed", exc)
 
     def _strip_unrequested_engage(self, command, user_text):
@@ -3308,7 +3309,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.last_safe:
             self.json_view.appendPlainText("\n\nDRY-RUN PREVIEW:\n" + dumps(self.last_safe, indent=2))
             self.log("Dry-run preview generated; no hardware action was executed.")
-            self.speak_event("dry_run", "这是 dry-run 预览，不会控制硬件。")
+            self.speak_event("dry_run", 'Dry-run preview.')
 
     def show_retrieved_context(self):
         context = self.last_project_context or self.project_context_for_query(self.command_text.toPlainText(), purpose="command")
@@ -3344,7 +3345,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.dry_run.isChecked():
                 self.log("Dry run: not executing. " + dumps(safe))
                 self.record_command_event("dry_run", payload={"safe": safe, "force_run": force_run})
-                self.speak_event("dry_run", "这是 dry-run 模式，不会控制硬件。")
+                self.speak_event("dry_run", 'Dry-run mode.')
                 return
             if (engage or safe.get("globals")) and self.rm.mock is not True:
                 raise PermissionError("Use labpilot prepare, A2/A3 approval and run-next for live Runmanager tasks.")
@@ -3352,7 +3353,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if safe.get("confirmations") and not self._confirm_high_risk(safe["confirmations"]):
                 self.log("Execution cancelled by user.")
                 self.record_command_event("cancelled", payload={"safe": safe, "force_run": force_run})
-                self.speak_event("after_execute", "执行已取消。", priority=True)
+                self.speak_event("after_execute", 'Execution cancelled.', priority=True)
                 return
             if safe.get("globals"):
                 report = self.write_runmanager_safe_globals(safe["globals"])
@@ -3435,10 +3436,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "execute_ok",
                 payload={"safe": safe, "force_run": force_run, "engage": engage, "confirm_engage": confirm_engage},
             )
-            self.speak_event("after_execute", "已提交 shot。" if engage else "执行完成。", priority=True)
+            self.speak_event("after_execute", 'Shot submitted.' if engage else 'Execution complete.', priority=True)
         except Exception as exc:
             self.record_command_event("execute_failed", payload={"safe": safe, "force_run": force_run, "error": str(exc)})
-            self.speak_event("error", "执行失败，已记录错误。", priority=True)
+            self.speak_event("error", 'Execution failed. See the error log.', priority=True)
             self._show_error("Execute failed", exc)
 
     def _confirm_high_risk(self, confirmations):
@@ -6709,7 +6710,7 @@ class MainWindow(QtWidgets.QMainWindow):
             advice += "\n\nRelated project context:\n" + context[:1400]
         self.log(msg + "\n" + advice)
         if title != "Text-to-speech failed":
-            self.speak_event("error", f"{title}。请查看 Error Center。", priority=True)
+            self.speak_event("error", f"{title}. See Error Center.", priority=True)
         popups = self.project_settings.get("ui", {}).get("error_popups", True)
         if modal and popups:
             QtWidgets.QMessageBox.critical(self, title, f"{exc}\n\nSuggestions:\n{advice}")

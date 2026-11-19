@@ -2,9 +2,9 @@
 
 LabPilot connects an operator or Harness to an existing labscript-suite installation. Inspect the active sequence and output, review a finite experiment, and trace each shot from Runmanager through BLACS to its analysis report.
 
-**Start here:** [中文安装、配置、测试和使用指南](https://github.com/wxccl/labpilot_ai/blob/v0.3.6rc1/manual/START_ZH.md) · [CLI and MCP reference](https://github.com/wxccl/labpilot_ai/blob/v0.3.6rc1/labpilot_ai/AUTOMATION.md).
+**Start here:** [中文安装、配置、测试和使用指南](https://github.com/wxccl/labpilot_ai/blob/v0.3.6rc2/manual/START_ZH.md) · [CLI and MCP reference](https://github.com/wxccl/labpilot_ai/blob/v0.3.6rc2/labpilot_ai/AUTOMATION.md).
 
-Install with `python -m pip install --no-deps labpilot-ai==0.3.6rc1` in an existing suite environment. Use `labpilot --profile PROFILE context` to inspect a reviewed profile. In a new empty directory, `labpilot init` creates a simulation instead. No model credential, voice service or desktop extension is needed for these commands.
+Install with `python -m pip install --no-deps labpilot-ai==0.3.6rc2` in an existing suite environment. Use `labpilot --profile PROFILE context` to inspect a reviewed profile. In a new empty directory, `labpilot init` creates a simulation instead. No model credential, voice service or desktop extension is needed for these commands.
 
 Use the same profile for approval and execution. A managed BLACS completion receipt, a validated analysis result, and calibrated evidence of a physical signal are different things. Hardware and custom routines require site acceptance. The optional legacy workbench remains available for existing installations; it is not the production writer.
 

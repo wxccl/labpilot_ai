@@ -11,4 +11,4 @@ def extract_json_object(text: str) -> dict:
     end = text.rfind("}")
     if start >= 0 and end > start:
         return json.loads(text[start:end+1])
-    raise ValueError(f"无法解析 JSON：{text}")
+    raise ValueError(f"Invalid JSON: {text}")

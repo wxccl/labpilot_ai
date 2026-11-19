@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from labpilot_ai.language_data import ZH
 import os
 import re
 
@@ -83,12 +84,12 @@ class LLMClient:
         original = text or ""
         low = (text or "").lower()
         no_run = any(token in low for token in ["do not run", "don't run", "no run", "not run", "dry run"])
-        no_run = no_run or any(token in original for token in ["不要运行", "不运行", "别运行", "不跑"])
+        no_run = no_run or any(token in original for token in [ZH['do_not_run'], ZH['no_run'], ZH['skip_run'], ZH['no_shot']])
 
         blacs_intent = any(
             token in low for token in ["blacs", "manual", "channel", "trigger", "switch", "ao", "do", "dds"]
         )
-        blacs_intent = blacs_intent or any(token in original for token in ["手动", "通道", "触发", "开关", "关闭blacs", "设置blacs"])
+        blacs_intent = blacs_intent or any(token in original for token in [ZH['manual'], ZH['channel'], ZH['trigger'], ZH['switch'], ZH['close_blacs'], ZH['set_blacs']])
         if blacs_intent:
             channel = self._match_registry_name(original, blacs_registry)
             if channel:
@@ -100,8 +101,8 @@ class LLMClient:
                     }
                 )
 
-        if any(token in low for token in ["tof", "time of flight"]) or any(token in original for token in ["飞行时间"]):
-            m = re.search(r"(?:from|从)\s*([\d.]+)\s*(?:ms)?\s*(?:to|到)\s*([\d.]+)\s*(?:ms)?.*?(\d+)\s*(?:points|点)", original, re.I)
+        if any(token in low for token in ["tof", "time of flight"]) or any(token in original for token in [ZH['time_of_flight']]):
+            m = re.search(ZH['tof_scan_pattern'], original, re.I)
             if m and "duration_tof_ms" in global_registry:
                 actions.append(
                     {
@@ -111,22 +112,22 @@ class LLMClient:
                     }
                 )
             else:
-                m = re.search(r"(?:tof|time of flight|飞行时间).*?(?:to|set to|设为|设置为|改成|=)\s*([\d.]+)", original, re.I)
+                m = re.search(ZH['tof_value_pattern'], original, re.I)
                 if m and "duration_tof_ms" in global_registry:
                     actions.append({"type": "set_global", "name": "duration_tof_ms", "value": float(m.group(1))})
 
         bool_map = {
-            "lyse_do_SG_F1_masked": ["sg mask", "遮罩"],
-            "lyse_update_centers_json": ["update centers", "centers_json", "centers json", "更新中心"],
-            "do_Rabi": ["rabi", "拉比"],
-            "do_pure": ["pure", "清除"],
+            "lyse_do_SG_F1_masked": ["sg mask", ZH['mask']],
+            "lyse_update_centers_json": ["update centers", "centers_json", "centers json", ZH['update_centers']],
+            "do_Rabi": ["rabi", ZH['rabi']],
+            "do_pure": ["pure", ZH['clear']],
             "do_Ramsey": ["ramsey"],
-            "do_camera": ["camera", "相机"],
+            "do_camera": ["camera", ZH['camera']],
         }
         for name, keys in bool_map.items():
             if name in global_registry and any(key.lower() in low or key in original for key in keys):
                 val = not any(token in low for token in ["disable", "off", "turn off"]) and not any(
-                    token in original for token in ["关闭", "关掉", "不要打开", "禁用"]
+                    token in original for token in [ZH['close'], ZH['turn_off'], ZH['do_not_open'], ZH['disable']]
                 )
                 actions.append({"type": "set_global", "name": name, "value": val})
 
@@ -140,9 +141,9 @@ class LLMClient:
                 }
             )
 
-        if not no_run and (any(token in low for token in ["run", "submit", "engage"]) or any(token in original for token in ["运行", "跑一次", "提交"])):
+        if not no_run and (any(token in low for token in ["run", "submit", "engage"]) or any(token in original for token in [ZH['run'], ZH['run_once'], ZH['submit']])):
             actions.append({"type": "engage"})
-        if any(token in low for token in ["read", "current", "globals"]) or any(token in original for token in ["读取", "查看", "当前参数"]):
+        if any(token in low for token in ["read", "current", "globals"]) or any(token in original for token in [ZH['read'], ZH['view'], ZH['current_parameters']]):
             actions.append({"type": "get_globals"})
         return {"actions": actions, "comment": "Mock LLM parser result. For serious use, enable API."}
 
@@ -170,11 +171,11 @@ class LLMClient:
     def _mock_value_for_text(text: str, rule: dict):
         low = (text or "").lower()
         if any(token in low for token in ["off", "false", "disable", "close"]) or any(
-            token in (text or "") for token in ["关闭", "关掉", "禁用", "否"]
+            token in (text or "") for token in [ZH['close'], ZH['turn_off'], ZH['disable'], ZH['no']]
         ):
             return False
         if any(token in low for token in ["on", "true", "enable", "open"]) or any(
-            token in (text or "") for token in ["打开", "开启", "启用", "是"]
+            token in (text or "") for token in [ZH['open'], ZH['enable'], ZH['turn_on'], ZH['yes']]
         ):
             if rule.get("type") == "bool":
                 return True

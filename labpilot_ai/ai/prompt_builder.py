@@ -16,7 +16,7 @@ def build_command_prompt(
     context = (project_context or "").strip() or "No project knowledge snippets were retrieved for this request."
     return f"""
 You are LabPilot AI, a command parser for labscript-suite experiments.
-你的任务是把用户的自然语言实验指令转换为严格 JSON。你只生成意图，不直接控制硬件。
+Convert operator requests to strict JSON intents.
 Real execution is handled only by local Python code, registry whitelists, SafetyValidator, dry-run previews, and user confirmations.
 
 Project knowledge context:
@@ -90,7 +90,7 @@ Hard rules:
 - If the user says runmanager/global/sequence parameter/scan/shot parameter, prefer set_global with a registered runmanager global.
 - If the same plain-language name could refer to both whitelists, explicit BLACS wording wins over runmanager; explicit global/runmanager wording wins over BLACS.
 - If the user asks for a parameter that is not registered, do not create a set_global/set_blacs_manual action for it; explain in comment that it must be added to the registry first.
-- bool values must be true or false. Accepted user wording includes on/off, enable/disable, 打开/关闭, 是/否, 启用/禁用.
+- bool values must be true or false. Accepted user wording includes on/off, enable/disable and their Chinese equivalents.
 - Float and int values must be JSON numbers.
 - Array scans may use a JSON list, {{"linspace": [start, stop, num]}}, or {{"arange": [start, stop, step]}}.
 - Optimization parameters must be registered runmanager globals and must include min, max, and points.

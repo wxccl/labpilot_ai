@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from labpilot_ai.language_data import ZH
 from pathlib import Path
 
 import numpy as np
@@ -18,12 +19,12 @@ TRUE_STRINGS = {
     "open",
     "enable",
     "enabled",
-    "打开",
-    "开启",
-    "启用",
-    "开",
-    "是",
-    "真",
+    ZH['open'],
+    ZH['enable'],
+    ZH['turn_on'],
+    ZH['on'],
+    ZH['yes'],
+    ZH['true'],
 }
 FALSE_STRINGS = {
     "false",
@@ -35,11 +36,11 @@ FALSE_STRINGS = {
     "closed",
     "disable",
     "disabled",
-    "关闭",
-    "关",
-    "禁用",
-    "否",
-    "假",
+    ZH['close'],
+    ZH['off'],
+    ZH['disable'],
+    ZH['no'],
+    ZH['false'],
 }
 
 
@@ -54,7 +55,7 @@ def normalize_bool(value):
             return True
         if text in FALSE_STRINGS:
             return False
-    raise SafetyError(f"Cannot convert value to bool / 无法转换为布尔值: {value!r}")
+    raise SafetyError(f"Cannot convert value to bool: {value!r}")
 
 
 def _optional_bool(value, default=False):
@@ -181,7 +182,7 @@ class SafetyValidator:
     def validate_value(self, name: str, value, registry: dict):
         if name not in registry:
             raise SafetyError(
-                f"Variable or channel {name!r} is not registered in the whitelist / 未在白名单中登记"
+                f"Variable or channel {name!r} is not registered in the whitelist"
             )
         rule = registry[name]
         typ = rule.get("type")

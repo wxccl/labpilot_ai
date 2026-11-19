@@ -1,3 +1,4 @@
+from labpilot_ai.language_data import ZH
 from pathlib import Path
 
 
@@ -81,12 +82,12 @@ TRUE_STRINGS = {
     "open",
     "enable",
     "enabled",
-    "打开",
-    "开启",
-    "启用",
-    "开",
-    "是",
-    "真",
+    ZH['open'],
+    ZH['enable'],
+    ZH['turn_on'],
+    ZH['on'],
+    ZH['yes'],
+    ZH['true'],
 }
 FALSE_STRINGS = {
     "false",
@@ -98,11 +99,11 @@ FALSE_STRINGS = {
     "closed",
     "disable",
     "disabled",
-    "关闭",
-    "关",
-    "禁用",
-    "否",
-    "假",
+    ZH['close'],
+    ZH['off'],
+    ZH['disable'],
+    ZH['no'],
+    ZH['false'],
 }
 
 

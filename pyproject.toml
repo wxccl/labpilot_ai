@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.3.6rc1"
+version = "0.3.6rc2"
 description = "Supervised labscript-suite experiments with live context, reviewed tasks, shot attribution and Lyse quality checks."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -39,6 +39,7 @@ labscript = [
 labpilot = "labpilot_ai.automation_cli:main"
 labpilot-runmanager = "labpilot_ai.host.managed_runmanager:main"
 labpilot-ai = "labpilot_ai.automation_ui:main"
+labpilot-shortcut = "labpilot_ai.desktop_shortcut:main"
 labpilot-workbench = "labpilot_ai.main:main"
 labpilot-control = "labpilot_ai.local_control.cli:main"
 labpilot-blacs-bridge = "labpilot_ai.blacs_ctrl.manual_bridge_server:main"
@@ -58,7 +59,7 @@ exclude = ["configs*", "plugins*", "tests*", "examples*"]
 [tool.setuptools.package-data]
 labpilot_ai = [
     "AUTOMATION.md",
-    "label.png",
+    "label.png", "labpilot.ico", "guide_*.md", "zh_CN.json", "command_zh.json",
     "templates/configs/*.yaml",
     "templates/manual/**/*.md",
     "templates/plugins/single_modules/*.py",

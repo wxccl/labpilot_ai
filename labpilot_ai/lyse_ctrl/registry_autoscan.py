@@ -19,8 +19,8 @@ def _safe_name(path: Path) -> str:
 
 def _detect_mode(path: Path) -> str:
     """
-    labpilot_module: 文件里有 def run(...)
-    lyse_script: 原版 lyse 风格脚本，顶层执行，常见 from lyse import Run, path
+    labpilot_module: module defines run(...)
+    lyse_script: native top-level Lyse script
     """
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
@@ -117,7 +117,7 @@ def _make_entry(
         "params": existing.get("params", {}),
     }
 
-    # 保留用户已经手动加的字段，例如 outputs、meta_h5_path 等
+    # Preserve manually configured fields such as outputs and meta_h5_path.
     for key, value in existing.items():
         if key not in entry:
             entry[key] = value
@@ -143,10 +143,10 @@ def merge_autoscanned_lyse_modules(
     prune_missing: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    扫描 single_dir/multi_dir，把文件夹中的 .py 自动合并到 lyse_registry。
+    Merge routines found in the single and multi directories into the registry.
 
-    不会删除真实 .py 文件；
-    prune_missing=True 时只删除 registry 中路径已经不存在的条目。
+    Source files are preserved.
+    prune_missing removes only registry entries for missing paths.
     """
     project_root_path = Path(project_root).resolve() if project_root else Path.cwd().resolve()
 

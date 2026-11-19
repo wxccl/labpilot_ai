@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
+from labpilot_ai.language_data import ZH
 
 
 def _short_path(value):
@@ -32,49 +33,52 @@ def _truncate(text, max_chars=240):
 
 def summarize_safe_actions(safe, language="zh", max_items=5, max_chars=240):
     """Create a short, non-sensitive spoken summary from SafetyValidator output."""
+    def phrase(key, *args):
+        return (ZH[key] if language == "zh" else key).format(*args)
+
     safe = safe or {}
     actions = list(safe.get("actions", []) or [])
     if not actions:
-        return "没有可执行的安全动作。" if language == "zh" else "No safe actions are ready."
+        return phrase("No safe actions are ready.")
 
     parts = []
     for action in actions[: int(max_items or 5)]:
         typ = action.get("type", "")
         name = action.get("name", "")
         if typ == "set_global":
-            parts.append(f"设置 runmanager 参数 {name}")
+            parts.append(phrase('Set Runmanager global {0}', name))
         elif typ == "set_blacs_manual":
-            parts.append(f"设置 BLACS 手动通道 {name}")
+            parts.append(phrase('Set BLACS manual channel {0}', name))
         elif typ == "engage":
-            parts.append("提交实验 shot")
+            parts.append(phrase('Submit shot'))
         elif typ == "load_h5":
-            parts.append(f"加载 H5 数据 {_short_path(action.get('path'))}")
+            parts.append(phrase('Load H5 {0}', _short_path(action.get('path'))))
         elif typ == "run_single_lyse":
-            parts.append(f"运行 single lyse {name}")
+            parts.append(phrase('Run single-shot Lyse {0}', name))
         elif typ == "run_multi_lyse":
-            parts.append(f"运行 multi lyse {name}")
+            parts.append(phrase('Run multishot Lyse {0}', name))
         elif typ == "plot":
-            parts.append(f"绘图 {action.get('plot_type', '')}".strip())
+            parts.append(phrase('Plot {0}', action.get('plot_type', '')).strip())
         elif typ == "fit":
-            parts.append(f"拟合 {action.get('model', '')}".strip())
+            parts.append(phrase('Fit {0}', action.get('model', '')).strip())
         elif typ == "start_optimization":
             objective = action.get("objective", "")
             method = action.get("method", "optimization")
-            parts.append(f"启动 {method} 优化 {objective}".strip())
+            parts.append(phrase('Start {0} optimization for {1}', method, objective).strip())
         elif typ == "generate_report":
-            parts.append("生成报告")
+            parts.append(phrase('Generate report'))
         elif typ == "generate_protocol":
-            parts.append("生成实验方案建议")
+            parts.append(phrase('Propose protocol'))
         else:
-            parts.append(f"执行 {typ or '动作'}")
+            parts.append(phrase('Execute {0}', typ or 'action'))
 
     if len(actions) > len(parts):
-        parts.append(f"另外 {len(actions) - len(parts)} 个动作")
-    prefix = f"检测到 {len(actions)} 个安全动作，"
-    text = prefix + "，".join(parts)
+        parts.append(phrase('{0} additional actions', len(actions) - len(parts)))
+    prefix = phrase('{0} safe actions: ', len(actions))
+    text = prefix + ", ".join(parts)
     confirmations = safe.get("confirmations") or []
     if confirmations:
-        text += f"。其中 {len(confirmations)} 项需要人工确认。"
+        text += phrase('. {0} require confirmation.', len(confirmations))
     return _truncate(text, max_chars=max_chars)
 
 

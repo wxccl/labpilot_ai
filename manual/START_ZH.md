@@ -1,4 +1,4 @@
-# LabPilot 0.3.6rc1：安装、接入、验收与回退
+# LabPilot 0.3.6rc2：安装、接入、验收与回退
 
 日常只需一个已审核的站点 profile 和一个入口：CLI、Harness 或 labpilot ui。它们共用当前 profile 的任务账本。语音、旧版桌面工作台、知识库、优化器都不是安装前提。升级前暂停可能派发任务的服务，处理旧任务；不要在实验进行中切换版本或 profile。
 
@@ -7,12 +7,12 @@
     conda activate labscript
     where python
     python -m pip show labpilot-ai
-    python -m pip install --upgrade --no-deps labpilot-ai==0.3.6rc1
+    python -m pip install --upgrade --no-deps labpilot-ai==0.3.6rc2
     python -c "import sys; from importlib.metadata import version; print(sys.executable,version('labpilot-ai'))"
 
-确认解释器与原 BLACS 快捷方式一致，版本为 0.3.6rc1。若 labpilot.exe 被占用，先正常退出使用它的 Harness MCP 服务。离线 ZIP 解压后在其根目录直接执行：
+确认解释器与原 BLACS 快捷方式一致，版本为 0.3.6rc2。若 labpilot.exe 被占用，先正常退出使用它的 Harness MCP 服务。离线 ZIP 解压后在其根目录直接执行：
 
-    python -m pip install --no-index --no-deps --find-links wheelhouse labpilot-ai==0.3.6rc1
+    python -m pip install --no-index --no-deps --find-links wheelhouse labpilot-ai==0.3.6rc2
 
 ## 2. 先在新目录验证模拟链
 

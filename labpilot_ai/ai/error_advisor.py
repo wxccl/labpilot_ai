@@ -1,3 +1,4 @@
+from labpilot_ai.language_data import ZH
 def advise_error(error_text: str) -> str:
     text = (error_text or "").strip()
     low = text.lower()
@@ -5,7 +6,7 @@ def advise_error(error_text: str) -> str:
 
     if any(token in low for token in ["unicode", "utf-8", "codec", "mojibake", "encoding", "decode error", chr(0xFFFD)]):
         hints.append("Check source/document encoding. Save Python and Markdown files as UTF-8, then rerun compileall before release.")
-    if any(token in text for token in ["乱码", "鏄", "涓", "鎵", "寮"]):
+    if any(token in text for token in [ZH['broken_encoding'], ZH['mojibake_a'], ZH['mojibake_b'], ZH['mojibake_c'], ZH['mojibake_d']]):
         hints.append("This looks like mojibake. Reopen the affected file as UTF-8, replace corrupted strings, and avoid mixed terminal encodings.")
     if "not in global whitelist" in low or "global" in low and "whitelist" in low:
         hints.append("Add the variable to configs/global_registry.yaml with type, range, risk, aliases, and description.")
