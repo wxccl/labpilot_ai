@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "labpilot-ai"
-version = "0.3.5"
+version = "0.3.6rc1"
 description = "Supervised labscript-suite experiments with live context, reviewed tasks, shot attribution and Lyse quality checks."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,7 +38,8 @@ labscript = [
 [project.scripts]
 labpilot = "labpilot_ai.automation_cli:main"
 labpilot-runmanager = "labpilot_ai.host.managed_runmanager:main"
-labpilot-ai = "labpilot_ai.main:main"
+labpilot-ai = "labpilot_ai.automation_ui:main"
+labpilot-workbench = "labpilot_ai.main:main"
 labpilot-control = "labpilot_ai.local_control.cli:main"
 labpilot-blacs-bridge = "labpilot_ai.blacs_ctrl.manual_bridge_server:main"
 labpilot-blacs-real-bridge-info = "labpilot_ai.blacs_bridge.plugin:diagnostic_main"
@@ -52,7 +53,7 @@ include = ["labpilot_ai*"]
 exclude = ["configs*", "plugins*", "tests*", "examples*"]
 
 [tool.setuptools.data-files]
-"share/labpilot" = ["tools/controller_one_shot.ps1", "manual/START_ZH.md", "manual/controller_one_shot.md", "manual/HARNESS_RETEST_ZH.md", "docs/analysis_helpers.md"]
+"share/labpilot" = ["tools/controller_one_shot.ps1", "manual/NATIVE_GUI_ZH.md", "manual/START_ZH.md", "manual/controller_one_shot.md", "manual/HARNESS_RETEST_ZH.md", "docs/analysis_helpers.md"]
 
 [tool.setuptools.package-data]
 labpilot_ai = [

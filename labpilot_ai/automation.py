@@ -154,10 +154,11 @@ class Automation:
                                        "snapshot_sha256", "n_shots", "flags", "errors")}},
                     "batch_output_policy": "runmanager_output" if follow else "fixed" if batch_parent else "unmanaged",
                     "configured_batch_root": self.batch_root, "selected_batch_parent": batch_parent,
-                    "analysis": {"backend": "simulation" if self.simulate else "private_copy" if analyzer else "none",
-                                 "routine": str(analyzer.routine) if analyzer else None,
+                    "analysis": {"backend": "simulation" if self.simulate else analyzer.backend if analyzer else "none",
+                                 "routine": str(analyzer.routine) if analyzer and analyzer.routine else None,
                                  "routine_sha256": analyzer.routine_sha256 if analyzer else None,
                                  "quality_rules": analyzer.rules if analyzer else [],
+                                 "result_group": analyzer.result_group if analyzer else None,
                                  "native_gui_state": "NOT_OBSERVED"},
                     "preflight": result}
         if operation == "events":

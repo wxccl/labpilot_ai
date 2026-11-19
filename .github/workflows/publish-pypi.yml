@@ -91,7 +91,7 @@ jobs:
           bundle="LabPilot-${tag#v}-kit"
           mkdir -p "$bundle/wheelhouse"
           cp dist/*.whl "$bundle/wheelhouse/"
-          cp manual/START_ZH.md manual/controller_one_shot.md manual/HARNESS_RETEST_ZH.md "$bundle/"
+          cp manual/NATIVE_GUI_ZH.md manual/START_ZH.md manual/controller_one_shot.md manual/HARNESS_RETEST_ZH.md "$bundle/"
           git archive --prefix=src/ HEAD | tar -xf - -C "$bundle"
           (cd "$bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum > ../kit-sums.txt && mv ../kit-sums.txt SHA256SUMS.txt)
           zip -qr "dist/$bundle.zip" "$bundle"

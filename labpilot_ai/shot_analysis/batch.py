@@ -165,24 +165,38 @@ class LyseBatchAnalysis:
 
     def __init__(self, python, config, *, base_dir, state_dir=None):
         if not isinstance(config, dict) or set(config) - {
-            "routine", "routine_sha256", "quality_rules", "timeout_s", "shots_per_observation", "max_shot_bytes", "sys_path"
+            "routine", "routine_sha256", "quality_rules", "timeout_s", "shots_per_observation", "max_shot_bytes", "sys_path", "backend", "result_group"
         }:
             raise ValueError("Invalid Lyse analysis profile fields")
         base = Path(base_dir).resolve()
         self.python = Path(python).resolve()
-        self.routine = _absolute(config.get("routine"), base)
-        paths = config.get("sys_path", [])
-        if type(paths) is not list or len(paths) > 16:
-            raise ValueError("analysis.sys_path must be a list of at most 16 trusted helper directories")
-        self.import_dirs = []
-        for entry in paths:
-            directory = _absolute(entry, base)
-            if not directory.is_dir() or directory.parent == directory or str(directory) in self.import_dirs:
-                raise ValueError("analysis.sys_path contains a missing, root, or duplicate directory")
-            self.import_dirs.append(str(directory))
-        self.routine_sha256 = config.get("routine_sha256")
-        if self.routine.suffix.lower() != ".py" or not isinstance(self.routine_sha256, str) or not _SHA.fullmatch(self.routine_sha256):
-            raise ValueError("Lyse analysis requires a pinned Python routine SHA-256")
+        self.backend = config.get("backend", "private_copy")
+        if self.backend == "native_h5":
+            if any(key in config for key in ("routine", "routine_sha256", "sys_path")):
+                raise ValueError("native_h5 only reads stored results and takes no routine")
+            self.result_group = config.get("result_group")
+            if (not isinstance(self.result_group, str) or not self.result_group.strip()
+                    or "/" in self.result_group or self.result_group in (".", "..")):
+                raise ValueError("Specify a single Lyse result_group name")
+            self.routine = self.routine_sha256 = None
+            self.import_dirs = []
+        elif self.backend == "private_copy" and "result_group" not in config:
+            self.routine = _absolute(config.get("routine"), base)
+            paths = config.get("sys_path", [])
+            if type(paths) is not list or len(paths) > 16:
+                raise ValueError("analysis.sys_path must be a list of at most 16 trusted helper directories")
+            self.import_dirs = []
+            for entry in paths:
+                directory = _absolute(entry, base)
+                if not directory.is_dir() or directory.parent == directory or str(directory) in self.import_dirs:
+                    raise ValueError("analysis.sys_path contains a missing, root, or duplicate directory")
+                self.import_dirs.append(str(directory))
+            self.routine_sha256 = config.get("routine_sha256")
+            if self.routine.suffix.lower() != ".py" or not isinstance(self.routine_sha256, str) or not _SHA.fullmatch(self.routine_sha256):
+                raise ValueError("Lyse analysis requires a pinned Python routine SHA-256")
+            self.result_group = self.routine.stem
+        else:
+            raise ValueError("Invalid analysis backend or result_group")
         self.rules = _rules(config.get("quality_rules"))
         self.timeout = config.get("timeout_s", 60)
         if not _matches_type(self.timeout, "number") or not 1 <= self.timeout <= 900:
@@ -195,15 +209,20 @@ class LyseBatchAnalysis:
             raise ValueError("max_shot_bytes must be a positive integer")
         self.state_dir = Path(state_dir).resolve() if state_dir is not None else base / ".labpilot-analysis"
         self.profile_sha256 = _digest({"routine": str(self.routine), "routine_sha256": self.routine_sha256,
-                                      "quality_rules": self.rules, **({"sys_path": self.import_dirs} if self.import_dirs else {})})
+                                      "quality_rules": self.rules, **({"native_group": self.result_group} if self.backend == "native_h5" else {}), **({"sys_path": self.import_dirs} if self.import_dirs else {})})
 
     def analyze(self, manifest, *, request_id, config_digest, expected_n_shots, prior_manifest_sha256=None):
         result = {"analysis_state": "FAILED", "quality": "UNKNOWN", "analyzed_count": 0,
                   "routine_sha256": self.routine_sha256, "analysis_profile_sha256": self.profile_sha256,
-                  "result_group": self.routine.stem}
+                  "result_group": self.result_group}
         try:
             checked = _checked_manifest(manifest, request_id, config_digest, expected_n_shots)
-            manifest_sha256 = _digest(checked)
+            identity = checked
+            if self.backend == "native_h5":
+                # Native Lyse appends to pending shots after BLACS completion.
+                identity = {**checked, "shots": [{"index": row["index"], "path": row["path"]}
+                                                  for row in checked["shots"]]}
+            manifest_sha256 = _digest(identity)
             if prior_manifest_sha256 is not None and prior_manifest_sha256 != manifest_sha256:
                 raise ValueError("The completed-shot manifest changed after analysis started")
             result["manifest_sha256"] = manifest_sha256
@@ -218,7 +237,7 @@ class LyseBatchAnalysis:
                             if _digest(json.load(stream)) != manifest_sha256:
                                 raise ValueError("The stored completed-shot manifest changed")
                     else:
-                        _write_once(manifest_path, checked)
+                        _write_once(manifest_path, identity)
                     self._analyze_shots(checked, directory, result)
                 else:
                     result["analysis_state"] = "PENDING"
@@ -238,7 +257,7 @@ class LyseBatchAnalysis:
                 "request_id": manifest["batch_id"], "config_digest": manifest["config_digest"],
                 "manifest_sha256": result["manifest_sha256"], "analysis_profile_sha256": self.profile_sha256,
                 "routine_sha256": self.routine_sha256, "source_sha256": shot["sha256"],
-                "index": shot["index"], "result_group": self.routine.stem,
+                "index": shot["index"], "result_group": self.result_group,
             }
             if cached:
                 with path.open("rb") as stream:
@@ -246,6 +265,9 @@ class LyseBatchAnalysis:
                 self._validate_report(report, binding)
             elif remaining:
                 payload = self._run_shot(manifest, shot, binding)
+                if payload.get("status") == "PENDING":
+                    result["waiting_for"] = payload.get("reason")
+                    break
                 report = {**payload, "violations": _violations(payload["results"], self.rules)}
                 report["report_sha256"] = _digest(report)
             else:
@@ -280,7 +302,7 @@ class LyseBatchAnalysis:
 
     def _run_shot(self, manifest, shot, binding):
         worker = Path(__file__).with_name("worker.py")
-        params = {"shot": shot, "batch_root": manifest["batch_root"], "expected_n_shots": manifest["expected_n_shots"],
+        params = {"backend": self.backend, "shot": shot, "batch_root": manifest["batch_root"], "expected_n_shots": manifest["expected_n_shots"],
                   "routine": str(self.routine), "result_names": sorted(self.rules), "binding": binding,
                   "sys_path": self.import_dirs, "max_shot_bytes": self.max_shot_bytes}
         env = dict(os.environ, MPLBACKEND="Agg")
@@ -292,6 +314,8 @@ class LyseBatchAnalysis:
         if len(replies) != 1 or len(replies[0]) > _MAX_REPLY:
             raise RuntimeError("Lyse analysis worker returned no valid receipt")
         reply = json.loads(replies[0])
+        if self.backend == "native_h5" and not completed.returncode and reply.get("status") == "PENDING":
+            return reply
         if completed.returncode or not isinstance(reply, dict) or reply.get("status") != "COMPLETE":
             reason = reply.get("reason") if isinstance(reply, dict) else None
             raise RuntimeError(reason or "Lyse analysis worker failed")

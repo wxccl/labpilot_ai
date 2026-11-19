@@ -190,3 +190,31 @@ def test_native_task_waits_for_quality_before_completing(analyzer, tmp_path):
     assert finished["evidence"]["batch_execution_complete"] is True
     assert finished["evidence"]["quality"] == "PASS"
     assert len(calls) == 2
+
+@pytest.mark.parametrize("signal, quality", [(3.0, "PASS"), (0.0, "FAIL")])
+def test_native_lyse_delayed_results_are_read_only(tmp_path, monkeypatch, signal, quality):
+    from labpilot_ai.shot_analysis.worker import read_native
+
+    engine = LyseBatchAnalysis(sys.executable, {
+        "backend": "native_h5", "result_group": "site_fit",
+        "quality_rules": [{"result": "signal", "type": "number", "min": 1}],
+    }, base_dir=tmp_path)
+    manifest = fixture_manifest(tmp_path, count=1)
+    shot = manifest["shots"][0]
+    path = Path(shot["path"])
+    with h5py.File(path, "w") as file:
+        file.attrs.update({"sequence_id": "abc", "run number": 0, "n_runs": 1, "run time": "recorded"})
+    def observe(manifest, shot, binding):
+        return read_native(h5py, {"shot": shot, "batch_root": manifest["batch_root"], "expected_n_shots": 1,
+                                  "binding": binding, "result_names": ["signal"], "max_shot_bytes": 100000})
+    monkeypatch.setattr(engine, "_run_shot", observe)
+    shot["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    first = run(engine, manifest)
+    assert first["analysis_state"] == "PENDING"
+    with h5py.File(path, "a") as file:
+        file.create_group("results/site_fit").attrs["signal"] = signal
+    assert run(engine, manifest)["analysis_state"] == "PENDING"
+    shot["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    complete = run(engine, manifest, prior_manifest_sha256=first["manifest_sha256"])
+    assert complete["quality"] == quality, complete
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == shot["sha256"]

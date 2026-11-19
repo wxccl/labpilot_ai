@@ -94,14 +94,56 @@ def _run_routine(lyse, routine, source, staging, import_dirs=()):
         sys.modules["__main__"] = previous_main
 
 
+def read_native(h5py, params):
+    shot = params["shot"]
+    path = Path(shot["path"])
+    if path.resolve(strict=True) != path or path.parent != Path(params["batch_root"]):
+        raise ValueError("Shot no longer matches its approved path")
+    with h5py.File(str(path), "r") as file:
+        if (file.attrs.get("run number") != shot["index"] or
+                file.attrs.get("n_runs") != params["expected_n_shots"] or not file.attrs.get("run time")):
+            raise ValueError("Native shot identity or completion metadata mismatch")
+        sequence = file.attrs.get("sequence_id")
+        if isinstance(sequence, bytes):
+            sequence = sequence.decode("utf-8")
+        if not isinstance(sequence, str) or not sequence:
+            raise ValueError("Missing native sequence ID")
+        group = file
+        for component in ("results", params["binding"]["result_group"]):
+            if component not in group:
+                return {"status": "PENDING", "reason": "Waiting for Lyse group " + component}
+            if not isinstance(group.get(component, getlink=True), h5py.HardLink):
+                raise ValueError("External or symbolic result link")
+            group = group[component]
+            if not isinstance(group, h5py.Group):
+                raise ValueError("Expected a native Lyse results group")
+        for name in params["result_names"]:
+            if name not in group.attrs:
+                return {"status": "PENDING", "reason": "Waiting for Lyse field " + name}
+        results = {name: _scalar(group.attrs[name]) for name in params["result_names"]}
+        if path.stat().st_size > params["max_shot_bytes"]:
+            raise ValueError("Shot exceeds configured size limit")
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != shot["sha256"]:
+            return {"status": "PENDING", "reason": "Shot changed since BLACS observation"}
+    return {**params["binding"], "status": "COMPLETE", "results": results,
+            "sequence_id": sequence, "lyse_version": "unobserved"}
+
+
 def analyze(params):
     # Ordering matters. Lyse shares the installed Labscript HDF5 lock.
     import labscript_utils.h5_lock as lock
     import h5py
-    import lyse
 
     if h5py.File is not lock.File:
         raise RuntimeError("Labscript HDF5 locking is not active")
+    if params.get("backend") == "native_h5":
+        return read_native(h5py, params)
+    import lyse
+
     routine = Path(params["routine"])
     if routine.resolve(strict=True) != routine:
         raise ValueError("Lyse routine path changed after review")
@@ -130,7 +172,7 @@ def main():
     except (Exception, SystemExit) as exc:
         result = {"status": "FAILED", "reason": f"{type(exc).__name__}: {str(exc)[:1000]}"}
     print(PREFIX + json.dumps(result, ensure_ascii=True, allow_nan=False), flush=True)
-    return 0 if result["status"] == "COMPLETE" else 2
+    return 0 if result["status"] in ("COMPLETE", "PENDING") else 2
 
 
 if __name__ == "__main__":
