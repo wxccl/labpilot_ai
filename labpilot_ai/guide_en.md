@@ -1,3 +1,5 @@
+Live writes require a separate owner grant before dispatch. Export the proposal and provision the owner public key during a maintenance window. See the rc3 migration guide.
+
 First use
 Choose the station profile shared with the managed Runmanager and BLACS. In Operations, click Live context. Compare the sequence, output folder and shot count with Runmanager. Capabilities lists device channels and advertised operations. Use Details for raw receipts.
 

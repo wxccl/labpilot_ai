@@ -184,6 +184,8 @@ class Automation:
             raise RuntimeError(observed.get("reason") or "Host snapshot unavailable")
         shots = args.get("expected_n_shots", 0)
         batch = target == "runmanager" and action == "engage"
+        if batch and not self.simulate and self.service.analysis is None:
+            raise ValueError("Configure Lyse result observation and quality rules before preparing a live batch")
         if batch and (type(shots) is not int or shots < 1 or shots != snapshot.get("n_shots")):
             raise ValueError("Engage requires an explicit positive shot count matching the live snapshot")
         if not batch and shots != 0:

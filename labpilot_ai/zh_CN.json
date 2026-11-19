@@ -45,5 +45,7 @@
   "Read device": "读取所选设备",
   "Lyse report folder": "打开分析报告目录",
   "Load the BLACS inventory first": "请先获取 BLACS 设备清单",
-  "Select a task with a saved analysis report": "请先在操作台选中有分析报告的任务"
+  "Select a task with a saved analysis report": "请先在操作台选中有分析报告的任务",
+  "Restore status": "恢复状态",
+  "MCP setup instructions": "MCP 配置说明（尚未验证客户端连接）"
 }

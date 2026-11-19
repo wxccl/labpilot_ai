@@ -192,6 +192,8 @@ def launch(profile):
                 status = Blacs(profile).batch_status()
                 if status.get("profile_sha256") != profile.sha256 or status.get("repeat") is not False:
                     raise Refused("Managed Engage requires the matching BLACS plugin with Repeat disabled")
+                from ..owner_grant import verify
+                verify(profile, params)
                 self.app.wait_until_preparse_complete()
                 return native.inmain(manage_engage, self, profile, params, deadline)
             except Refused as exc:

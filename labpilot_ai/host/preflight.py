@@ -26,7 +26,7 @@ def capability_report(response, requirements=(), *, quality_rules_configured=Fal
     return {"schema": "labpilot-preflight/1",
             "state": "REFUSED" if missing or not any(t.get("available") is True for t in targets.values()) else "OBSERVED",
             "adapter": "packaged_host", "simulated": value.get("simulated"),
-            "targets": {name: {"available": info.get("available") is True, "reason": info.get("reason")}
+            "targets": {name: {"available": info.get("available") is True, "reason": info.get("reason"), "loaded_version": info.get("loaded_version")}
                         for name, info in targets.items()},
             "reason": response.get("reason"), "advertised_actions": sorted(available_actions),
             "missing_required_actions": missing, "devices": devices,

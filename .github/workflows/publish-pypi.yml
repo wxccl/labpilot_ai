@@ -92,7 +92,7 @@ jobs:
           mkdir -p "$bundle/wheelhouse"
           cp dist/*.whl "$bundle/wheelhouse/"
           cp tools/Setup-LabPilot-Desktop.cmd labpilot_ai/guide_en.md labpilot_ai/guide_zh.md "$bundle/"
-          cp manual/NATIVE_GUI_ZH.md manual/START_ZH.md manual/controller_one_shot.md manual/HARNESS_RETEST_ZH.md "$bundle/"
+          cp manual/RC3_OWNER_ZH.md manual/NATIVE_GUI_ZH.md manual/START_ZH.md manual/controller_one_shot.md manual/HARNESS_RETEST_ZH.md "$bundle/"
           git archive --prefix=src/ HEAD | tar -xf - -C "$bundle"
           (cd "$bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum > ../kit-sums.txt && mv ../kit-sums.txt SHA256SUMS.txt)
           zip -qr "dist/$bundle.zip" "$bundle"

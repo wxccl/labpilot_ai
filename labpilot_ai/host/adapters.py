@@ -48,16 +48,27 @@ def run_values(action, params, before, max_shots):
 
 
 def restore_record(journal, values, current, profile_sha256=None):
-    if set(values) != {"original_request_id"}:
+    if "original_request_id" not in values or set(values) - {"original_request_id", "preserve_output"}:
         raise Refused("Restore accepts only an original set_globals request ID")
     key = request_id({"request_id": values["original_request_id"]})
     original = journal.observe(key, "runmanager") or {}
     result = original.get("value", {})
     if (original.get("state") != "APPLIED" or original.get("request_id") != key
-            or not result.get("restore_baseline") or result.get("restore_profile_sha256") != profile_sha256
-            or result.get("after", {}).get("snapshot_sha256") != current["snapshot_sha256"]):
+            or not result.get("restore_baseline") or result.get("restore_profile_sha256") != profile_sha256):
         raise Refused("No matching recorded set_globals baseline, or configuration has drifted")
-    return result["restore_baseline"]
+    after = result.get("after", {})
+    if after.get("snapshot_sha256") == current["snapshot_sha256"] and "preserve_output" not in values:
+        return result["restore_baseline"]
+    old, new = Path(after.get("output") or "."), Path(current.get("output") or ".")
+    if (values.get("preserve_output") != current.get("output") or old.parent != new.parent
+            or len(old.name) != len(new.name) or not old.name.isascii() or not new.name.isascii()
+            or not old.name.isdecimal() or not new.name.isdecimal() or int(new.name) != int(old.name) + 1):
+        raise Refused("Restore conflict: output or configuration differs from the recorded write")
+    def adjusted(record):
+        return snapshot({**{k: v for k, v in record.items() if k != "snapshot_sha256"}, "output": str(current["output"])})
+    if adjusted(after) != current:
+        raise Refused("Restore conflict outside the reviewed output increment")
+    return adjusted(result["restore_baseline"])
 
 
 def blacs_values(params, before):

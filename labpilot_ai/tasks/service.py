@@ -55,10 +55,8 @@ class TaskService:
             return self.store._record_receipt(task["task_id"], token, "CANCELLED", receipt, never_dispatched=True)
         if current["status"] in TERMINAL:
             return current
-        request = {**task["params"], "action": task["action"], "request_id": task["request_id"],
-                   "expected_snapshot_sha256": task["expected_config_digest"]}
-        if task["kind"] == "batch":
-            request["expected_n_shots"] = task["expected_shots"]
+        from ..owner_grant import task_request
+        request = task_request(task)
         if self.store._now() >= expires_at:
             receipt = {"schema": HOST_SCHEMA, "state": "REFUSED", "request_id": task["request_id"],
                        "reason": "Approval expired before host dispatch"}

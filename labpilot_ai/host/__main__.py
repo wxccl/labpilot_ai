@@ -10,6 +10,7 @@ if not __package__:
     sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != here]
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from labpilot_ai.owner_grant import verify
 from labpilot_ai.host.adapters import Runmanager, Simulator
 from labpilot_ai.host.blacs import Blacs
 from labpilot_ai.host.native_batch import NativeBatches
@@ -54,12 +55,22 @@ def dispatch(envelope, profile):
     key = request_id(params)
     if type(params.get("action")) is not str:
         raise Refused("A concrete action is required")
+    grant_digest = None
+    if not profile.simulate and journal.observe(key, target) is None:
+        try:
+            grant_digest = verify(profile, params)
+        except Refused as exc:
+            return receipt("REFUSED", reason=str(exc), request_id=key)
     prior = journal.reserve(key, target, params)
     if prior is not None:
         return prior
     try:
         with journal.exclusive_effect():
+            if not profile.simulate:
+                grant_digest = verify(profile, params)
             value = adapters[target].execute(params)
+            if grant_digest:
+                value["owner_grant_sha256"] = grant_digest
         result = receipt("APPLIED", value=value, request_id=key)
     except Refused as exc:
         result = receipt("REFUSED", reason=str(exc), request_id=key)

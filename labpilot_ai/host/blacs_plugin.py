@@ -8,6 +8,7 @@ import uuid
 from labpilot_ai.blacs_bridge.accessor import BLACSAccessor
 from labpilot_ai.blacs_bridge.plugin import Plugin as PluginHooks
 
+from labpilot_ai import __version__
 from .adapters import blacs_values
 from .blacs import atomic_json, mailbox
 from .device_actions import describe_device, read_device_action, require_typed_manual
@@ -89,7 +90,7 @@ class Plugin(PluginHooks):
         try:
             now = time.time()
             if now - self.updated >= 2:
-                atomic_json(self.spool / "ready.json", {"generation": self.generation, "updated": now})
+                atomic_json(self.spool / "ready.json", {"generation": self.generation, "updated": now, "version": __version__, "profile_sha256": self.profile.sha256})
                 self.updated = now
             if self.pending and now > self.pending["expires"] + 2:
                 # Late callbacks check identity and expiration before changing anything.
@@ -117,17 +118,23 @@ class Plugin(PluginHooks):
             elif message["method"] == "discover":
                 tabs = self.accessor._tabs()
                 configured = self.profile.blacs["allow"]
+                eligible = {}
+                for ref in self.accessor._channel_refs():
+                    channel = f"{ref.channel}.{ref.subchannel}" if ref.subchannel else ref.channel
+                    if (not ref.locked and ref.kind in {"AO", "DO", "DDS.freq", "DDS.amp", "DDS.phase", "DDS.gate"}
+                            and channel in configured.get(ref.device, ())):
+                        eligible.setdefault(ref.device, []).append(channel)
                 capabilities = {
                     device: describe_device(tab, manual_mode=self.manual_mode,
-                                            write_channels=configured.get(device, ()))
+                                            write_channels=eligible.get(device, ()))
                     for device, tab in tabs.items()
                 }
-                write_channels = {device: configured[device] for device, info in capabilities.items()
+                write_channels = {device: eligible[device] for device, info in capabilities.items()
                                   if info["write_actions"]}
                 self._reply(message, "OK", value={"available": True, "devices": sorted(tabs),
                                                   "device_capabilities": capabilities,
                                                   "actions": ["set_manual"] if write_channels else [],
-                                                  "write_channels": write_channels})
+                                                  "write_channels": write_channels, "loaded_version": __version__})
             elif message["method"] == "snapshot":
                 device = params.get("device")
                 action = params.get("action")
@@ -140,6 +147,13 @@ class Plugin(PluginHooks):
                     value = read_device_action(action, tabs[device], device=device, manual_mode=self.manual_mode)
                 self._reply(message, "OK", value=value)
             elif message["method"] == "execute" and params.get("action") == "set_manual":
+                from ..owner_grant import verify
+                from .protocol import Journal, request_id
+                verify(self.profile, params)
+                key = request_id(params)
+                ledger = Journal(self.profile.state_db.with_suffix(".manual-receivers.sqlite3"))
+                if ledger.reserve(key, "blacs", params) is not None:
+                    raise Refused("Original BLACS write already reserved; reconcile without replay")
                 self._prepare(message)
             else:
                 raise Refused("Unsupported BLACS mailbox operation")

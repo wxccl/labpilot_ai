@@ -120,6 +120,7 @@ class TaskWindow(QtWidgets.QWidget):
         button(row, "Runmanager snapshot", lambda: self.inspect("runmanager"))
         button(row, "BLACS inventory", self.inventory)
         self.devices = QtWidgets.QComboBox()
+        self.devices.currentTextChanged.connect(lambda: self.inspection.clear())
         row.addWidget(self.devices, 1)
         button(row, "Read device", lambda: self.inspect("blacs"))
         button(row, "Lyse report folder", self.open_report)
@@ -191,8 +192,12 @@ class TaskWindow(QtWidgets.QWidget):
                 self.status.setText(self.t("Load the BLACS inventory first"))
                 return
             params["device"] = self.devices.currentText()
-        self.submit(lambda app: app.dispatch("snapshot", params),
-                    lambda reply: self.inspection.setPlainText(json.dumps(reply, ensure_ascii=False, indent=2)))
+        requested = params.get("device")
+        def show(reply):
+            if requested is not None and self.devices.currentText() != requested:
+                return
+            self.inspection.setPlainText(json.dumps({"requested_target": params, "reply": reply}, ensure_ascii=False, indent=2))
+        self.submit(lambda app: app.dispatch("snapshot", params), show)
 
     def open_report(self):
         task = self.selected()
@@ -214,7 +219,7 @@ class TaskWindow(QtWidgets.QWidget):
         args = ["--profile", str(Path(self.profile).resolve()), "mcp"]
         config = json.dumps({"command": command, "args": args}, ensure_ascii=False, indent=2)
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(self.t("Connect an agent"))
+        dialog.setWindowTitle(self.t("MCP setup instructions"))
         box = QtWidgets.QVBoxLayout(dialog)
         selector = QtWidgets.QComboBox()
         selector.addItems(["DeepSeek Harness (stdio)", "Codex CLI"])
@@ -297,7 +302,9 @@ class TaskWindow(QtWidgets.QWidget):
             rows = [("Task", value["task_id"]), ("Status", value["status"]), ("Action", value["action"]),
                     ("Shots", value.get("expected_shots")), ("Parameters", json.dumps(value.get("params"), ensure_ascii=False)),
                     ("Executed", evidence.get("executed_count")), ("Analyzed", evidence.get("analyzed_count")),
-                    ("Quality", evidence.get("quality")), ("Waiting for", evidence.get("waiting_for"))]
+                    ("Analysis", evidence.get("analysis_state", "UNVERIFIED")),
+                    ("Quality", evidence.get("quality", "UNKNOWN")),
+                    ("Restore status", "VERIFIED" if value["action"] == "restore_globals" and (value.get("receipt") or {}).get("value", {}).get("evidence", {}).get("configuration_readback") else "UNVERIFIED"), ("Waiting for", evidence.get("waiting_for"))]
             text = "\n".join(f"{self.t(k)}    {v}" for k,v in rows if v is not None)
         else:
             text = json.dumps(value, ensure_ascii=False, indent=2)
@@ -385,7 +392,8 @@ class TaskWindow(QtWidgets.QWidget):
         task = self.selected()
         if not task:
             return
-        operator, ok = QtWidgets.QInputDialog.getText(self, self.t("Approve selected"), self.t("Review the plan and enter your name"))
+        operator, ok = QtWidgets.QInputDialog.getText(self, self.t("Approve selected"),
+            self.t("Review the plan and enter your name") + "\n" + task["action"] + "  " + str(task["expected_shots"]) + "\n" + task["plan_digest"])
         if ok and operator.strip():
             expiry = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
             self.submit(lambda app: app.store.approve(task["task_id"], task["plan_digest"], operator.strip(), expiry))

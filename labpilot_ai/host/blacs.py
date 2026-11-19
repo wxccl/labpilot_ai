@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 import uuid
 
+from labpilot_ai import __version__
 from .protocol import Refused, canonical, read_json
 
 
@@ -36,6 +37,9 @@ class Blacs:
         try:
             ready = read_json(spool / "ready.json")
             generation = ready["generation"]
+            if method in {"execute", "batch.status"} and (
+                    ready.get("version") != __version__ or ready.get("profile_sha256") != self.profile.sha256):
+                raise Refused("BLACS plugin version or site binding differs; reload in a maintenance window")
             if not 0 <= time.time() - ready["updated"] <= 5:
                 raise ValueError("stale heartbeat")
         except (OSError, ValueError, TypeError, KeyError) as exc:

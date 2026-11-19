@@ -98,8 +98,10 @@ def test_plugin_snapshot_dispatches_specialized_cache_without_full_channel_scan(
                      _can_check_remote_values=True, _last_remote_values={})
     plugin = Plugin()
     plugin.manual_mode = 1
-    plugin.accessor = SimpleNamespace(_tabs=lambda: {"dds": tab})
-    plugin.profile = SimpleNamespace(blacs={"allow": {"dds": ["channel 1.freq"]}})
+    refs = [SimpleNamespace(device="dds", channel="channel 1", kind="DDS." + sub, subchannel=sub, locked=False)
+            for sub in ("freq", "phase")]
+    plugin.accessor = SimpleNamespace(_tabs=lambda: {"dds": tab}, _channel_refs=lambda: refs)
+    plugin.profile = SimpleNamespace(blacs={"allow": {"dds": ["channel 1.freq", "channel 1"]}})
     replies = []
     monkeypatch.setattr(plugin, "_reply", lambda message, state, **data: replies.append((state, data)))
     monkeypatch.setattr(plugin, "_capture", lambda *_: pytest.fail("Specialized query scanned all channels"))
@@ -112,6 +114,7 @@ def test_plugin_snapshot_dispatches_specialized_cache_without_full_channel_scan(
                                     "expires": time.time() + 2, "method": method, "params": params}), encoding="utf-8")
         plugin._read_one(path)
     assert replies[0][1]["value"]["device_capabilities"]["dds"]["read_actions"] == ["dds_registers", "device_status"]
+    assert replies[0][1]["value"]["write_channels"] == {"dds": ["channel 1.freq"]}
     assert replies[1][1]["value"]["available"] is False
     assert replies[2][0] == "REFUSED"
 

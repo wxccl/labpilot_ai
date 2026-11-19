@@ -7,7 +7,7 @@ from pathlib import Path
 from .protocol import Journal, Refused, canonical, digest, loads, request_id
 
 
-BATCH_PROTOCOL = "labpilot-native-batch/1"
+BATCH_PROTOCOL = "labpilot-native-batch/2"
 
 
 def source_text_hash(path):
